@@ -1,30 +1,36 @@
 #include <Wire.h>
+#include <math.h>
 
 // ==================================================
 // Arduino Mega - Apex Rover Main Control
-// Mobile App -> ESP32 -> Arduino Mega
 //
-// This code controls:
-// 1. Robot movement using 2 BTS7960 motor drivers
-// 2. Normal Mode / Climb Mode
-// 3. 4 IR sensors
-// 4. MPU6500 / MPU6050 basic reading
-// 5. Two Linear Actuators using L298N driver
+// Supports:
+// 1. Raspberry Pi -> Mega using USB Serial
+// 2. ESP32 -> Mega using Serial1
+// 3. Robot movement using 2 BTS7960 motor drivers
+// 4. Normal Mode / Climb Mode
+// 5. MPU6500 / MPU6050 pitch and roll
+// 6. Two ultrasonic sensors for jack height
+// 7. Two linear actuators using L298N
 //
-// IMPORTANT:
-// Ultrasonic sensor was removed from the code.
+// Raspberry Pi command example:
+// GET:SENSORS
+//
+// Mega response example:
+// DATA:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20
 // ==================================================
 
 
 // ==================================================
-// 1) ESP32 TO MEGA CONNECTION
+// 1) SERIAL CONNECTIONS
 // ==================================================
 //
-// ESP32 G17 TX  --->  Mega Pin 19 RX1
-// ESP32 GND     --->  Mega GND
+// Raspberry Pi USB ---> Arduino Mega USB
+// Uses Serial
 //
-// Mega receives commands from ESP32 using Serial1.
-// Serial1 RX on Arduino Mega is Pin 19.
+// ESP32 G17 TX ---> Mega Pin 19 RX1
+// ESP32 GND    ---> Mega GND
+// Uses Serial1
 // ==================================================
 
 
@@ -39,9 +45,6 @@
 // Left Side BTS7960:
 // RPWM ---> Mega Pin 5
 // LPWM ---> Mega Pin 7
-//
-// RPWM and LPWM are PWM control pins.
-// analogWrite is used to control motor speed.
 // ==================================================
 
 #define RIGHT_RPWM 9
@@ -52,36 +55,23 @@
 
 
 // ==================================================
-// 3) IR SENSOR PINS
+// 3) ULTRASONIC SENSOR PINS
 // ==================================================
 //
-// Each IR sensor has 3 pins:
+// Front ultrasonic:
+// TRIG ---> Mega Pin 22
+// ECHO ---> Mega Pin 23
 //
-// VCC ---> 5V
-// GND ---> GND
-// OUT ---> Arduino Mega input pin
-//
-// Front Left IR  OUT ---> Mega Pin 22
-// Front Right IR OUT ---> Mega Pin 23
-// Rear Left IR   OUT ---> Mega Pin 24
-// Rear Right IR  OUT ---> Mega Pin 25
-//
-// OUT may also be written as:
-// DO / DOUT / S / SIG / Signal
+// Rear ultrasonic:
+// TRIG ---> Mega Pin 24
+// ECHO ---> Mega Pin 25
 // ==================================================
 
-#define IR_FRONT_LEFT   22
-#define IR_FRONT_RIGHT  23
-#define IR_REAR_LEFT    24
-#define IR_REAR_RIGHT   25
+#define FRONT_US_TRIG 22
+#define FRONT_US_ECHO 23
 
-// Most IR modules:
-// LOW  = obstacle detected
-// HIGH = no obstacle
-//
-// If your IR sensor works opposite,
-// change LOW to HIGH.
-#define IR_OBSTACLE_STATE LOW
+#define REAR_US_TRIG 24
+#define REAR_US_ECHO 25
 
 
 // ==================================================
@@ -92,9 +82,6 @@
 // MPU SCL ---> Mega Pin 21 SCL
 // MPU VCC ---> 3.3V or 5V depending on your module
 // MPU GND ---> GND
-//
-// The MPU is used to read pitch and roll.
-// This can help later with stairs/climb angle.
 // ==================================================
 
 #define MPU_ADDR 0x68
@@ -102,6 +89,7 @@
 float accelX = 0;
 float accelY = 0;
 float accelZ = 0;
+
 float pitch = 0;
 float roll = 0;
 
@@ -110,28 +98,15 @@ float roll = 0;
 // 5) L298N LINEAR ACTUATOR PINS
 // ==================================================
 //
-// L298N is used to control two linear actuators.
-//
-// Rear Linear Actuator:
-// L298N OUT1 / OUT2 ---> Rear Jack motor wires
-//
-// Front Linear Actuator:
-// L298N OUT3 / OUT4 ---> Front Jack motor wires
-//
-// L298N control pins:
-//
-// Rear Jack side:
+// Rear Jack:
 // ENA ---> Mega Pin 32
 // IN1 ---> Mega Pin 30
 // IN2 ---> Mega Pin 31
 //
-// Front Jack side:
+// Front Jack:
 // ENB ---> Mega Pin 35
 // IN3 ---> Mega Pin 33
 // IN4 ---> Mega Pin 34
-//
-// If jack moves opposite direction,
-// swap OUT wires or swap HIGH/LOW in the function.
 // ==================================================
 
 #define REAR_JACK_EN  32
@@ -147,12 +122,15 @@ float roll = 0;
 // 6) ROBOT STATE
 // ==================================================
 
-int motorSpeed = 150;           // PWM value from 0 to 255
+int motorSpeed = 150;           // PWM value 0 to 255
 String currentMode = "NORMAL";  // NORMAL or CLIMB
 String lastMovement = "STOP";   // FORWARD, BACKWARD, LEFT, RIGHT, STOP
 
-unsigned long lastSensorPrint = 0;
-unsigned long sensorPrintInterval = 1000;
+float frontUltrasonicCM = 0;
+float rearUltrasonicCM = 0;
+
+unsigned long lastDebugPrint = 0;
+unsigned long debugPrintInterval = 1500;
 
 
 // ==================================================
@@ -160,11 +138,10 @@ unsigned long sensorPrintInterval = 1000;
 // ==================================================
 
 void setup() {
-  // Serial Monitor for debugging
+  // USB Serial for Raspberry Pi and Serial Monitor
   Serial.begin(9600);
 
-  // Serial1 receives commands from ESP32
-  // ESP32 G17 TX ---> Mega Pin 19 RX1
+  // Serial1 for ESP32
   Serial1.begin(9600);
 
   // BTS7960 motor pins
@@ -173,11 +150,12 @@ void setup() {
   pinMode(LEFT_RPWM, OUTPUT);
   pinMode(LEFT_LPWM, OUTPUT);
 
-  // IR sensor pins
-  pinMode(IR_FRONT_LEFT, INPUT);
-  pinMode(IR_FRONT_RIGHT, INPUT);
-  pinMode(IR_REAR_LEFT, INPUT);
-  pinMode(IR_REAR_RIGHT, INPUT);
+  // Ultrasonic pins
+  pinMode(FRONT_US_TRIG, OUTPUT);
+  pinMode(FRONT_US_ECHO, INPUT);
+
+  pinMode(REAR_US_TRIG, OUTPUT);
+  pinMode(REAR_US_ECHO, INPUT);
 
   // L298N jack control pins
   pinMode(REAR_JACK_EN, OUTPUT);
@@ -192,7 +170,7 @@ void setup() {
   digitalWrite(REAR_JACK_EN, HIGH);
   digitalWrite(FRONT_JACK_EN, HIGH);
 
-  // Stop motors and jacks at startup
+  // Stop everything at startup
   stopMotors();
   stopAllJacks();
 
@@ -200,13 +178,17 @@ void setup() {
   Wire.begin();
   initMPU();
 
+  delay(500);
+
   Serial.println("====================================");
-  Serial.println("Arduino Mega Ready");
-  Serial.println("Waiting for commands from ESP32...");
-  Serial.println("Default Mode: NORMAL");
-  Serial.println("Ultrasonic removed - IR only safety");
-  Serial.println("Linear actuators enabled on L298N");
+  Serial.println("Arduino Mega Ready - Apex Rover");
+  Serial.println("USB Serial: Raspberry Pi");
+  Serial.println("Serial1: ESP32");
+  Serial.println("IR removed");
+  Serial.println("Ultrasonic enabled for jack height");
   Serial.println("====================================");
+
+  Serial1.println("MEGA:READY");
 }
 
 
@@ -215,26 +197,35 @@ void setup() {
 // ==================================================
 
 void loop() {
-  // Read commands from ESP32
+  // Commands from Raspberry Pi through USB Serial
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command.length() > 0) {
+      handleCommand(command, Serial, "RASPBERRY_PI");
+    }
+  }
+
+  // Commands from ESP32 through Serial1
   if (Serial1.available() > 0) {
     String command = Serial1.readStringUntil('\n');
     command.trim();
 
-    Serial.print("Received from ESP32: [");
-    Serial.print(command);
-    Serial.println("]");
-
-    handleCommand(command);
+    if (command.length() > 0) {
+      handleCommand(command, Serial1, "ESP32");
+    }
   }
 
-  // Safety checking for movement in NORMAL mode
-  safetyMonitor();
+  // Keep sensor values updated
+  readMPU();
+  frontUltrasonicCM = readUltrasonicCM(FRONT_US_TRIG, FRONT_US_ECHO);
+  rearUltrasonicCM = readUltrasonicCM(REAR_US_TRIG, REAR_US_ECHO);
 
-  // Print sensor status every second
-  if (millis() - lastSensorPrint >= sensorPrintInterval) {
-    lastSensorPrint = millis();
-    readMPU();
-    printSensorStatus();
+  // Optional debug printing
+  if (millis() - lastDebugPrint >= debugPrintInterval) {
+    lastDebugPrint = millis();
+    printDebugStatus();
   }
 }
 
@@ -243,210 +234,173 @@ void loop() {
 // COMMAND HANDLER
 // ==================================================
 
-void handleCommand(String command) {
-  // ==================================================
+void handleCommand(String command, Stream &replyPort, String sourceName) {
+  Serial.print("Received from ");
+  Serial.print(sourceName);
+  Serial.print(": [");
+  Serial.print(command);
+  Serial.println("]");
+
+  // --------------------------
+  // SENSOR REQUEST
+  // --------------------------
+
+  if (command == "GET:SENSORS") {
+    sendSensorData(replyPort);
+    return;
+  }
+
+  // --------------------------
   // MODE COMMANDS
-  // ==================================================
+  // --------------------------
 
   if (command == "MODE:NORMAL") {
     currentMode = "NORMAL";
-    Serial.println("Mode changed to NORMAL");
-
     stopMotors();
     lastMovement = "STOP";
+
+    replyPort.println("ACK:MODE:NORMAL");
     return;
   }
 
   if (command == "MODE:CLIMB") {
     currentMode = "CLIMB";
-    Serial.println("Mode changed to CLIMB");
-    Serial.println("Climb Mode: IR obstacle safety is relaxed for stairs.");
-
     stopMotors();
     lastMovement = "STOP";
+
+    replyPort.println("ACK:MODE:CLIMB");
     return;
   }
 
-
-  // ==================================================
-  // JACK COMMANDS FROM APP DRIVE MODE
-  // ==================================================
-  //
-  // Front Jack buttons send:
-  // JACK:FRONT:EXTEND
-  // JACK:FRONT:RETRACT
-  // JACK:FRONT:STOP
-  //
-  // Rear Jack buttons send:
-  // JACK:REAR:EXTEND
-  // JACK:REAR:RETRACT
-  // JACK:REAR:STOP
-  // ==================================================
+  // --------------------------
+  // JACK COMMANDS
+  // --------------------------
 
   if (command == "JACK:FRONT:EXTEND") {
     frontJackExtend();
+    replyPort.println("ACK:JACK:FRONT:EXTEND");
     return;
   }
 
   if (command == "JACK:FRONT:RETRACT") {
     frontJackRetract();
+    replyPort.println("ACK:JACK:FRONT:RETRACT");
     return;
   }
 
   if (command == "JACK:FRONT:STOP") {
     frontJackStop();
+    replyPort.println("ACK:JACK:FRONT:STOP");
     return;
   }
 
   if (command == "JACK:REAR:EXTEND") {
     rearJackExtend();
+    replyPort.println("ACK:JACK:REAR:EXTEND");
     return;
   }
 
   if (command == "JACK:REAR:RETRACT") {
     rearJackRetract();
+    replyPort.println("ACK:JACK:REAR:RETRACT");
     return;
   }
 
   if (command == "JACK:REAR:STOP") {
     rearJackStop();
+    replyPort.println("ACK:JACK:REAR:STOP");
     return;
   }
 
-
-  // ==================================================
+  // --------------------------
   // MOVEMENT COMMANDS
-  // ==================================================
+  // --------------------------
 
   if (command == "FORWARD") {
     lastMovement = "FORWARD";
-    Serial.println("Action: Move Forward");
-
-    if (canMoveForward()) {
-      moveForward();
-    } else {
-      Serial.println("Blocked: Front IR obstacle detected in NORMAL mode");
-      stopMotors();
-      lastMovement = "STOP";
-    }
+    moveForward();
+    replyPort.println("ACK:FORWARD");
+    return;
   }
 
-  else if (command == "BACKWARD") {
+  if (command == "BACKWARD") {
     lastMovement = "BACKWARD";
-    Serial.println("Action: Move Backward");
-
-    if (canMoveBackward()) {
-      moveBackward();
-    } else {
-      Serial.println("Blocked: Rear IR obstacle detected in NORMAL mode");
-      stopMotors();
-      lastMovement = "STOP";
-    }
+    moveBackward();
+    replyPort.println("ACK:BACKWARD");
+    return;
   }
 
-  else if (command == "LEFT") {
+  if (command == "LEFT") {
     lastMovement = "LEFT";
-    Serial.println("Action: Turn Left");
     turnLeft();
+    replyPort.println("ACK:LEFT");
+    return;
   }
 
-  else if (command == "RIGHT") {
+  if (command == "RIGHT") {
     lastMovement = "RIGHT";
-    Serial.println("Action: Turn Right");
     turnRight();
+    replyPort.println("ACK:RIGHT");
+    return;
   }
 
-  else if (command == "STOP") {
+  if (command == "STOP") {
     lastMovement = "STOP";
-    Serial.println("Action: Stop");
-
-    // BRAKE / STOP from app stops robot movement
-    // and also stops both jacks for safety.
     stopMotors();
     stopAllJacks();
+
+    replyPort.println("ACK:STOP");
+    return;
   }
 
-
-  // ==================================================
+  // --------------------------
   // SPEED COMMAND
-  // ==================================================
+  // --------------------------
 
-  else if (command.startsWith("SPEED:")) {
+  if (command.startsWith("SPEED:")) {
     int speedPercent = command.substring(6).toInt();
     speedPercent = constrain(speedPercent, 0, 100);
 
     motorSpeed = map(speedPercent, 0, 100, 0, 255);
 
-    Serial.print("Speed Percent: ");
-    Serial.println(speedPercent);
-    Serial.print("PWM Speed: ");
-    Serial.println(motorSpeed);
+    replyPort.print("ACK:SPEED:");
+    replyPort.println(speedPercent);
 
     applyLastMovement();
-  }
-
-  else {
-    Serial.println("Unknown command");
-  }
-}
-
-
-// ==================================================
-// SAFETY LOGIC
-// ==================================================
-
-bool canMoveForward() {
-  // In CLIMB mode, the robot should not stop just
-  // because IR detects stairs as an obstacle.
-  if (currentMode == "CLIMB") {
-    return true;
-  }
-
-  return !frontObstacleDetected();
-}
-
-bool canMoveBackward() {
-  // In CLIMB mode, rear IR safety is relaxed too.
-  if (currentMode == "CLIMB") {
-    return true;
-  }
-
-  return !rearObstacleDetected();
-}
-
-void safetyMonitor() {
-  // Safety only works in NORMAL mode.
-  // In CLIMB mode, stairs should not be treated as a normal obstacle.
-
-  if (currentMode != "NORMAL") {
     return;
   }
 
-  if (lastMovement == "FORWARD" && frontObstacleDetected()) {
-    Serial.println("SAFETY STOP: Front IR obstacle detected");
-    stopMotors();
-    lastMovement = "STOP";
-  }
+  // --------------------------
+  // UNKNOWN COMMAND
+  // --------------------------
 
-  if (lastMovement == "BACKWARD" && rearObstacleDetected()) {
-    Serial.println("SAFETY STOP: Rear IR obstacle detected");
-    stopMotors();
-    lastMovement = "STOP";
-  }
+  replyPort.print("ERROR:UNKNOWN_COMMAND:");
+  replyPort.println(command);
 }
 
-bool frontObstacleDetected() {
-  bool irFrontLeft = digitalRead(IR_FRONT_LEFT) == IR_OBSTACLE_STATE;
-  bool irFrontRight = digitalRead(IR_FRONT_RIGHT) == IR_OBSTACLE_STATE;
 
-  return irFrontLeft || irFrontRight;
-}
+// ==================================================
+// SENSOR DATA RESPONSE
+// ==================================================
 
-bool rearObstacleDetected() {
-  bool irRearLeft = digitalRead(IR_REAR_LEFT) == IR_OBSTACLE_STATE;
-  bool irRearRight = digitalRead(IR_REAR_RIGHT) == IR_OBSTACLE_STATE;
+void sendSensorData(Stream &replyPort) {
+  readMPU();
 
-  return irRearLeft || irRearRight;
+  frontUltrasonicCM = readUltrasonicCM(FRONT_US_TRIG, FRONT_US_ECHO);
+  rearUltrasonicCM = readUltrasonicCM(REAR_US_TRIG, REAR_US_ECHO);
+
+  replyPort.print("DATA:");
+  replyPort.print("PITCH=");
+  replyPort.print(pitch, 2);
+
+  replyPort.print(";ROLL=");
+  replyPort.print(roll, 2);
+
+  replyPort.print(";UF=");
+  replyPort.print(frontUltrasonicCM, 2);
+
+  replyPort.print(";UR=");
+  replyPort.println(rearUltrasonicCM, 2);
 }
 
 
@@ -496,21 +450,11 @@ void stopMotors() {
 
 void applyLastMovement() {
   if (lastMovement == "FORWARD") {
-    if (canMoveForward()) {
-      moveForward();
-    } else {
-      stopMotors();
-      lastMovement = "STOP";
-    }
+    moveForward();
   }
 
   else if (lastMovement == "BACKWARD") {
-    if (canMoveBackward()) {
-      moveBackward();
-    } else {
-      stopMotors();
-      lastMovement = "STOP";
-    }
+    moveBackward();
   }
 
   else if (lastMovement == "LEFT") {
@@ -530,62 +474,37 @@ void applyLastMovement() {
 // ==================================================
 // LINEAR ACTUATOR FUNCTIONS - L298N
 // ==================================================
-//
-// If an actuator moves opposite to what you expect,
-// you have two options:
-//
-// 1. Swap the two wires on OUT1/OUT2 or OUT3/OUT4
-// 2. Swap HIGH and LOW in extend/retract function
-//
-// Rear Jack:
-// OUT1 / OUT2 on L298N
-//
-// Front Jack:
-// OUT3 / OUT4 on L298N
-// ==================================================
 
 void rearJackExtend() {
-  Serial.println("Rear Jack: EXTEND");
-
   digitalWrite(REAR_JACK_EN, HIGH);
   digitalWrite(REAR_JACK_IN1, HIGH);
   digitalWrite(REAR_JACK_IN2, LOW);
 }
 
 void rearJackRetract() {
-  Serial.println("Rear Jack: RETRACT");
-
   digitalWrite(REAR_JACK_EN, HIGH);
   digitalWrite(REAR_JACK_IN1, LOW);
   digitalWrite(REAR_JACK_IN2, HIGH);
 }
 
 void rearJackStop() {
-  Serial.println("Rear Jack: STOP");
-
   digitalWrite(REAR_JACK_IN1, LOW);
   digitalWrite(REAR_JACK_IN2, LOW);
 }
 
 void frontJackExtend() {
-  Serial.println("Front Jack: EXTEND");
-
   digitalWrite(FRONT_JACK_EN, HIGH);
   digitalWrite(FRONT_JACK_IN3, HIGH);
   digitalWrite(FRONT_JACK_IN4, LOW);
 }
 
 void frontJackRetract() {
-  Serial.println("Front Jack: RETRACT");
-
   digitalWrite(FRONT_JACK_EN, HIGH);
   digitalWrite(FRONT_JACK_IN3, LOW);
   digitalWrite(FRONT_JACK_IN4, HIGH);
 }
 
 void frontJackStop() {
-  Serial.println("Front Jack: STOP");
-
   digitalWrite(FRONT_JACK_IN3, LOW);
   digitalWrite(FRONT_JACK_IN4, LOW);
 }
@@ -597,13 +516,36 @@ void stopAllJacks() {
 
 
 // ==================================================
+// ULTRASONIC SENSOR FUNCTIONS
+// ==================================================
+
+float readUltrasonicCM(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+
+  if (duration == 0) {
+    return -1.0;
+  }
+
+  float distanceCM = duration * 0.0343 / 2.0;
+  return distanceCM;
+}
+
+
+// ==================================================
 // MPU6500 / MPU6050 BASIC READING
 // ==================================================
 
 void initMPU() {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);   // PWR_MGMT_1 register
-  Wire.write(0x00);   // Wake up MPU
+  Wire.write(0x6B);
+  Wire.write(0x00);
   byte error = Wire.endTransmission();
 
   if (error == 0) {
@@ -615,7 +557,7 @@ void initMPU() {
 
 void readMPU() {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B);   // ACCEL_XOUT_H register
+  Wire.write(0x3B);
   byte error = Wire.endTransmission(false);
 
   if (error != 0) {
@@ -643,8 +585,8 @@ void readMPU() {
 // DEBUG PRINTING
 // ==================================================
 
-void printSensorStatus() {
-  Serial.println("----------- SENSOR STATUS -----------");
+void printDebugStatus() {
+  Serial.println("----------- MEGA STATUS -----------");
 
   Serial.print("Mode: ");
   Serial.println(currentMode);
@@ -655,23 +597,17 @@ void printSensorStatus() {
   Serial.print("Speed PWM: ");
   Serial.println(motorSpeed);
 
-  Serial.print("IR Front Left: ");
-  Serial.println(digitalRead(IR_FRONT_LEFT));
-
-  Serial.print("IR Front Right: ");
-  Serial.println(digitalRead(IR_FRONT_RIGHT));
-
-  Serial.print("IR Rear Left: ");
-  Serial.println(digitalRead(IR_REAR_LEFT));
-
-  Serial.print("IR Rear Right: ");
-  Serial.println(digitalRead(IR_REAR_RIGHT));
-
   Serial.print("Pitch: ");
   Serial.println(pitch);
 
   Serial.print("Roll: ");
   Serial.println(roll);
 
-  Serial.println("-------------------------------------");
+  Serial.print("Front Ultrasonic cm: ");
+  Serial.println(frontUltrasonicCM);
+
+  Serial.print("Rear Ultrasonic cm: ");
+  Serial.println(rearUltrasonicCM);
+
+  Serial.println("-----------------------------------");
 }
