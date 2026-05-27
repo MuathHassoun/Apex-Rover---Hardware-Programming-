@@ -51,7 +51,7 @@
 // UNO GND      -> External power GND
 // ==================================================
 
-#define CAMERA_SERVO_PIN 9
+#define CAMERA_SERVO_PIN A0
 
 
 // ==================================================
