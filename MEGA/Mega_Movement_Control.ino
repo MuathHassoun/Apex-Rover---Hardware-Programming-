@@ -59,19 +59,19 @@
 // ==================================================
 //
 // Front ultrasonic:
-// TRIG ---> Mega Pin 22
-// ECHO ---> Mega Pin 23
+// TRIG ---> Mega Pin A8
+// ECHO ---> Mega Pin A9
 //
-// Rear ultrasonic:
-// TRIG ---> Mega Pin 24
-// ECHO ---> Mega Pin 25
+// Back / Rear ultrasonic:
+// TRIG ---> Mega Pin A11
+// ECHO ---> Mega Pin A12
 // ==================================================
 
-#define FRONT_US_TRIG 22
-#define FRONT_US_ECHO 23
+#define FRONT_US_TRIG A8
+#define FRONT_US_ECHO A9
 
-#define REAR_US_TRIG 24
-#define REAR_US_ECHO 25
+#define REAR_US_TRIG A11
+#define REAR_US_ECHO A12
 
 
 // ==================================================
@@ -184,8 +184,9 @@ void setup() {
   Serial.println("Arduino Mega Ready - Apex Rover");
   Serial.println("USB Serial: Raspberry Pi");
   Serial.println("Serial1: ESP32");
-  Serial.println("IR removed");
-  Serial.println("Ultrasonic enabled for jack height");
+  Serial.println("IR sensors removed");
+  Serial.println("Front Ultrasonic: TRIG A8, ECHO A9");
+  Serial.println("Rear Ultrasonic : TRIG A11, ECHO A12");
   Serial.println("====================================");
 
   Serial1.println("MEGA:READY");
@@ -222,7 +223,7 @@ void loop() {
   frontUltrasonicCM = readUltrasonicCM(FRONT_US_TRIG, FRONT_US_ECHO);
   rearUltrasonicCM = readUltrasonicCM(REAR_US_TRIG, REAR_US_ECHO);
 
-  // Optional debug printing
+  // Debug printing
   if (millis() - lastDebugPrint >= debugPrintInterval) {
     lastDebugPrint = millis();
     printDebugStatus();
@@ -544,8 +545,8 @@ float readUltrasonicCM(int trigPin, int echoPin) {
 
 void initMPU() {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);
-  Wire.write(0x00);
+  Wire.write(0x6B);   // PWR_MGMT_1 register
+  Wire.write(0x00);   // Wake up MPU
   byte error = Wire.endTransmission();
 
   if (error == 0) {
@@ -557,7 +558,7 @@ void initMPU() {
 
 void readMPU() {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B);
+  Wire.write(0x3B);   // ACCEL_XOUT_H register
   byte error = Wire.endTransmission(false);
 
   if (error != 0) {
