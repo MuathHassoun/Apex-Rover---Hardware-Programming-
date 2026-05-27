@@ -13,6 +13,8 @@
 // 6. Two ultrasonic sensors for jack height
 // 7. Two linear actuators using L298N
 //
+// IR sensors removed completely.
+//
 // Raspberry Pi command example:
 // GET:SENSORS
 //
@@ -58,11 +60,11 @@
 // 3) ULTRASONIC SENSOR PINS
 // ==================================================
 //
-// Front ultrasonic:
+// Front Ultrasonic:
 // TRIG ---> Mega Pin A8
 // ECHO ---> Mega Pin A9
 //
-// Back / Rear ultrasonic:
+// Rear / Back Ultrasonic:
 // TRIG ---> Mega Pin A11
 // ECHO ---> Mega Pin A12
 // ==================================================
@@ -98,36 +100,35 @@ float roll = 0;
 // 5) L298N LINEAR ACTUATOR PINS
 // ==================================================
 //
+// Jacks are already enabled by hardware.
+// So we only control IN pins.
+//
 // Rear Jack:
-// ENA ---> Mega Pin 32
-// IN1 ---> Mega Pin 30
-// IN2 ---> Mega Pin 31
+// IN1 ---> Mega Pin A0
+// IN2 ---> Mega Pin A1
 //
 // Front Jack:
-// ENB ---> Mega Pin 35
-// IN3 ---> Mega Pin 33
-// IN4 ---> Mega Pin 34
+// IN3 ---> Mega Pin A3
+// IN4 ---> Mega Pin A4
 // ==================================================
 
-#define REAR_JACK_EN  32
-#define REAR_JACK_IN1 30
-#define REAR_JACK_IN2 31
+#define REAR_JACK_IN1 A0
+#define REAR_JACK_IN2 A1
 
-#define FRONT_JACK_EN  35
-#define FRONT_JACK_IN3 33
-#define FRONT_JACK_IN4 34
+#define FRONT_JACK_IN3 A3
+#define FRONT_JACK_IN4 A4
 
 
 // ==================================================
 // 6) ROBOT STATE
 // ==================================================
 
-int motorSpeed = 150;           // PWM value 0 to 255
+int motorSpeed = 150;           // PWM value from 0 to 255
 String currentMode = "NORMAL";  // NORMAL or CLIMB
 String lastMovement = "STOP";   // FORWARD, BACKWARD, LEFT, RIGHT, STOP
 
-float frontUltrasonicCM = 0;
-float rearUltrasonicCM = 0;
+float frontUltrasonicCM = -1.0;
+float rearUltrasonicCM = -1.0;
 
 unsigned long lastDebugPrint = 0;
 unsigned long debugPrintInterval = 1500;
@@ -157,18 +158,15 @@ void setup() {
   pinMode(REAR_US_TRIG, OUTPUT);
   pinMode(REAR_US_ECHO, INPUT);
 
+  digitalWrite(FRONT_US_TRIG, LOW);
+  digitalWrite(REAR_US_TRIG, LOW);
+
   // L298N jack control pins
-  pinMode(REAR_JACK_EN, OUTPUT);
   pinMode(REAR_JACK_IN1, OUTPUT);
   pinMode(REAR_JACK_IN2, OUTPUT);
 
-  pinMode(FRONT_JACK_EN, OUTPUT);
   pinMode(FRONT_JACK_IN3, OUTPUT);
   pinMode(FRONT_JACK_IN4, OUTPUT);
-
-  // Enable L298N channels
-  digitalWrite(REAR_JACK_EN, HIGH);
-  digitalWrite(FRONT_JACK_EN, HIGH);
 
   // Stop everything at startup
   stopMotors();
@@ -187,6 +185,9 @@ void setup() {
   Serial.println("IR sensors removed");
   Serial.println("Front Ultrasonic: TRIG A8, ECHO A9");
   Serial.println("Rear Ultrasonic : TRIG A11, ECHO A12");
+  Serial.println("Rear Jack : A0, A1");
+  Serial.println("Front Jack: A3, A4");
+  Serial.println("Jacks EN already enabled by hardware");
   Serial.println("====================================");
 
   Serial1.println("MEGA:READY");
@@ -474,16 +475,16 @@ void applyLastMovement() {
 
 // ==================================================
 // LINEAR ACTUATOR FUNCTIONS - L298N
+//
+// EN pins are already enabled by hardware.
 // ==================================================
 
 void rearJackExtend() {
-  digitalWrite(REAR_JACK_EN, HIGH);
   digitalWrite(REAR_JACK_IN1, HIGH);
   digitalWrite(REAR_JACK_IN2, LOW);
 }
 
 void rearJackRetract() {
-  digitalWrite(REAR_JACK_EN, HIGH);
   digitalWrite(REAR_JACK_IN1, LOW);
   digitalWrite(REAR_JACK_IN2, HIGH);
 }
@@ -494,13 +495,11 @@ void rearJackStop() {
 }
 
 void frontJackExtend() {
-  digitalWrite(FRONT_JACK_EN, HIGH);
   digitalWrite(FRONT_JACK_IN3, HIGH);
   digitalWrite(FRONT_JACK_IN4, LOW);
 }
 
 void frontJackRetract() {
-  digitalWrite(FRONT_JACK_EN, HIGH);
   digitalWrite(FRONT_JACK_IN3, LOW);
   digitalWrite(FRONT_JACK_IN4, HIGH);
 }
