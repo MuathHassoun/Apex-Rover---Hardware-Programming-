@@ -1,3 +1,4 @@
+
 import time
 import cv2
 
@@ -13,41 +14,79 @@ from config import (
     MODE_MANUAL,
     MODE_OBJECT,
     MODE_STAIRS,
-    MODE_CLIMB_ASSIST
+    MODE_CLIMB_ASSIST,
+    AUTO_START_CLIMB_UP,
+    AUTO_ARM_DELAY_SEC,
+    CLIMB_ROLL_DANGER,
+    CLIMB_PITCH_DANGER,
+    CLIMB_FRONT_ON_STEP_PITCH,
+    AUTO_CLIMB_ALIGN_SPEED,
+    AUTO_CLIMB_FORWARD_SPEED,
+    AUTO_CLIMB_JACK_DRIVE_SPEED,
+    REAR_JACK_USE_ULTRASONIC,
+    REAR_JACK_EXTEND_STOP_WHEN_LESS_EQUAL,
+    REAR_JACK_EXTEND_TARGET_CM,
+    REAR_JACK_EXTEND_MAX_SEC,
+    REAR_JACK_RETRACT_STOP_WHEN_GREATER_EQUAL,
+    REAR_JACK_RETRACT_TARGET_CM,
+    REAR_JACK_RETRACT_MAX_SEC,
+    DRIVE_WITH_REAR_JACK_SEC,
+    RECOVER_FORWARD_SEC,
+    LEVEL_PITCH_ABS,
+    LEVEL_ROLL_ABS,
+    TOP_LEVEL_TIME_SEC,
+    NO_STAIRS_TOP_TIME_SEC
 )
 
 
 class ApexMainBrain:
     """
-    Apex Rover Main Brain V4
+    Apex Rover Main Brain - Auto Climb UP V1
 
-    This file connects:
-    - ControlBrain: Mega + UNO serial commands
-    - VisionBrain : camera processing
-    - Sensors     : data from Mega
+    This version is for UP stairs only.
 
-    V4 camera fix:
-    - Camera commands are sent raw to UNO V3.
-    - Python does NOT invert CAM:UP / CAM:DOWN.
-    - UNO V3 owns servo inversion using INVERT_SERVO_VERTICAL.
-    - Manual camera keys are direct and repeatable:
-        a = CAM:LEFT
-        d = CAM:RIGHT
-        v = CAM:STOP
-        w = CAM:UP
-        s = CAM:DOWN
-        c = CAM:CENTER
+    Manual observation converted to auto logic:
+    - During climbing up, we keep driving forward along the yellow path.
+    - When the front part of the robot is already on the stair, pitch rises.
+    - Then we use ONLY the rear linear actuator/jack.
+    - Rear jack extends for enough time or until rear ultrasonic target is reached.
+    - Robot drives forward while rear jack is still supporting/lifting.
+    - Then rear jack retracts because it can hit the lower stair part.
+    - Repeat the same process for the next stair.
+
+    Important:
+    - Front jack is NOT used for climbing up in this version.
+    - Both jacks may be used later for DOWN stairs, but not now.
     """
+
+    PHASE_ARMING = "ARMING"
+    PHASE_SEARCH_ALIGN = "SEARCH_ALIGN_YELLOW"
+    PHASE_FORWARD = "FORWARD_ON_YELLOW"
+    PHASE_REAR_JACK_EXTEND = "REAR_JACK_EXTEND"
+    PHASE_DRIVE_WITH_REAR_JACK = "DRIVE_WITH_REAR_JACK"
+    PHASE_REAR_JACK_RETRACT = "REAR_JACK_RETRACT"
+    PHASE_RECOVER_FORWARD = "RECOVER_FORWARD"
+    PHASE_TOP_REACHED = "TOP_REACHED_STOP"
+    PHASE_DANGER_STOP = "DANGER_STOP"
 
     def __init__(self):
         self.control = ControlBrain()
         self.vision = VisionBrain()
 
-        self.mode = MODE_MANUAL
+        self.mode = MODE_CLIMB_ASSIST if AUTO_START_CLIMB_UP else MODE_MANUAL
         self.running = True
 
         self.last_climb_state = "NONE"
         self.last_debug_print_time = 0.0
+
+        # Auto climb state machine variables
+        self.auto_arm_until = time.time() + AUTO_ARM_DELAY_SEC
+        self.climb_phase = self.PHASE_ARMING
+        self.phase_start_time = time.time()
+        self.had_started_climb = False
+        self.level_start_time = None
+        self.no_stairs_since = None
+        self.rear_jack_cycle_count = 0
 
     # ========================================================
     # Start / Info
@@ -69,15 +108,18 @@ class ApexMainBrain:
     def print_start_info(self):
         print()
         print("=================================================")
-        print("       APEX ROVER MODULAR MAIN BRAIN V4")
+        print("       APEX ROVER - AUTO CLIMB UP V1")
         print("=================================================")
+        print()
+        print("Startup mode:", self.mode)
+        print("Auto start climb up:", AUTO_START_CLIMB_UP)
         print()
         print("Modes:")
         print("  0 = IDLE")
         print("  m = MANUAL")
         print("  1 = OBJECT")
         print("  2 = STAIRS")
-        print("  3 = CLIMB_ASSIST")
+        print("  3 = CLIMB_ASSIST / AUTO CLIMB UP")
         print()
         print("Movement:")
         print("  f = forward")
@@ -86,20 +128,16 @@ class ApexMainBrain:
         print("  r = right")
         print("  x = stop")
         print()
-        print("Camera to UNO V3:")
+        print("Camera:")
         print("  a = CAM:LEFT")
         print("  d = CAM:RIGHT")
         print("  v = CAM:STOP")
         print("  w = CAM:UP")
         print("  s = CAM:DOWN")
         print("  c = CAM:CENTER")
-        print("  e = CAM:ENABLE")
-        print("  y = CAM:DISABLE")
         print("  t = CAM:STATUS")
-        print("  [ = CAM:DIR:LEFT + CAM:STEPS:100")
-        print("  ] = CAM:DIR:RIGHT + CAM:STEPS:100")
         print()
-        print("Jacks:")
+        print("Jacks manual test:")
         print("  g = front extend")
         print("  h = front retract")
         print("  n = front stop")
@@ -108,35 +146,101 @@ class ApexMainBrain:
         print("  k = rear stop")
         print("  z = stop all jacks")
         print()
-        print("Other:")
-        print("  p = print sensors")
-        print("  q = quit")
-        print()
-        print("CLIMB_ASSIST uses camera + MPU6500 + ultrasonics + jacks.")
+        print("Auto UP logic:")
+        print("  Follow yellow path -> forward -> rear jack extend -> drive -> rear jack retract -> repeat")
         print("=================================================")
         print()
 
     # ========================================================
-    # Incoming Mega / ESP32
+    # Auto climb state helpers
+    # ========================================================
+
+    def reset_auto_climb(self):
+        self.auto_arm_until = time.time() + AUTO_ARM_DELAY_SEC
+        self.climb_phase = self.PHASE_ARMING
+        self.phase_start_time = time.time()
+        self.had_started_climb = False
+        self.level_start_time = None
+        self.no_stairs_since = None
+        self.rear_jack_cycle_count = 0
+        self.control.stop()
+        self.control.stop_all_jacks()
+
+    def set_climb_phase(self, new_phase):
+        if self.climb_phase == new_phase:
+            return
+
+        print(f"[AUTO CLIMB] Phase: {self.climb_phase} -> {new_phase}")
+
+        self.climb_phase = new_phase
+        self.phase_start_time = time.time()
+
+        if new_phase == self.PHASE_REAR_JACK_EXTEND:
+            self.control.stop()
+            self.control.rear_jack_extend()
+
+        elif new_phase == self.PHASE_DRIVE_WITH_REAR_JACK:
+            # Rear jack stays extended while robot moves forward a little.
+            self.control.set_speed(AUTO_CLIMB_JACK_DRIVE_SPEED)
+            self.control.forward()
+
+        elif new_phase == self.PHASE_REAR_JACK_RETRACT:
+            self.control.stop()
+            self.control.rear_jack_retract()
+
+        elif new_phase == self.PHASE_RECOVER_FORWARD:
+            self.control.set_speed(AUTO_CLIMB_FORWARD_SPEED)
+            self.control.forward()
+
+        elif new_phase in [self.PHASE_TOP_REACHED, self.PHASE_DANGER_STOP]:
+            self.control.stop()
+            self.control.stop_all_jacks()
+            self.control.camera_stop()
+
+    def rear_jack_extend_finished(self, rear_ultrasonic, elapsed):
+        """
+        Rear jack is a linear actuator, so it needs time.
+        We stop it using rear ultrasonic if valid, otherwise by max time fallback.
+        """
+
+        if elapsed >= REAR_JACK_EXTEND_MAX_SEC:
+            return True
+
+        if not REAR_JACK_USE_ULTRASONIC:
+            return False
+
+        if rear_ultrasonic <= 0:
+            return False
+
+        if REAR_JACK_EXTEND_STOP_WHEN_LESS_EQUAL:
+            return rear_ultrasonic <= REAR_JACK_EXTEND_TARGET_CM
+
+        return rear_ultrasonic >= REAR_JACK_EXTEND_TARGET_CM
+
+    def rear_jack_retract_finished(self, rear_ultrasonic, elapsed):
+        """
+        Stop rear jack retract using rear ultrasonic if valid, otherwise by max time fallback.
+        """
+
+        if elapsed >= REAR_JACK_RETRACT_MAX_SEC:
+            return True
+
+        if not REAR_JACK_USE_ULTRASONIC:
+            return False
+
+        if rear_ultrasonic <= 0:
+            return False
+
+        if REAR_JACK_RETRACT_STOP_WHEN_GREATER_EQUAL:
+            return rear_ultrasonic >= REAR_JACK_RETRACT_TARGET_CM
+
+        return rear_ultrasonic <= REAR_JACK_RETRACT_TARGET_CM
+
+    # ========================================================
+    # Incoming Mega / ESP32 / UNO
     # ========================================================
 
     def handle_incoming_mega_lines(self):
-        """
-        Drain available Mega lines so serial buffer does not lag.
-
-        Mega may send:
-            DATA:PITCH=5.2;ROLL=-1.4;UF=8.5;UR=9.1
-
-        ESP32 forwarded through Mega may send:
-            MODE:OBJECT
-            MODE:STAIRS
-            MODE:CLIMB_ASSIST
-            MODE:MANUAL
-            MODE:IDLE
-            TARGET:red
-            CMD:STOP
-        """
-
         for _ in range(8):
             line = self.control.mega.read_line()
 
@@ -177,12 +281,11 @@ class ApexMainBrain:
 
                 continue
 
-    def handle_incoming_uno_lines(self):
-        """
-        Read UNO ACK/status lines without blocking.
-        This helps verify that camera commands reach UNO.
-        """
+            if line.startswith("CAM:"):
+                self.control.send_camera_command(line)
+                continue
 
+    def handle_incoming_uno_lines(self):
         for _ in range(5):
             line = self.control.uno.read_line()
 
@@ -206,6 +309,7 @@ class ApexMainBrain:
 
         elif self.mode == MODE_MANUAL:
             self.control.stop()
+            self.control.stop_all_jacks()
             self.control.camera_center()
 
         elif self.mode == MODE_OBJECT:
@@ -214,168 +318,210 @@ class ApexMainBrain:
 
         elif self.mode == MODE_STAIRS:
             self.control.set_speed(STAIRS_SPEED)
-            # One camera down command when entering mode.
             self.control.camera_down()
 
         elif self.mode == MODE_CLIMB_ASSIST:
+            self.reset_auto_climb()
             self.control.set_speed(CLIMB_SPEED)
             self.control.mode_climb()
-            # One camera down command when entering mode.
             self.control.camera_down()
 
     # ========================================================
-    # Climb Assist - Autonomous stairs logic
+    # Auto Climb UP only
     # ========================================================
 
-    def climb_assist_step(self, stairs):
+    def auto_climb_up_step(self, stairs, yellow):
         """
-        Auto up/down stairs decision using:
-        - Camera stairs detection
-        - MPU6500 pitch/roll
-        - Ultrasonic front/rear
-        - Motors
-        - Front/rear jacks
+        Auto climb UP only.
+
+        Real process based on your manual mobile control:
+        1. Keep pressing forward along the yellow path.
+        2. When the robot front part gets on the stair, pitch rises.
+        3. Use rear linear actuator only.
+        4. Wait for rear jack using rear ultrasonic or time fallback.
+        5. Move forward while rear jack is extended.
+        6. Retract rear jack because it can hit the lower stair.
+        7. Repeat for next stair.
         """
 
         data = self.control.latest_sensor_data
-
         pitch = data.pitch
         roll = data.roll
-        front_distance = data.front_ultrasonic
-        rear_distance = data.rear_ultrasonic
+        rear_ultrasonic = data.rear_ultrasonic
+        now = time.time()
+        elapsed = now - self.phase_start_time
 
         # ==========================================
-        # 1. Emergency balance safety
+        # 1. Emergency safety
         # ==========================================
 
-        if abs(roll) > 25:
-            self.control.stop()
-            self.control.stop_all_jacks()
-            self.control.camera_stop()
+        if abs(roll) > CLIMB_ROLL_DANGER:
+            self.set_climb_phase(self.PHASE_DANGER_STOP)
             return "DANGER_ROLL_STOP"
 
-        if abs(pitch) > 30:
-            self.control.stop()
-            self.control.stop_all_jacks()
-            self.control.camera_stop()
+        if abs(pitch) > CLIMB_PITCH_DANGER:
+            self.set_climb_phase(self.PHASE_DANGER_STOP)
             return "DANGER_PITCH_STOP"
 
         # ==========================================
-        # 2. Camera does not see stairs
+        # 2. Arming wait
+        # ==========================================
+
+        if self.climb_phase == self.PHASE_ARMING:
+            self.control.stop()
+            self.control.stop_all_jacks()
+            self.control.camera_down()
+
+            if now >= self.auto_arm_until:
+                self.set_climb_phase(self.PHASE_SEARCH_ALIGN)
+
+            return "AUTO_ARMING_WAIT"
+
+        # ==========================================
+        # 3. Top / landing detection
         # ==========================================
 
         if not stairs["stairs_found"]:
+            if self.no_stairs_since is None:
+                self.no_stairs_since = now
+        else:
+            self.no_stairs_since = None
+
+        is_level = abs(pitch) <= LEVEL_PITCH_ABS and abs(roll) <= LEVEL_ROLL_ABS
+
+        if self.rear_jack_cycle_count >= 1 and is_level:
+            if self.level_start_time is None:
+                self.level_start_time = now
+        else:
+            self.level_start_time = None
+
+        if (
+            self.rear_jack_cycle_count >= 1 and
+            self.level_start_time is not None and
+            self.no_stairs_since is not None and
+            now - self.level_start_time >= TOP_LEVEL_TIME_SEC and
+            now - self.no_stairs_since >= NO_STAIRS_TOP_TIME_SEC
+        ):
+            self.set_climb_phase(self.PHASE_TOP_REACHED)
+            self.auto_climb_finished = True
+            return "TOP_REACHED_STOP"
+
+        # ==========================================
+        # 4. Rear jack extend phase
+        # ==========================================
+
+        if self.climb_phase == self.PHASE_REAR_JACK_EXTEND:
+            if self.rear_jack_extend_finished(rear_ultrasonic, elapsed):
+                self.control.rear_jack_stop()
+                self.set_climb_phase(self.PHASE_DRIVE_WITH_REAR_JACK)
+                return "REAR_JACK_EXTENDED_DRIVE_NOW"
+
+            return f"REAR_JACK_EXTENDING_UR={rear_ultrasonic:.1f}"
+
+        # ==========================================
+        # 5. Drive while rear jack is extended
+        # ==========================================
+
+        if self.climb_phase == self.PHASE_DRIVE_WITH_REAR_JACK:
+            if elapsed >= DRIVE_WITH_REAR_JACK_SEC:
+                self.set_climb_phase(self.PHASE_REAR_JACK_RETRACT)
+                return "DRIVE_DONE_RETRACT_REAR_JACK"
+
+            return "DRIVING_WITH_REAR_JACK_EXTENDED"
+
+        # ==========================================
+        # 6. Rear jack retract phase
+        # ==========================================
+
+        if self.climb_phase == self.PHASE_REAR_JACK_RETRACT:
+            if self.rear_jack_retract_finished(rear_ultrasonic, elapsed):
+                self.control.rear_jack_stop()
+                self.rear_jack_cycle_count += 1
+                self.set_climb_phase(self.PHASE_RECOVER_FORWARD)
+                return "REAR_JACK_RETRACTED_RECOVER_FORWARD"
+
+            return f"REAR_JACK_RETRACTING_UR={rear_ultrasonic:.1f}"
+
+        # ==========================================
+        # 7. Recover forward after retract
+        # ==========================================
+
+        if self.climb_phase == self.PHASE_RECOVER_FORWARD:
+            if elapsed >= RECOVER_FORWARD_SEC:
+                self.set_climb_phase(self.PHASE_SEARCH_ALIGN)
+                return "RECOVER_DONE_SEARCH_NEXT_STEP"
+
+            return "RECOVER_FORWARD_AFTER_RETRACT"
+
+        # ==========================================
+        # 8. Search / align on yellow path
+        # ==========================================
+
+        if not yellow["yellow_found"]:
             self.control.stop()
-            # Do not keep spinning stepper. Servo down is one small tilt command.
-            self.control.apply_auto_camera_command("CAM:DOWN")
-            return "NO_STAIRS_WAIT"
+            self.control.camera_down()
+            self.set_climb_phase(self.PHASE_SEARCH_ALIGN)
+            return "YELLOW_PATH_NOT_FOUND_WAIT"
 
-        # ==========================================
-        # 3. Too close to obstacle / stair
-        # ==========================================
+        move_cmd, yellow_state = self.vision.decide_yellow_path_action(yellow)
 
-        if front_distance > 0 and front_distance < 5:
-            self.control.stop()
-            self.control.stop_all_jacks()
-            self.control.camera_stop()
-            return "FRONT_TOO_CLOSE_STOP"
-
-        if rear_distance > 0 and rear_distance < 4:
-            self.control.stop()
-            self.control.stop_all_jacks()
-            return "REAR_TOO_CLOSE_STOP"
-
-        # ==========================================
-        # 4. Correct left/right alignment using camera
-        # ==========================================
-
-        move_cmd, vision_state = self.vision.decide_stairs_action(stairs, data)
-
-        if vision_state == "ALIGN_LEFT_TO_STAIRS":
-            self.control.set_speed(30)
+        if yellow_state == "YELLOW_LEFT_ALIGN":
+            self.control.set_speed(AUTO_CLIMB_ALIGN_SPEED)
             self.control.left()
-            return "TURN_LEFT_ALIGN_STAIRS"
+            self.set_climb_phase(self.PHASE_SEARCH_ALIGN)
+            return "ALIGN_LEFT_ON_YELLOW"
 
-        if vision_state == "ALIGN_RIGHT_TO_STAIRS":
-            self.control.set_speed(30)
+        if yellow_state == "YELLOW_RIGHT_ALIGN":
+            self.control.set_speed(AUTO_CLIMB_ALIGN_SPEED)
             self.control.right()
-            return "TURN_RIGHT_ALIGN_STAIRS"
+            self.set_climb_phase(self.PHASE_SEARCH_ALIGN)
+            return "ALIGN_RIGHT_ON_YELLOW"
 
-        if vision_state == "CORRECT_TILT_LEFT":
-            self.control.set_speed(25)
-            self.control.left()
-            return "CAMERA_TILT_LEFT_CORRECTION"
-
-        if vision_state == "CORRECT_TILT_RIGHT":
-            self.control.set_speed(25)
-            self.control.right()
-            return "CAMERA_TILT_RIGHT_CORRECTION"
+        # If yellow is centered, drive forward.
+        if self.climb_phase == self.PHASE_SEARCH_ALIGN:
+            self.set_climb_phase(self.PHASE_FORWARD)
 
         # ==========================================
-        # 5. MPU6500 balance decisions
+        # 9. Forward on yellow and trigger rear jack
         # ==========================================
 
-        if pitch > 15 and pitch <= 25:
-            self.control.stop()
+        if self.climb_phase == self.PHASE_FORWARD:
+            self.control.set_speed(AUTO_CLIMB_FORWARD_SPEED)
+            self.control.forward()
 
-            self.control.front_jack_extend()
-            time.sleep(0.25)
-            self.control.front_jack_stop()
+            # Front of robot is on the stair: pitch goes up.
+            # Then use rear jack only.
+            if pitch >= CLIMB_FRONT_ON_STEP_PITCH:
+                self.had_started_climb = True
+                self.set_climb_phase(self.PHASE_REAR_JACK_EXTEND)
+                return "FRONT_ON_STEP_START_REAR_JACK"
 
-            return "FRONT_JACK_BALANCE_ASSIST"
+            return "FORWARD_ON_YELLOW_WAITING_FOR_STEP"
 
-        if pitch < -10 and pitch >= -25:
-            self.control.stop()
-
-            self.control.rear_jack_extend()
-            time.sleep(0.25)
-            self.control.rear_jack_stop()
-
-            return "REAR_JACK_BALANCE_ASSIST"
-
-        if roll > 12:
-            self.control.stop()
-            self.control.set_speed(25)
-            self.control.left()
-            time.sleep(0.2)
-            self.control.stop()
-            return "ROLL_RIGHT_CORRECTION"
-
-        if roll < -12:
-            self.control.stop()
-            self.control.set_speed(25)
-            self.control.right()
-            time.sleep(0.2)
-            self.control.stop()
-            return "ROLL_LEFT_CORRECTION"
-
-        # ==========================================
-        # 6. Safe forward climb
-        # ==========================================
-
-        self.control.set_speed(35)
-        self.control.forward()
-
-        return "BALANCED_FORWARD_SLOW"
+        return f"AUTO_CLIMB_PHASE_{self.climb_phase}"
 
     # ========================================================
     # Debug
     # ========================================================
 
-    def print_climb_debug_every_second(self, state):
+    def print_climb_debug_every_second(self, state, yellow=None):
         now = time.time()
 
         if now - self.last_debug_print_time < 1.0:
             return
 
         self.last_debug_print_time = now
-
         data = self.control.latest_sensor_data
 
+        yellow_text = ""
+        if yellow is not None:
+            yellow_text = f" yellow={yellow['state']} err={yellow['error_x']}"
+
         print(
-            f"[CLIMB] state={state} "
+            f"[CLIMB_UP] phase={self.climb_phase} state={state} "
             f"pitch={data.pitch:.2f} roll={data.roll:.2f} "
-            f"UF={data.front_ultrasonic:.2f} UR={data.rear_ultrasonic:.2f}"
+            f"UF={data.front_ultrasonic:.2f} UR={data.rear_ultrasonic:.2f} "
+            f"cycles={self.rear_jack_cycle_count}{yellow_text}"
         )
 
     # ========================================================
@@ -399,10 +545,6 @@ class ApexMainBrain:
             mask = None
             data = self.control.latest_sensor_data
 
-            # ====================================================
-            # OBJECT MODE
-            # ====================================================
-
             if self.mode == MODE_OBJECT:
                 detection, mask = self.vision.detect_color_object(frame)
                 move_cmd, cam_cmd, state = self.vision.decide_object_action(detection)
@@ -415,10 +557,6 @@ class ApexMainBrain:
                     self.mode, self.control.speed, data
                 )
 
-            # ====================================================
-            # STAIRS MODE
-            # ====================================================
-
             elif self.mode == MODE_STAIRS:
                 stairs, stairs_debug, edges = self.vision.detect_stairs(frame)
                 move_cmd, state = self.vision.decide_stairs_action(stairs, data)
@@ -429,40 +567,33 @@ class ApexMainBrain:
                     stairs_debug, stairs, move_cmd, state,
                     self.mode, self.control.speed, data
                 )
-
                 mask = edges
-
-            # ====================================================
-            # CLIMB ASSIST MODE
-            # ====================================================
 
             elif self.mode == MODE_CLIMB_ASSIST:
                 stairs, stairs_debug, edges = self.vision.detect_stairs(frame)
+                yellow, yellow_mask = self.vision.detect_yellow_path(frame)
 
-                state = self.climb_assist_step(stairs)
+                state = self.auto_climb_up_step(stairs, yellow)
                 self.last_climb_state = state
-                self.print_climb_debug_every_second(state)
+                self.print_climb_debug_every_second(state, yellow)
 
                 debug_frame = self.vision.draw_stairs_debug(
-                    stairs_debug, stairs, "AUTO", state,
+                    stairs_debug, stairs, "AUTO_UP", state,
                     self.mode, self.control.speed, data
                 )
 
-                mask = edges
-
-            # ====================================================
-            # IDLE / MANUAL
-            # ====================================================
+                debug_frame = self.vision.draw_yellow_path_debug(debug_frame, yellow)
+                mask = yellow_mask
 
             else:
                 debug_frame = self.vision.draw_idle_debug(
                     frame, self.mode, self.control.speed, data
                 )
 
-            cv2.imshow("Apex Rover Modular Brain V4", debug_frame)
+            cv2.imshow("Apex Rover Auto Climb UP V1", debug_frame)
 
             if mask is not None:
-                cv2.imshow("Vision Mask / Edges", mask)
+                cv2.imshow("Yellow Path / Vision Mask", mask)
 
             self.handle_keyboard()
             time.sleep(CAPTURE_DELAY)
@@ -478,10 +609,6 @@ class ApexMainBrain:
 
         if key == 255:
             return
-
-        # ----------------------------
-        # Modes
-        # ----------------------------
 
         if key == ord("q"):
             self.running = False
@@ -501,10 +628,6 @@ class ApexMainBrain:
         elif key == ord("3"):
             self.change_mode(MODE_CLIMB_ASSIST)
 
-        # ----------------------------
-        # Manual movement to Mega
-        # ----------------------------
-
         elif key == ord("f"):
             self.control.forward()
 
@@ -519,10 +642,6 @@ class ApexMainBrain:
 
         elif key == ord("x"):
             self.control.stop()
-
-        # ----------------------------
-        # Camera to UNO V3 - direct raw
-        # ----------------------------
 
         elif key == ord("w"):
             self.control.camera_up()
@@ -542,28 +661,8 @@ class ApexMainBrain:
         elif key == ord("c"):
             self.control.camera_center()
 
-        elif key == ord("e"):
-            self.control.camera_enable()
-
-        elif key == ord("y"):
-            self.control.camera_disable()
-
         elif key == ord("t"):
             self.control.camera_status()
-
-        elif key == ord("["):
-            self.control.camera_dir_left()
-            time.sleep(0.02)
-            self.control.camera_steps(100)
-
-        elif key == ord("]"):
-            self.control.camera_dir_right()
-            time.sleep(0.02)
-            self.control.camera_steps(100)
-
-        # ----------------------------
-        # Jacks to Mega
-        # ----------------------------
 
         elif key == ord("g"):
             self.control.front_jack_extend()
@@ -586,10 +685,6 @@ class ApexMainBrain:
         elif key == ord("z"):
             self.control.stop_all_jacks()
 
-        # ----------------------------
-        # Sensors
-        # ----------------------------
-
         elif key == ord("p"):
             self.control.print_sensor_data()
 
@@ -598,7 +693,7 @@ class ApexMainBrain:
     # ========================================================
 
     def shutdown(self):
-        print("[SYSTEM] Shutting down modular brain V4")
+        print("[SYSTEM] Shutting down Auto Climb UP V1")
 
         try:
             self.control.shutdown()
