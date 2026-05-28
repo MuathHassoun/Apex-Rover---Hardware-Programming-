@@ -1,3 +1,4 @@
+
 # ============================================================
 # Apex Rover Brain Configuration - V2 Fast Modular Version
 # ============================================================
@@ -58,3 +59,63 @@ COLOR_RANGES = {
     "black": [((0, 0, 0), (180, 255, 60))],
     "white": [((0, 0, 180), (180, 60, 255))]
 }
+
+# ============================================================
+# AUTO CLIMB UP V1 SETTINGS
+# ============================================================
+# When True, main_brain.py starts directly in CLIMB_ASSIST after boot.
+AUTO_START_CLIMB_UP = True
+AUTO_ARM_DELAY_SEC = 3.0
+
+# Yellow guide path tracking. The robot follows the yellow path while climbing.
+YELLOW_PATH_MIN_AREA = 900
+YELLOW_PATH_CENTER_TOLERANCE = 80
+YELLOW_HSV_LOWER = (15, 60, 60)
+YELLOW_HSV_UPPER = (45, 255, 255)
+
+# Safety thresholds from MPU6500
+CLIMB_ROLL_DANGER = 25.0
+CLIMB_PITCH_DANGER = 32.0
+
+# Start rear jack cycle when the front part is already on the stair.
+# If your pitch sign is reversed, change this to a negative value and update condition in main if needed.
+CLIMB_FRONT_ON_STEP_PITCH = 8.0
+
+# Speeds during auto climb up
+AUTO_CLIMB_ALIGN_SPEED = 25
+AUTO_CLIMB_FORWARD_SPEED = 30
+AUTO_CLIMB_JACK_DRIVE_SPEED = 28
+
+# Rear jack only is used for climbing up.
+# Linear actuator takes time, so we keep it running until ultrasonic target OR max time.
+REAR_JACK_USE_ULTRASONIC = True
+
+# If rear ultrasonic distance becomes smaller when jack goes down/touches ground, keep True.
+# If your reading increases when jack extends, set this False.
+REAR_JACK_EXTEND_STOP_WHEN_LESS_EQUAL = True
+REAR_JACK_EXTEND_TARGET_CM = 6.0
+REAR_JACK_EXTEND_MAX_SEC = 20.0
+
+# If rear ultrasonic distance becomes larger when jack retracts, keep True.
+# If your reading decreases when jack retracts, set this False.
+REAR_JACK_RETRACT_STOP_WHEN_GREATER_EQUAL = True
+REAR_JACK_RETRACT_TARGET_CM = 14.0
+REAR_JACK_RETRACT_MAX_SEC = 20.0
+
+# After rear jack lifts robot, drive forward while rear jack stays extended, then retract it.
+DRIVE_WITH_REAR_JACK_SEC = 4.0
+RECOVER_FORWARD_SEC = 3.0
+
+# Detect top/landing: after at least one rear-jack cycle, pitch/roll become level and stairs disappear.
+LEVEL_PITCH_ABS = 6.0
+LEVEL_ROLL_ABS = 8.0
+TOP_LEVEL_TIME_SEC = 2.0
+NO_STAIRS_TOP_TIME_SEC = 1.5
+
+FORWARD_ON_YELLOW_SPEED = 30
+
+DRIVE_WITH_REAR_JACK_SPEED = 28
+
+RECOVER_FORWARD_SPEED = 30
+
+MIN_FORWARD_BEFORE_JACK_SEC = 1.5
