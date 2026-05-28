@@ -1,0 +1,114 @@
+#include <Servo.h>
+
+#define EN_PIN A1
+#define STEP_PIN 12
+#define DIR_PIN A2
+#define SERVO_PIN A0
+
+Servo cameraServo;
+
+int angle = 90;
+int direction = 0;
+
+unsigned long lastStepTime = 0;
+unsigned long stepInterval = 1200;
+
+void setup() {
+  Serial.begin(9600);
+  Serial.setTimeout(50);
+
+  pinMode(EN_PIN, OUTPUT);
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+
+  digitalWrite(EN_PIN, LOW);     // Enable A4988
+  digitalWrite(STEP_PIN, LOW);
+  digitalWrite(DIR_PIN, LOW);
+
+  cameraServo.attach(SERVO_PIN);
+  cameraServo.write(angle);
+
+  Serial.println("UNO Camera Stand Simple Test Ready");
+}
+
+void loop() {
+  readCommand();
+  runStepper();
+}
+
+void readCommand() {
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    Serial.print("RX:");
+    Serial.println(cmd);
+
+    if (cmd == "CAM:LEFT") {
+      direction = -1;
+      digitalWrite(DIR_PIN, LOW);
+      digitalWrite(EN_PIN, LOW);
+      Serial.println("ACK:CAM:LEFT");
+    }
+
+    else if (cmd == "CAM:RIGHT") {
+      direction = 1;
+      digitalWrite(DIR_PIN, HIGH);
+      digitalWrite(EN_PIN, LOW);
+      Serial.println("ACK:CAM:RIGHT");
+    }
+
+    else if (cmd == "CAM:STOP") {
+      direction = 0;
+      digitalWrite(STEP_PIN, LOW);
+      Serial.println("ACK:CAM:STOP");
+    }
+
+    else if (cmd == "CAM:UP") {
+      angle -= 5;   // inverted fix
+      angle = constrain(angle, 30, 150);
+      cameraServo.write(angle);
+      Serial.print("ANGLE:");
+      Serial.println(angle);
+    }
+
+    else if (cmd == "CAM:DOWN") {
+      angle += 5;   // inverted fix
+      angle = constrain(angle, 30, 150);
+      cameraServo.write(angle);
+      Serial.print("ANGLE:");
+      Serial.println(angle);
+    }
+
+    else if (cmd == "CAM:CENTER") {
+      direction = 0;
+      angle = 90;
+      digitalWrite(STEP_PIN, LOW);
+      cameraServo.write(angle);
+      Serial.println("ACK:CAM:CENTER");
+    }
+
+    else if (cmd == "CAM:STATUS") {
+      Serial.print("DATA:CAMERA:ANGLE=");
+      Serial.print(angle);
+      Serial.print(";DIR=");
+      Serial.println(direction);
+    }
+  }
+}
+
+void runStepper() {
+  if (direction == 0) {
+    return;
+  }
+
+  unsigned long now = micros();
+
+  if (now - lastStepTime >= stepInterval) {
+    lastStepTime = now;
+
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(3);
+    digitalWrite(STEP_PIN, LOW);
+  }
+}
