@@ -1,3 +1,4 @@
+
 import cv2
 import math
 import numpy as np
@@ -296,6 +297,162 @@ class VisionBrain:
                 return "LEFT", "CORRECT_TILT_LEFT"
 
         return "FORWARD", "STAIRS_CENTERED_FORWARD"
+
+
+    # ========================================================
+    # Yellow Path Detection
+    # ========================================================
+
+    def detect_yellow_path(self, frame):
+        """
+        Detect the yellow guide path on the stairs.
+
+        Returns:
+            yellow_result, yellow_mask
+
+        yellow_result contains:
+            yellow_found, line_count, center_x, center_y, error_x, area, state
+        """
+
+        from config import (
+            YELLOW_HSV_LOWER,
+            YELLOW_HSV_UPPER,
+            YELLOW_PATH_MIN_AREA
+        )
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        lower = np.array(YELLOW_HSV_LOWER)
+        upper = np.array(YELLOW_HSV_UPPER)
+
+        mask = cv2.inRange(hsv, lower, upper)
+
+        # Clean small noise and close gaps in the yellow tape/strips.
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.erode(mask, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+
+        # Focus on the lower/middle part of the image because this is where
+        # the robot should follow the yellow guide path.
+        roi_y_start = int(FRAME_HEIGHT * 0.30)
+        roi_mask = mask[roi_y_start:FRAME_HEIGHT, 0:FRAME_WIDTH]
+
+        contours, _ = cv2.findContours(
+            roi_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        valid = []
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+
+            if area < YELLOW_PATH_MIN_AREA:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            y_full = y + roi_y_start
+
+            valid.append({
+                "x": x,
+                "y": y_full,
+                "w": w,
+                "h": h,
+                "area": area,
+                "center_x": x + w // 2,
+                "center_y": y_full + h // 2
+            })
+
+        if len(valid) == 0:
+            return {
+                "yellow_found": False,
+                "line_count": 0,
+                "center_x": None,
+                "center_y": None,
+                "error_x": None,
+                "area": 0,
+                "state": "NO_YELLOW_PATH"
+            }, mask
+
+        valid_sorted = sorted(valid, key=lambda item: item["center_x"])
+
+        # If two yellow strips are visible, drive between them.
+        if len(valid_sorted) >= 2:
+            left = valid_sorted[0]
+            right = valid_sorted[-1]
+
+            center_x = int((left["center_x"] + right["center_x"]) / 2)
+            center_y = int((left["center_y"] + right["center_y"]) / 2)
+            total_area = left["area"] + right["area"]
+            state = "TWO_YELLOW_PATHS"
+
+        # If only one strip is visible, follow its center for now.
+        else:
+            one = valid_sorted[0]
+            center_x = one["center_x"]
+            center_y = one["center_y"]
+            total_area = one["area"]
+            state = "ONE_YELLOW_PATH"
+
+        frame_center_x = FRAME_WIDTH // 2
+        error_x = center_x - frame_center_x
+
+        return {
+            "yellow_found": True,
+            "line_count": len(valid_sorted),
+            "center_x": center_x,
+            "center_y": center_y,
+            "error_x": error_x,
+            "area": total_area,
+            "state": state
+        }, mask
+
+    def decide_yellow_path_action(self, yellow):
+        """
+        Decide how to align robot on yellow path.
+
+        Returns:
+            move_command, state
+        """
+
+        from config import YELLOW_PATH_CENTER_TOLERANCE
+
+        if not yellow["yellow_found"]:
+            return "STOP", "YELLOW_NOT_FOUND"
+
+        error_x = yellow["error_x"]
+
+        if error_x < -YELLOW_PATH_CENTER_TOLERANCE:
+            return "LEFT", "YELLOW_LEFT_ALIGN"
+
+        if error_x > YELLOW_PATH_CENTER_TOLERANCE:
+            return "RIGHT", "YELLOW_RIGHT_ALIGN"
+
+        return "FORWARD", "YELLOW_CENTERED"
+
+    def draw_yellow_path_debug(self, frame, yellow):
+        """
+        Draw yellow path tracking info on the debug frame.
+        """
+
+        if not yellow["yellow_found"]:
+            cv2.putText(frame, "YELLOW: NOT FOUND", (20, 315),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            return frame
+
+        cx = yellow["center_x"]
+        cy = yellow["center_y"]
+
+        cv2.circle(frame, (cx, cy), 8, (0, 255, 255), -1)
+
+        cv2.putText(frame, f"YELLOW: {yellow['state']}", (20, 315),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        cv2.putText(frame, f"YELLOW ERROR: {yellow['error_x']}", (20, 350),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        return frame
 
     # ========================================================
     # Drawing
