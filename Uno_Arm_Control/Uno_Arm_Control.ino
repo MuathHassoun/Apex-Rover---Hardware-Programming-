@@ -218,7 +218,6 @@ void enableStepper() {
 }
 
 void disableStepper() {
-  stopStepper(false);
   digitalWrite(EN_PIN, HIGH);    // A4988 disabled
   stepperEnabled = false;
 }
