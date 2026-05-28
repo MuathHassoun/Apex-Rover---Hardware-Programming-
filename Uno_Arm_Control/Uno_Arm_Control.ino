@@ -1,7 +1,7 @@
 #include <Servo.h>
 
 // ==================================================
-// Arduino UNO - Apex Rover Camera Mount + ARM Placeholder V2
+// Arduino UNO - Apex Rover Camera Mount + ARM Placeholder V3
 //
 // Raspberry Pi sends commands to Arduino UNO through USB Serial.
 //
@@ -17,15 +17,23 @@
 // ARM control is kept as a placeholder for advanced control later.
 // Do NOT remove ARM section.
 //
-// V2 Updates:
-// - Full stepper control
-// - Continuous left/right movement
-// - Stop command
-// - Enable / disable A4988
-// - Set direction only
-// - Move exact number of steps
-// - Change speed from Raspberry Pi
-// - Status command
+// V3 Fixes over V2:
+// [FIX 1] Serial.setTimeout changed from 10ms to 50ms
+//         -> At 9600 baud each character takes ~1ms
+//         -> Commands like CAM:STEPS:200 are 14 chars = ~14ms
+//         -> 10ms caused commands to be cut off as UNKNOWN_COMMAND
+//
+// [FIX 2] DIR_PIN moved from Pin 13 to Pin A2
+//         -> Pin 13 has onboard LED + ~1k resistor
+//         -> This pulled the DIR signal and caused unreliable direction
+//         -> A2 is a clean GPIO with no interference
+//
+// [FIX 3] Double ACK removed from CAM:LEFT and CAM:RIGHT
+//         -> startStepperContinuous() was sending ACK:CAM:START
+//         -> Then handleCameraCommand() also sent ACK:CAM:LEFT / ACK:CAM:RIGHT
+//         -> Raspberry Pi was receiving 2 responses for 1 command
+//         -> Fixed: startStepperContinuous() no longer sends any ACK
+//         -> Each command handler is responsible for its own ACK only
 // ==================================================
 
 
@@ -35,7 +43,7 @@
 //
 // A4988 EN   -> Arduino UNO Pin A1
 // A4988 STEP -> Arduino UNO Pin D12
-// A4988 DIR  -> Arduino UNO Pin D13
+// A4988 DIR  -> Arduino UNO Pin A2   <-- CHANGED from D13 to A2 (FIX 2)
 //
 // A4988:
 // EN LOW  = enabled
@@ -50,7 +58,7 @@
 
 #define EN_PIN   A1
 #define STEP_PIN 12
-#define DIR_PIN  13
+#define DIR_PIN  A2    // <-- FIXED: was 13 (onboard LED pin), now A2
 
 
 // ==================================================
@@ -74,8 +82,8 @@ Servo cameraServo;
 
 int cameraAngle = 90;
 
-const int SERVO_MIN = 30;
-const int SERVO_MAX = 150;
+const int SERVO_MIN  = 30;
+const int SERVO_MAX  = 150;
 const int SERVO_STEP = 5;
 
 // If UP/DOWN is reversed, keep this true.
@@ -99,7 +107,7 @@ const bool INVERT_SERVO_VERTICAL = true;
 // ==================================================
 
 int cameraDirection = 0;
-int stepperMode = 0;
+int stepperMode     = 0;
 
 bool stepperEnabled = false;
 
@@ -138,7 +146,7 @@ const bool DISABLE_STEPPER_WHEN_STOPPED = false;
 // ARM:GRIPPER:CLOSE
 // ==================================================
 
-bool armEnabled = false;
+bool   armEnabled    = false;
 String lastArmCommand = "NONE";
 
 
@@ -148,15 +156,17 @@ String lastArmCommand = "NONE";
 
 void setup() {
   Serial.begin(9600);
-  Serial.setTimeout(10);
+  Serial.setTimeout(50);   // <-- FIXED: was 10ms, now 50ms (FIX 1)
+                            //     10ms was too short at 9600 baud
+                            //     long commands like CAM:STEPS:200 were getting cut off
 
   // Stepper pins
   pinMode(STEP_PIN, OUTPUT);
-  pinMode(DIR_PIN, OUTPUT);
-  pinMode(EN_PIN, OUTPUT);
+  pinMode(DIR_PIN,  OUTPUT);
+  pinMode(EN_PIN,   OUTPUT);
 
   digitalWrite(STEP_PIN, LOW);
-  digitalWrite(DIR_PIN, LOW);
+  digitalWrite(DIR_PIN,  LOW);
 
   // Enable A4988 at startup
   enableStepper();
@@ -166,10 +176,10 @@ void setup() {
   cameraServo.write(cameraAngle);
 
   Serial.println("====================================");
-  Serial.println("UNO Ready - Apex Rover Camera Mount V2");
+  Serial.println("UNO Ready - Apex Rover Camera Mount V3");
   Serial.println("Stepper EN   : A1");
   Serial.println("Stepper STEP : D12");
-  Serial.println("Stepper DIR  : D13");
+  Serial.println("Stepper DIR  : A2  (fixed from D13)");
   Serial.println("Servo Pin    : A0");
   Serial.println("ARM placeholder enabled");
   Serial.println("====================================");
@@ -212,46 +222,6 @@ void loop() {
 // Stepper Low-Level Control
 // ==================================================
 
-void enableStepper() {
-  digitalWrite(EN_PIN, LOW);     // A4988 enabled
-  stepperEnabled = true;
-}
-
-void disableStepper() {
-  digitalWrite(EN_PIN, HIGH);    // A4988 disabled
-  stepperEnabled = false;
-}
-
-void setStepperDirection(int dir) {
-  if (dir < 0) {
-    cameraDirection = -1;
-    digitalWrite(DIR_PIN, LOW);
-  }
-
-  else if (dir > 0) {
-    cameraDirection = 1;
-    digitalWrite(DIR_PIN, HIGH);
-  }
-
-  else {
-    cameraDirection = 0;
-  }
-}
-
-void startStepperContinuous() {
-  // If no direction selected, default right
-  if (cameraDirection == 0) {
-    setStepperDirection(1);
-  }
-
-  enableStepper();
-
-  stepperMode = 1;
-  stepsRemaining = 0;
-
-  Serial.println("ACK:CAM:START");
-}
-
 void startStepperSteps(long stepCount) {
   if (stepCount <= 0) {
     Serial.println("ERROR:CAM:STEPS_INVALID");
@@ -265,17 +235,17 @@ void startStepperSteps(long stepCount) {
 
   enableStepper();
 
-  stepperMode = 2;
-  stepsRemaining = stepCount;
+  stepperMode     = 2;
+  stepsRemaining  = stepCount;
 
   Serial.print("ACK:CAM:STEPS:");
   Serial.println(stepsRemaining);
 }
 
 void stopStepper(bool sendAck = true) {
-  stepperMode = 0;
+  stepperMode     = 0;
   cameraDirection = 0;
-  stepsRemaining = 0;
+  stepsRemaining  = 0;
 
   digitalWrite(STEP_PIN, LOW);
 
@@ -287,6 +257,59 @@ void stopStepper(bool sendAck = true) {
   if (sendAck) {
     Serial.println("ACK:CAM:STOP");
   }
+}
+
+void enableStepper() {
+  digitalWrite(EN_PIN, LOW);   // A4988: EN LOW = enabled
+  stepperEnabled = true;
+}
+
+void disableStepper() {
+  stopStepper(false);
+  digitalWrite(EN_PIN, HIGH);  // A4988: EN HIGH = disabled
+  stepperEnabled = false;
+}
+
+void setStepperDirection(int dir) {
+  if (dir < 0) {
+    cameraDirection = -1;
+    digitalWrite(DIR_PIN, LOW);
+  }
+  else if (dir > 0) {
+    cameraDirection = 1;
+    digitalWrite(DIR_PIN, HIGH);
+  }
+  else {
+    cameraDirection = 0;
+  }
+}
+
+// ==================================================
+// startStepperContinuous
+// --------------------------------------------------
+// FIXED V3: This function no longer sends any ACK.
+// Each command (CAM:LEFT, CAM:RIGHT, CAM:START) sends
+// its own correct ACK from handleCameraCommand().
+//
+// V2 problem:
+// CAM:LEFT called startStepperContinuous() which sent
+// "ACK:CAM:START", then CAM:LEFT also sent "ACK:CAM:LEFT"
+// -> Raspberry Pi received 2 responses for 1 command.
+// ==================================================
+
+void startStepperContinuous() {
+  // If no direction selected, default right
+  if (cameraDirection == 0) {
+    setStepperDirection(1);
+  }
+
+  enableStepper();
+
+  stepperMode    = 1;
+  stepsRemaining = 0;
+
+  // NO Serial.println here anymore (FIX 3)
+  // ACK is sent by the calling command handler
 }
 
 void makeOneStepPulse() {
@@ -312,17 +335,9 @@ void makeOneStepPulse() {
 // ==================================================
 
 void runCameraStepper() {
-  if (stepperMode == 0) {
-    return;
-  }
-
-  if (!stepperEnabled) {
-    return;
-  }
-
-  if (cameraDirection == 0) {
-    return;
-  }
+  if (stepperMode == 0)     return;
+  if (!stepperEnabled)      return;
+  if (cameraDirection == 0) return;
 
   unsigned long now = micros();
 
@@ -362,11 +377,9 @@ void readRaspberryCommands() {
     if (command.startsWith("CAM:")) {
       handleCameraCommand(command);
     }
-
     else if (command.startsWith("ARM:")) {
       handleArmCommand(command);
     }
-
     else {
       Serial.print("ERROR:UNKNOWN_COMMAND:");
       Serial.println(command);
@@ -388,17 +401,18 @@ void handleCameraCommand(String command) {
   if (command == "CAM:LEFT") {
     setStepperDirection(-1);
     startStepperContinuous();
-    Serial.println("ACK:CAM:LEFT");
+    Serial.println("ACK:CAM:LEFT");    // <-- FIXED: only 1 ACK now (FIX 3)
   }
 
   else if (command == "CAM:RIGHT") {
     setStepperDirection(1);
     startStepperContinuous();
-    Serial.println("ACK:CAM:RIGHT");
+    Serial.println("ACK:CAM:RIGHT");   // <-- FIXED: only 1 ACK now (FIX 3)
   }
 
   else if (command == "CAM:START") {
     startStepperContinuous();
+    Serial.println("ACK:CAM:START");   // <-- FIXED: only 1 ACK now (FIX 3)
   }
 
   else if (command == "CAM:STOP") {
@@ -452,18 +466,14 @@ void handleCameraCommand(String command) {
   //
   // Smaller = faster
   // Bigger  = slower
+  // Min = 300, Max = 10000
   // ------------------------------
 
   else if (command.startsWith("CAM:SPEED:")) {
-    unsigned long value = command.substring(10).toInt();
+    unsigned long value = (unsigned long)command.substring(10).toInt();
 
-    if (value < 300) {
-      value = 300;
-    }
-
-    if (value > 10000) {
-      value = 10000;
-    }
+    if (value < 300)   value = 300;
+    if (value > 10000) value = 10000;
 
     stepIntervalMicros = value;
 
@@ -481,7 +491,6 @@ void handleCameraCommand(String command) {
     } else {
       cameraAngle += SERVO_STEP;
     }
-
     updateCameraServo();
     Serial.println("ACK:CAM:UP");
   }
@@ -492,7 +501,6 @@ void handleCameraCommand(String command) {
     } else {
       cameraAngle -= SERVO_STEP;
     }
-
     updateCameraServo();
     Serial.println("ACK:CAM:DOWN");
   }
