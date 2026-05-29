@@ -1,8 +1,17 @@
+
+
+
 #include <Servo.h>
 #include <SoftwareSerial.h>
 
 // ==================================================
 // Arduino UNO - Apex Rover Camera Stand SAFE COMMAND VERSION
+//
+// Supports two control modes:
+// MANUAL  = accept CAM commands from ESP32 / Mobile App
+// AUTO    = accept CAM commands from Raspberry Pi through USB Serial
+//
+// Default mode: MANUAL
 //
 // Hardware:
 // A4988 EN   -> A1
@@ -10,10 +19,11 @@
 // A4988 DIR  -> A2
 // Servo      -> A0
 // ESP32 TX   -> D2  (SoftwareSerial RX)
+// Raspberry  -> UNO USB Serial
 // ==================================================
 
 // ==================================================
-// Commands from Raspberry PI:
+// Camera commands:
 // CAM:LEFT      stepper continuous left
 // CAM:RIGHT     stepper continuous right
 // CAM:STOP      stop stepper
@@ -21,6 +31,10 @@
 // CAM:DOWN      servo down
 // CAM:CENTER    servo center + stop stepper
 // CAM:STATUS    print status
+//
+// System mode commands:
+// SYS:MODE:MANUAL
+// SYS:MODE:AUTO
 // ==================================================
 
 #define EN_PIN     A1
@@ -33,8 +47,9 @@ SoftwareSerial espSerial(2, 3);
 
 Servo cameraServo;
 
-int servoAngle = 90;
+String systemMode = "MANUAL";  // Default mode
 
+int servoAngle = 90;
 int stepperDirection = 0;
 
 unsigned long lastStepTime = 0;
@@ -71,20 +86,15 @@ void setup() {
 
   Serial.println("====================================");
   Serial.println("UNO Camera Stand SAFE Command Code");
+  Serial.println("Default System Mode: MANUAL");
+  Serial.println("MANUAL: commands from ESP32/Mobile");
+  Serial.println("AUTO: commands from Raspberry Pi USB");
   Serial.println("EN   = A1");
   Serial.println("STEP = D12");
   Serial.println("DIR  = A2");
   Serial.println("SERVO= A0");
   Serial.println("ESP32= D2 (SoftwareSerial RX)");
   Serial.println("====================================");
-  Serial.println("Commands:");
-  Serial.println("CAM:LEFT");
-  Serial.println("CAM:RIGHT");
-  Serial.println("CAM:STOP");
-  Serial.println("CAM:UP");
-  Serial.println("CAM:DOWN");
-  Serial.println("CAM:CENTER");
-  Serial.println("CAM:STATUS");
 }
 
 
@@ -93,30 +103,108 @@ void setup() {
 // ==================================================
 
 void loop() {
-  readCommand();
+  readCommands();
   runStepper();
 }
 
 
 // ==================================================
-// Read command from BOTH Serial and espSerial
+// Read command from BOTH Raspberry USB Serial and ESP32 SoftwareSerial
 // ==================================================
 
-void readCommand() {
-  String cmd = "";
-
+void readCommands() {
   if (Serial.available() > 0) {
-    cmd = Serial.readStringUntil('\n');
-  }
-  else if (espSerial.available() > 0) {
-    cmd = espSerial.readStringUntil('\n');
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd.length() > 0) {
+      handleCommand(cmd, "RASPBERRY_PI");
+    }
   }
 
+  if (espSerial.available() > 0) {
+    String cmd = espSerial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd.length() > 0) {
+      handleCommand(cmd, "ESP32");
+    }
+  }
+}
+
+
+// ==================================================
+// Command handler with MANUAL / AUTO gate
+// ==================================================
+
+void handleCommand(String cmd, String sourceName) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
   Serial.print("RX:");
+  Serial.print(sourceName);
+  Serial.print(":");
   Serial.println(cmd);
+
+  // --------------------------
+  // System mode commands
+  // --------------------------
+
+  if (cmd == "SYS:MODE:MANUAL") {
+    systemMode = "MANUAL";
+    stopCameraMotion();
+    Serial.println("ACK:SYS:MODE:MANUAL");
+    return;
+  }
+
+  if (cmd == "SYS:MODE:AUTO") {
+    systemMode = "AUTO";
+    stopCameraMotion();
+    Serial.println("ACK:SYS:MODE:AUTO");
+    return;
+  }
+
+  // --------------------------
+  // Always allowed safety/status commands
+  // --------------------------
+
+  if (cmd == "CAM:STOP") {
+    stepperDirection = 0;
+    digitalWrite(STEP_PIN, LOW);
+    Serial.println("ACK:CAM:STOP");
+    return;
+  }
+
+  if (cmd == "CAM:STATUS") {
+    sendStatus();
+    return;
+  }
+
+  // --------------------------
+  // Source gate
+  // --------------------------
+  //
+  // MANUAL: only ESP32/Mobile CAM commands are accepted.
+  // AUTO: only Raspberry Pi CAM commands are accepted.
+  // --------------------------
+
+  if (systemMode == "MANUAL" && sourceName != "ESP32") {
+    Serial.print("IGNORED:");
+    Serial.print(cmd);
+    Serial.println(":SYSTEM_MODE_MANUAL_ONLY_ESP32_ALLOWED");
+    return;
+  }
+
+  if (systemMode == "AUTO" && sourceName != "RASPBERRY_PI") {
+    Serial.print("IGNORED:");
+    Serial.print(cmd);
+    Serial.println(":SYSTEM_MODE_AUTO_ONLY_RASPBERRY_ALLOWED");
+    return;
+  }
+
+  // --------------------------
+  // Camera movement commands
+  // --------------------------
 
   if (cmd == "CAM:LEFT") {
     stepperDirection = -1;
@@ -132,20 +220,16 @@ void readCommand() {
     Serial.println("ACK:CAM:RIGHT");
   }
 
-  else if (cmd == "CAM:STOP") {
-    stepperDirection = 0;
-    digitalWrite(STEP_PIN, LOW);
-    Serial.println("ACK:CAM:STOP");
-  }
-
   else if (cmd == "CAM:UP") {
     if (INVERT_SERVO_VERTICAL) {
       servoAngle -= SERVO_STEP;
     } else {
       servoAngle += SERVO_STEP;
     }
+
     servoAngle = constrain(servoAngle, SERVO_MIN, SERVO_MAX);
     cameraServo.write(servoAngle);
+
     Serial.print("ACK:CAM:UP ANGLE=");
     Serial.println(servoAngle);
   }
@@ -156,8 +240,10 @@ void readCommand() {
     } else {
       servoAngle -= SERVO_STEP;
     }
+
     servoAngle = constrain(servoAngle, SERVO_MIN, SERVO_MAX);
     cameraServo.write(servoAngle);
+
     Serial.print("ACK:CAM:DOWN ANGLE=");
     Serial.println(servoAngle);
   }
@@ -170,10 +256,6 @@ void readCommand() {
     Serial.println("ACK:CAM:CENTER");
   }
 
-  else if (cmd == "CAM:STATUS") {
-    sendStatus();
-  }
-
   else {
     Serial.print("ERROR:UNKNOWN_COMMAND:");
     Serial.println(cmd);
@@ -182,29 +264,33 @@ void readCommand() {
 
 
 // ==================================================
-// Run stepper continuously
+// Helpers
 // ==================================================
+
+void stopCameraMotion() {
+  stepperDirection = 0;
+  digitalWrite(STEP_PIN, LOW);
+}
 
 void runStepper() {
   if (stepperDirection == 0) return;
 
   unsigned long now = micros();
+
   if (now - lastStepTime >= stepIntervalMicros) {
     lastStepTime = now;
+
     digitalWrite(STEP_PIN, HIGH);
     delayMicroseconds(STEP_PULSE_MICROS);
     digitalWrite(STEP_PIN, LOW);
   }
 }
 
-
-// ==================================================
-// Status
-// ==================================================
-
 void sendStatus() {
   Serial.print("DATA:CAMERA:");
-  Serial.print("ANGLE=");
+  Serial.print("MODE=");
+  Serial.print(systemMode);
+  Serial.print(";ANGLE=");
   Serial.print(servoAngle);
   Serial.print(";DIR=");
   Serial.print(stepperDirection);
