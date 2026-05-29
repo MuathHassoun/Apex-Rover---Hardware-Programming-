@@ -1,5 +1,4 @@
 
-
 import cv2
 import math
 import numpy as np
@@ -532,3 +531,4 @@ class VisionBrain:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
 
         return debug
+
