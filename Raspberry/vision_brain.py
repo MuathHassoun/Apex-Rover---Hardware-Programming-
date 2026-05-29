@@ -1,4 +1,3 @@
-
 import cv2
 import math
 import numpy as np
@@ -15,7 +14,11 @@ from config import (
     STAIR_CENTER_TOLERANCE,
     STAIR_TOO_CLOSE_Y,
     STAIR_MIN_LINE_LENGTH,
-    STAIR_MAX_LINE_GAP
+    STAIR_MAX_LINE_GAP,
+    YELLOW_TRACK_MIN_AREA,
+    YELLOW_TRACK_MIN_WIDTH,
+    YELLOW_TRACK_CENTER_TOLERANCE,
+    CAMERA_MOUNT_OFFSET_X_PIXELS
 )
 
 
@@ -177,11 +180,94 @@ class VisionBrain:
     # ========================================================
 
     def detect_stairs(self, frame):
-        debug = frame.copy()
+        """
+        Detect the real stair path used by this robot:
+        - the two yellow side tracks are the driving path
+        - horizontal stair edges confirm that the robot is facing stairs
 
+        Returns a dict compatible with the old code, plus new keys:
+            yellow_tracks_found, left_yellow_x, right_yellow_x, path_center_x,
+            error_x, confidence
+        """
+        debug = frame.copy()
+        frame_center_x = FRAME_WIDTH // 2
+
+        # ----------------------------------------------------
+        # 1) Yellow tracks detection in the lower/middle image
+        # ----------------------------------------------------
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        yellow_mask = None
+
+        for lower, upper in COLOR_RANGES["yellow"]:
+            current_mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+            yellow_mask = current_mask if yellow_mask is None else cv2.bitwise_or(yellow_mask, current_mask)
+
+        kernel = np.ones((5, 5), np.uint8)
+        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # The tracks are most useful in the lower 70% of the frame.
+        track_roi_y = int(FRAME_HEIGHT * 0.30)
+        track_mask = yellow_mask[track_roi_y:FRAME_HEIGHT, :]
+
+        left_mask = track_mask[:, :frame_center_x]
+        right_mask = track_mask[:, frame_center_x:]
+
+        def largest_yellow_blob(mask, x_offset=0, y_offset=0):
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None
+
+            largest = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest)
+            if area < YELLOW_TRACK_MIN_AREA:
+                return None
+
+            x, y, w, h = cv2.boundingRect(largest)
+            if w < YELLOW_TRACK_MIN_WIDTH:
+                return None
+
+            return {
+                "x": x + x_offset,
+                "y": y + y_offset,
+                "w": w,
+                "h": h,
+                "area": area,
+                "center_x": x + x_offset + w // 2,
+                "center_y": y + y_offset + h // 2,
+            }
+
+        left_blob = largest_yellow_blob(left_mask, 0, track_roi_y)
+        right_blob = largest_yellow_blob(right_mask, frame_center_x, track_roi_y)
+
+        left_yellow_x = left_blob["center_x"] if left_blob else None
+        right_yellow_x = right_blob["center_x"] if right_blob else None
+        left_yellow_area = float(left_blob["area"]) if left_blob else 0.0
+        right_yellow_area = float(right_blob["area"]) if right_blob else 0.0
+        yellow_area = left_yellow_area + right_yellow_area
+        yellow_tracks_found = left_blob is not None and right_blob is not None
+        path_center_x = None
+        error_x = None
+
+        if yellow_tracks_found:
+            path_center_x = int((left_yellow_x + right_yellow_x) / 2)
+            # Camera is mounted on the robot right side. Use robot-center compensation.
+            robot_center_x = frame_center_x + CAMERA_MOUNT_OFFSET_X_PIXELS
+            error_x = path_center_x - robot_center_x
+
+            for blob, color in [(left_blob, (0, 255, 255)), (right_blob, (0, 255, 255))]:
+                cv2.rectangle(debug, (blob["x"], blob["y"]), (blob["x"] + blob["w"], blob["y"] + blob["h"]), color, 2)
+                cv2.circle(debug, (blob["center_x"], blob["center_y"]), 6, (0, 0, 255), -1)
+
+            cv2.line(debug, (path_center_x, 0), (path_center_x, FRAME_HEIGHT), (0, 255, 255), 2)
+            cv2.putText(debug, "YELLOW TRACK CENTER", (max(5, path_center_x - 140), 455),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+        # ----------------------------------------------------
+        # 2) Horizontal stair edge confirmation
+        # ----------------------------------------------------
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
         edges = cv2.Canny(blur, 60, 160)
 
         roi_y_start = FRAME_HEIGHT // 2
@@ -204,13 +290,11 @@ class VisionBrain:
         if lines is not None:
             for line in lines:
                 x1, y1, x2, y2 = line[0]
-
                 y1_full = y1 + roi_y_start
                 y2_full = y2 + roi_y_start
 
                 dx = x2 - x1
                 dy = y2 - y1
-
                 if dx == 0:
                     continue
 
@@ -218,51 +302,65 @@ class VisionBrain:
                 angle = abs(math.degrees(math.atan(slope)))
                 length = math.sqrt(dx * dx + dy * dy)
 
-                # Stairs usually appear as horizontal or slightly tilted lines.
                 if angle < 25 and length >= STAIR_MIN_LINE_LENGTH:
                     stair_lines.append((x1, y1_full, x2, y2_full))
                     centers_x.append((x1 + x2) // 2)
                     centers_y.append((y1_full + y2_full) // 2)
                     slopes.append(slope)
-
                     cv2.line(debug, (x1, y1_full), (x2, y2_full), (0, 255, 0), 2)
 
-        if len(stair_lines) < STAIR_MIN_LINES:
-            result = {
-                "stairs_found": False,
-                "state": "NO_STAIRS",
-                "line_count": len(stair_lines),
-                "center_x": None,
-                "center_y": None,
-                "avg_slope": None
-            }
+        horizontal_found = len(stair_lines) >= max(2, STAIR_MIN_LINES - 2)
 
-            return result, debug, edges
+        if centers_x:
+            avg_center_x = int(sum(centers_x) / len(centers_x))
+            avg_center_y = int(sum(centers_y) / len(centers_y))
+            avg_slope = sum(slopes) / len(slopes)
+        else:
+            avg_center_x = path_center_x
+            avg_center_y = None
+            avg_slope = None
 
-        avg_center_x = int(sum(centers_x) / len(centers_x))
-        avg_center_y = int(sum(centers_y) / len(centers_y))
-        avg_slope = sum(slopes) / len(slopes)
+        # Yellow tracks are the main path. Horizontal lines only confirm stairs.
+        confidence = 0.0
+        if yellow_tracks_found:
+            confidence += 0.70
+        elif left_blob or right_blob:
+            confidence += 0.30
+        if horizontal_found:
+            confidence += 0.30
 
-        cv2.circle(debug, (avg_center_x, avg_center_y), 8, (0, 0, 255), -1)
+        stairs_found = confidence >= 0.60
+
+        center_x = path_center_x if path_center_x is not None else avg_center_x
+        center_y = avg_center_y
+
+        if center_x is not None and center_y is not None:
+            cv2.circle(debug, (int(center_x), int(center_y)), 8, (0, 0, 255), -1)
 
         result = {
-            "stairs_found": True,
-            "state": "STAIRS_FOUND",
+            "stairs_found": stairs_found,
+            "state": "YELLOW_TRACK_STAIRS_FOUND" if stairs_found else "NO_STAIRS",
             "line_count": len(stair_lines),
-            "center_x": avg_center_x,
-            "center_y": avg_center_y,
-            "avg_slope": avg_slope
+            "center_x": center_x,
+            "center_y": center_y,
+            "avg_slope": avg_slope,
+            "yellow_tracks_found": yellow_tracks_found,
+            "left_yellow_x": left_yellow_x,
+            "right_yellow_x": right_yellow_x,
+            "left_yellow_area": left_yellow_area,
+            "right_yellow_area": right_yellow_area,
+            "yellow_area": yellow_area,
+            "path_center_x": path_center_x,
+            "error_x": error_x,
+            "confidence": confidence,
         }
 
         return result, debug, edges
 
     def decide_stairs_action(self, stairs, sensor_data):
         """
-        Functional integration point:
-        Vision decision + sensor safety data.
-
-        Returns:
-            move_command, state
+        Decide movement from yellow track center.
+        The robot drives directly on the two yellow side tracks.
         """
 
         if not sensor_data.is_safe_angle():
@@ -275,20 +373,24 @@ class VisionBrain:
             return "STOP", "NO_STAIRS_STOP"
 
         frame_center_x = FRAME_WIDTH // 2
-        stairs_center_x = stairs["center_x"]
-        stairs_center_y = stairs["center_y"]
-        avg_slope = stairs["avg_slope"]
+        robot_center_x = frame_center_x + CAMERA_MOUNT_OFFSET_X_PIXELS
+        path_center_x = stairs.get("path_center_x") or stairs.get("center_x")
+        stairs_center_y = stairs.get("center_y")
+        avg_slope = stairs.get("avg_slope")
 
-        error_x = stairs_center_x - frame_center_x
+        if path_center_x is None:
+            return "STOP", "NO_TRACK_CENTER_STOP"
 
-        if stairs_center_y > STAIR_TOO_CLOSE_Y:
+        error_x = path_center_x - robot_center_x
+
+        if stairs_center_y is not None and stairs_center_y > STAIR_TOO_CLOSE_Y:
             return "SLOW", "STAIRS_TOO_CLOSE_GO_SLOW"
 
-        if error_x < -STAIR_CENTER_TOLERANCE:
-            return "LEFT", "ALIGN_LEFT_TO_STAIRS"
+        if error_x < -YELLOW_TRACK_CENTER_TOLERANCE:
+            return "LEFT", "ALIGN_LEFT_TO_YELLOW_TRACKS"
 
-        if error_x > STAIR_CENTER_TOLERANCE:
-            return "RIGHT", "ALIGN_RIGHT_TO_STAIRS"
+        if error_x > YELLOW_TRACK_CENTER_TOLERANCE:
+            return "RIGHT", "ALIGN_RIGHT_TO_YELLOW_TRACKS"
 
         if avg_slope is not None:
             if avg_slope > 0.18:
@@ -296,163 +398,7 @@ class VisionBrain:
             elif avg_slope < -0.18:
                 return "LEFT", "CORRECT_TILT_LEFT"
 
-        return "FORWARD", "STAIRS_CENTERED_FORWARD"
-
-
-    # ========================================================
-    # Yellow Path Detection
-    # ========================================================
-
-    def detect_yellow_path(self, frame):
-        """
-        Detect the yellow guide path on the stairs.
-
-        Returns:
-            yellow_result, yellow_mask
-
-        yellow_result contains:
-            yellow_found, line_count, center_x, center_y, error_x, area, state
-        """
-
-        from config import (
-            YELLOW_HSV_LOWER,
-            YELLOW_HSV_UPPER,
-            YELLOW_PATH_MIN_AREA
-        )
-
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        lower = np.array(YELLOW_HSV_LOWER)
-        upper = np.array(YELLOW_HSV_UPPER)
-
-        mask = cv2.inRange(hsv, lower, upper)
-
-        # Clean small noise and close gaps in the yellow tape/strips.
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.erode(mask, kernel, iterations=1)
-        mask = cv2.dilate(mask, kernel, iterations=2)
-
-        # Focus on the lower/middle part of the image because this is where
-        # the robot should follow the yellow guide path.
-        roi_y_start = int(FRAME_HEIGHT * 0.30)
-        roi_mask = mask[roi_y_start:FRAME_HEIGHT, 0:FRAME_WIDTH]
-
-        contours, _ = cv2.findContours(
-            roi_mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        valid = []
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-
-            if area < YELLOW_PATH_MIN_AREA:
-                continue
-
-            x, y, w, h = cv2.boundingRect(contour)
-            y_full = y + roi_y_start
-
-            valid.append({
-                "x": x,
-                "y": y_full,
-                "w": w,
-                "h": h,
-                "area": area,
-                "center_x": x + w // 2,
-                "center_y": y_full + h // 2
-            })
-
-        if len(valid) == 0:
-            return {
-                "yellow_found": False,
-                "line_count": 0,
-                "center_x": None,
-                "center_y": None,
-                "error_x": None,
-                "area": 0,
-                "state": "NO_YELLOW_PATH"
-            }, mask
-
-        valid_sorted = sorted(valid, key=lambda item: item["center_x"])
-
-        # If two yellow strips are visible, drive between them.
-        if len(valid_sorted) >= 2:
-            left = valid_sorted[0]
-            right = valid_sorted[-1]
-
-            center_x = int((left["center_x"] + right["center_x"]) / 2)
-            center_y = int((left["center_y"] + right["center_y"]) / 2)
-            total_area = left["area"] + right["area"]
-            state = "TWO_YELLOW_PATHS"
-
-        # If only one strip is visible, follow its center for now.
-        else:
-            one = valid_sorted[0]
-            center_x = one["center_x"]
-            center_y = one["center_y"]
-            total_area = one["area"]
-            state = "ONE_YELLOW_PATH"
-
-        frame_center_x = FRAME_WIDTH // 2
-        error_x = center_x - frame_center_x
-
-        return {
-            "yellow_found": True,
-            "line_count": len(valid_sorted),
-            "center_x": center_x,
-            "center_y": center_y,
-            "error_x": error_x,
-            "area": total_area,
-            "state": state
-        }, mask
-
-    def decide_yellow_path_action(self, yellow):
-        """
-        Decide how to align robot on yellow path.
-
-        Returns:
-            move_command, state
-        """
-
-        from config import YELLOW_PATH_CENTER_TOLERANCE
-
-        if not yellow["yellow_found"]:
-            return "STOP", "YELLOW_NOT_FOUND"
-
-        error_x = yellow["error_x"]
-
-        if error_x < -YELLOW_PATH_CENTER_TOLERANCE:
-            return "LEFT", "YELLOW_LEFT_ALIGN"
-
-        if error_x > YELLOW_PATH_CENTER_TOLERANCE:
-            return "RIGHT", "YELLOW_RIGHT_ALIGN"
-
-        return "FORWARD", "YELLOW_CENTERED"
-
-    def draw_yellow_path_debug(self, frame, yellow):
-        """
-        Draw yellow path tracking info on the debug frame.
-        """
-
-        if not yellow["yellow_found"]:
-            cv2.putText(frame, "YELLOW: NOT FOUND", (20, 315),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            return frame
-
-        cx = yellow["center_x"]
-        cy = yellow["center_y"]
-
-        cv2.circle(frame, (cx, cy), 8, (0, 255, 255), -1)
-
-        cv2.putText(frame, f"YELLOW: {yellow['state']}", (20, 315),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-        cv2.putText(frame, f"YELLOW ERROR: {yellow['error_x']}", (20, 350),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-        return frame
+        return "FORWARD", "YELLOW_TRACKS_CENTERED_FORWARD"
 
     # ========================================================
     # Drawing
@@ -488,7 +434,9 @@ class VisionBrain:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
 
         center_x = FRAME_WIDTH // 2
-        cv2.line(debug, (center_x, 0), (center_x, FRAME_HEIGHT), (255, 255, 255), 2)
+        robot_center_x = center_x + CAMERA_MOUNT_OFFSET_X_PIXELS
+        cv2.line(debug, (center_x, 0), (center_x, FRAME_HEIGHT), (120, 120, 120), 1)
+        cv2.line(debug, (robot_center_x, 0), (robot_center_x, FRAME_HEIGHT), (255, 255, 255), 2)
 
         if detection:
             x = detection["x"]
@@ -518,8 +466,19 @@ class VisionBrain:
         cv2.putText(debug, f"LINES: {stairs['line_count']}", (20, 240),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 0), 2)
 
+        cv2.putText(debug, f"YELLOW TRACKS: {stairs.get('yellow_tracks_found', False)}  CONF: {stairs.get('confidence', 0):.2f}", (20, 275),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
+
         center_x = FRAME_WIDTH // 2
-        cv2.line(debug, (center_x, 0), (center_x, FRAME_HEIGHT), (255, 255, 255), 2)
+        robot_center_x = center_x + CAMERA_MOUNT_OFFSET_X_PIXELS
+        cv2.line(debug, (center_x, 0), (center_x, FRAME_HEIGHT), (120, 120, 120), 1)
+        cv2.line(debug, (robot_center_x, 0), (robot_center_x, FRAME_HEIGHT), (255, 255, 255), 2)
+
+        path_center_x = stairs.get("path_center_x")
+        if path_center_x is not None:
+            cv2.line(debug, (int(path_center_x), 0), (int(path_center_x), FRAME_HEIGHT), (0, 255, 255), 2)
+            cv2.putText(debug, f"ERROR_X: {int(path_center_x - robot_center_x)}", (20, 310),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
         return debug
 
@@ -531,4 +490,3 @@ class VisionBrain:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
 
         return debug
-

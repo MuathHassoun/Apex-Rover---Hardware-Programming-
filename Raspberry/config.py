@@ -1,4 +1,3 @@
-
 # ============================================================
 # Apex Rover Brain Configuration - V2 Fast Modular Version
 # ============================================================
@@ -61,69 +60,164 @@ COLOR_RANGES = {
 }
 
 # ============================================================
-# AUTO CLIMB UP V1 SETTINGS
+# Auto stair climb optimized settings - V5
 # ============================================================
-# When True, main_brain.py starts directly in CLIMB_ASSIST after boot.
-AUTO_START_CLIMB_UP = True
-AUTO_ARM_DELAY_SEC = 3.0
+DEFAULT_MODE = MODE_CLIMB_ASSIST
 
-# Yellow guide path tracking. The robot follows the yellow path while climbing.
-YELLOW_PATH_MIN_AREA = 900
-YELLOW_PATH_CENTER_TOLERANCE = 80
-YELLOW_HSV_LOWER = (15, 60, 60)
-YELLOW_HSV_UPPER = (45, 255, 255)
+STAIRS_ALIGN_SPEED = 28
+STAIRS_APPROACH_SPEED = 38
+STAIRS_CLIMB_SPEED = 50
+STAIRS_SHORT_PULSE_SPEED = 45
 
-# Safety thresholds from MPU6500
-CLIMB_ROLL_DANGER = 25.0
-CLIMB_PITCH_DANGER = 32.0
+# Camera movement must be slow in auto mode. UNO receives these once on start/mode entry.
+CAMERA_STEPPER_SPEED = 450
+CAMERA_STEPPER_STEPS = 25
+AUTO_CAMERA_COMMAND_INTERVAL = 0.50
+AUTO_CAMERA_SCAN_INTERVAL = 0.80
 
-# Start rear jack cycle when the front part is already on the stair.
-# If your pitch sign is reversed, change this to a negative value and update condition in main if needed.
-CLIMB_FRONT_ON_STEP_PITCH = 8.0
+# Yellow track following. The robot drives on the two yellow side tracks.
+YELLOW_TRACK_MIN_AREA = 1200
+YELLOW_TRACK_MIN_WIDTH = 25
+YELLOW_TRACK_CENTER_TOLERANCE = 55
+YELLOW_TRACK_LOST_TIMEOUT = 1.00
 
-# Speeds during auto climb up
-AUTO_CLIMB_ALIGN_SPEED = 45
-AUTO_CLIMB_FORWARD_SPEED = 60
-AUTO_CLIMB_JACK_DRIVE_SPEED = 60
+# Approach / climb timing. Tune on the real robot.
+STAIRS_APPROACH_DISTANCE_CM = 35.0
+STAIRS_FRONT_TOO_CLOSE_CM = 5.0
+STAIRS_REAR_TOO_CLOSE_CM = 4.0
+STAIRS_STOP_BEFORE_CLIMB_TIME = 0.50
+REAR_JACK_EXTEND_TIME = 1.00
+REAR_JACK_RETRACT_TIME = 1.00
+STAIRS_LONG_FORWARD_TIME = 1.40
+STAIRS_SHORT_FORWARD_TIME = 0.60
+STAIRS_REPEAT_PAUSE_TIME = 0.20
 
-# Rear jack only is used for climbing up.
-# Linear actuator takes time, so we keep it running until ultrasonic target OR max time.
-REAR_JACK_USE_ULTRASONIC = True
+# Finish conditions.
+FINISH_FLAT_PITCH_DEG = 8.0
+FINISH_FRONT_CLEAR_CM = 45.0
+CLIMB_DANGER_PITCH = 35.0
+CLIMB_DANGER_ROLL = 25.0
 
-# If rear ultrasonic distance becomes smaller when jack goes down/touches ground, keep True.
-# If your reading increases when jack extends, set this False.
-REAR_JACK_EXTEND_STOP_WHEN_LESS_EQUAL = True
-REAR_JACK_EXTEND_TARGET_CM = 6.0
-REAR_JACK_EXTEND_MAX_SEC = 20.0
+# ============================================================
+# Camera-based close verification - V6 smart approach
+# ============================================================
+# The ultrasonic sensors are pointing to the ground, so they are NOT used
+# as front/rear distance-to-stair sensors.
+USE_ULTRASONIC_FOR_STAIR_DISTANCE = False
 
-# If rear ultrasonic distance becomes larger when jack retracts, keep True.
-# If your reading decreases when jack retracts, set this False.
-REAR_JACK_RETRACT_STOP_WHEN_GREATER_EQUAL = True
-REAR_JACK_RETRACT_TARGET_CM = 14.0
-REAR_JACK_RETRACT_MAX_SEC = 20.0
+# In service/boot mode it is safer to keep OpenCV windows disabled.
+# Set True only when running manually from desktop with a screen.
+SHOW_DEBUG_WINDOWS = False
 
-# After rear jack lifts robot, drive forward while rear jack stays extended, then retract it.
-DRIVE_WITH_REAR_JACK_SEC = 4.0
-RECOVER_FORWARD_SEC = 3.0
+# Camera poses are relative because the current UNO supports CAM:CENTER and CAM:DOWN.
+# FORWARD view: look slightly down/forward to find and follow yellow tracks.
+# GROUND view : look more down; if yellow tracks are still visible here, the robot is close.
+CAMERA_FORWARD_DOWN_PULSES = 1
+CAMERA_GROUND_DOWN_PULSES = 4
+CAMERA_PULSE_DELAY_SEC = 0.10
+CAMERA_POSE_SETTLE_TIME = 0.70
 
-# Detect top/landing: after at least one rear-jack cycle, pitch/roll become level and stairs disappear.
-LEVEL_PITCH_ABS = 6.0
-LEVEL_ROLL_ABS = 8.0
-TOP_LEVEL_TIME_SEC = 2.0
-NO_STAIRS_TOP_TIME_SEC = 1.5
+# Approach no longer depends on ultrasonic distance.
+# The robot drives forward on the yellow tracks for a short time, then stops and
+# verifies closeness by moving camera down to ground view.
+APPROACH_FORWARD_TIME_BEFORE_GROUND_CHECK = 1.20
+GROUND_VERIFY_TIMEOUT = 1.60
+GROUND_CONFIRM_FRAMES = 2
+GROUND_CONFIRM_MIN_CONFIDENCE = 0.60
 
-FORWARD_ON_YELLOW_SPEED = 60
+# ============================================================
+# Smart adaptive feedback layer - V7
+# ============================================================
+# These are NOT fixed memorized distances. They are thresholds used to decide
+# whether the robot actually moved, slipped, touched ground, or got stuck.
 
-DRIVE_WITH_REAR_JACK_SPEED = 60
+SMART_NO_PROGRESS_GRACE_SEC = 0.90
+SMART_MIN_FORWARD_STATE_TIME = 0.35
+SMART_MAX_FORWARD_STATE_TIME = 2.80
 
-RECOVER_FORWARD_SPEED = 60
+SMART_PROGRESS_MIN_PITCH_DELTA = 0.9
+SMART_PROGRESS_MIN_ROLL_DELTA = 1.2
+SMART_PROGRESS_MIN_GROUND_DELTA = 0.7
+SMART_PROGRESS_MIN_CENTER_DELTA = 8.0
+SMART_PROGRESS_MIN_YELLOW_AREA_DELTA = 350.0
 
-MIN_FORWARD_BEFORE_JACK_SEC = 1.5
+SMART_JACK_MIN_EXTEND_TIME = 0.45
+SMART_JACK_CONTACT_TIMEOUT = 1.60
+SMART_JACK_CONTACT_MIN_GROUND_DELTA = 0.6
+SMART_JACK_CONTACT_MIN_PITCH_DELTA = 0.7
 
-VISION_LOST_FORWARD_SPEED = 60
+SMART_SLIP_ROLL_DELTA = 7.0
+SMART_SLIP_PITCH_DROP = 5.0
+SMART_LOST_TRACK_RECOVERY_TIMEOUT = 0.60
 
-YELLOW_LOST_FORWARD_MAX_SEC = 8.0
+RECOVERY_MAX_ATTEMPTS = 3
+RECOVERY_SETTLE_TIME = 0.35
+RECOVERY_BACKWARD_TIME = 0.35
+RECOVERY_BACKWARD_SPEED = 30
+RECOVERY_TURN_SPEED = 24
+RECOVERY_AFTER_BACKWARD_REALIGN_TIME = 0.60
 
-NO_STAIRS_FORWARD_MAX_SEC = 8.0
+
+# ============================================================
+# Smart Adaptive V8 - MPU + Camera priority
+# ============================================================
+# The ultrasonic sensors are ground-facing, so they are low-priority clues only.
+# Main decision sources are MPU6500 pitch/roll and camera vision.
+ULTRASONIC_DECISION_WEIGHT = 0.15
+MPU_DECISION_WEIGHT = 1.00
+CAMERA_DECISION_WEIGHT = 0.85
+
+# Camera is mounted on the RIGHT side of the robot, not in the center.
+# Positive value means the robot center appears left/right shifted relative to camera center.
+# Tune this on the real robot. Start around 50-80 pixels.
+CAMERA_MOUNT_OFFSET_X_PIXELS = 65
+
+# While climbing, camera must look DOWN to see stairs and yellow tracks.
+# This pose is reused during jack/forward climb states.
+CAMERA_CLIMB_DOWN_PULSES = 4
+CAMERA_CLIMB_SETTLE_TIME = 0.50
+
+# MPU-based jack logic:
+# 1) extend jack until MPU detects body/balance effect.
+# 2) after effect is detected, keep extending 3 sec.
+# 3) stop jack and continue.
+# Timeouts below are safety limits only, not the main logic.
+JACK_EFFECT_MIN_PITCH_DELTA = 0.70
+JACK_EFFECT_MIN_ROLL_DELTA = 0.70
+JACK_EXTRA_EXTEND_AFTER_EFFECT_SEC = 3.00
+JACK_EFFECT_DETECT_TIMEOUT_SEC = 4.00
+JACK_ABSOLUTE_MAX_EXTEND_SEC = 8.00
+
+# Progress scoring in V8: MPU + camera dominate; ultrasonic alone should not pass.
+SMART_PROGRESS_REQUIRED_SCORE = 2.20
+SMART_JACK_EFFECT_REQUIRED_SCORE = 1.00
 
 
+# ============================================================
+# Smart Adaptive V9 - Ultrasonic helper with minimum delta/rate
+# ============================================================
+# Keep the ground-facing ultrasonic sensors, but do NOT let them decide alone.
+# They are helper clues with a minimum accepted change/rate to reject noise.
+USE_ULTRASONIC_AS_HELPER = True
+
+# Ignore tiny ultrasonic changes smaller than this; they are usually noise.
+ULTRASONIC_MIN_DELTA_CM = 0.80
+
+# Ignore slow/tiny ultrasonic drift. Count it only if the change rate is high enough.
+ULTRASONIC_MIN_RATE_CM_PER_SEC = 0.60
+
+# Decision weights. MPU and camera dominate; ultrasonic is a small helper.
+MPU_PROGRESS_WEIGHT = 3.00
+CAMERA_PROGRESS_WEIGHT = 2.00
+ULTRASONIC_PROGRESS_WEIGHT = 1.00
+
+# Required score for real progress.
+# MPU alone can pass. Camera + ultrasonic can pass. Ultrasonic alone cannot pass.
+SMART_PROGRESS_SCORE_THRESHOLD = 3.00
+
+# Jack effect decision: MPU is the main proof; ultrasonic only supports weak MPU evidence.
+MPU_JACK_EFFECT_WEIGHT = 3.00
+ULTRASONIC_JACK_EFFECT_WEIGHT = 1.00
+JACK_EFFECT_SCORE_THRESHOLD = 3.00
+WEAK_MPU_JACK_EFFECT_PITCH_DELTA = 0.35
+WEAK_MPU_JACK_EFFECT_ROLL_DELTA = 0.35

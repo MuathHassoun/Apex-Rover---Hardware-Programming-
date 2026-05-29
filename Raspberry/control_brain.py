@@ -1,4 +1,3 @@
-
 import time
 
 from serial_device import SerialDevice
@@ -9,7 +8,8 @@ from config import (
     BAUD_RATE,
     DEFAULT_SPEED,
     STAIRS_SPEED,
-    AUTO_COMMAND_INTERVAL
+    AUTO_COMMAND_INTERVAL,
+    AUTO_CAMERA_COMMAND_INTERVAL
 )
 
 
@@ -54,7 +54,7 @@ class ControlBrain:
 
         self.last_auto_camera_command = None
         self.last_auto_camera_time = 0.0
-        self.auto_camera_interval = 0.12
+        self.auto_camera_interval = AUTO_CAMERA_COMMAND_INTERVAL
 
     # ========================================================
     # Connections
