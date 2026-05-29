@@ -10,6 +10,9 @@ from config import (
     DEFAULT_SPEED,
     STAIRS_SPEED,
     CLIMB_SPEED,
+    VISION_LOST_FORWARD_SPEED,
+    YELLOW_LOST_FORWARD_MAX_SEC,
+    NO_STAIRS_FORWARD_MAX_SEC,
     MODE_IDLE,
     MODE_MANUAL,
     MODE_OBJECT,
@@ -400,7 +403,10 @@ class ApexMainBrain:
             self.level_start_time is not None and
             self.no_stairs_since is not None and
             now - self.level_start_time >= TOP_LEVEL_TIME_SEC and
-            now - self.no_stairs_since >= NO_STAIRS_TOP_TIME_SEC
+            now - self.no_stairs_since >= NO_STAIRS_TOP_TIME_SEC,
+            VISION_LOST_FORWARD_SPEED,
+            YELLOW_LOST_FORWARD_MAX_SEC,
+            NO_STAIRS_FORWARD_MAX_SEC
         ):
             self.set_climb_phase(self.PHASE_TOP_REACHED)
             self.auto_climb_finished = True
@@ -458,10 +464,26 @@ class ApexMainBrain:
         # ==========================================
 
         if not yellow["yellow_found"]:
+            # Do not freeze here.
+            # Sometimes the camera does not see yellow at the beginning.
+            # So we move forward slowly for a limited time, like manual mobile control.
+            # Also do not keep moving the camera every frame.
+            if self.yellow_lost_since is None:
+                self.yellow_lost_since = now
+
+            lost_time = now - self.yellow_lost_since
+
+            if lost_time <= YELLOW_LOST_FORWARD_MAX_SEC:
+                self.control.set_speed(VISION_LOST_FORWARD_SPEED)
+                self.control.forward()
+                self.set_climb_phase(self.PHASE_FORWARD_ON_YELLOW)
+                return "YELLOW_NOT_FOUND_FORWARD_SLOW"
+
             self.control.stop()
-            self.control.camera_down()
             self.set_climb_phase(self.PHASE_SEARCH_ALIGN)
-            return "YELLOW_PATH_NOT_FOUND_WAIT"
+            return "YELLOW_LOST_TOO_LONG_STOP"
+
+        self.yellow_lost_since = None
 
         move_cmd, yellow_state = self.vision.decide_yellow_path_action(yellow)
 
@@ -724,3 +746,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
