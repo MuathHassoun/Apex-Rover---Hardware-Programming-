@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass
 from typing import Optional, Dict
 
@@ -54,3 +55,4 @@ def parse_sensor_data(response: str) -> Optional[SensorData]:
         print("[ERROR] Failed to parse sensor data")
         print(e)
         return None
+
