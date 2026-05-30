@@ -1,6 +1,3 @@
-
-
-@'
 # Apex Rover Hardware Programming
 
 This repository contains the hardware programming files for the Apex Rover robot.
@@ -79,4 +76,3 @@ Examples:
 - `ARM:PICK`
 - `ARM:CARRY`
 - `ARM:DROP`
-'@ | Set-Content -Encoding UTF8 README.md
