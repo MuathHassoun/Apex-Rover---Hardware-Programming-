@@ -1,0 +1,288 @@
+apex-rover@raspberrypi:~/ApexRover_Repo $ ls /dev/video*
+/dev/video0   /dev/video12  /dev/video16  /dev/video20  /dev/video3
+/dev/video1   /dev/video13  /dev/video18  /dev/video21  /dev/video31
+/dev/video10  /dev/video14  /dev/video19  /dev/video22
+/dev/video11  /dev/video15  /dev/video2   /dev/video23
+apex-rover@raspberrypi:~/ApexRover_Repo $ 
+
+
+
+
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ sudo apt update
+[sudo] password for apex-rover: 
+Hit:1 http://deb.debian.org/debian trixie InRelease
+Get:2 http://deb.debian.org/debian trixie-updates InRelease [47.3 kB]
+Hit:3 http://archive.raspberrypi.com/debian trixie InRelease
+Hit:4 http://deb.debian.org/debian-security trixie-security InRelease
+Fetched 47.3 kB in 1s (53.5 kB/s)
+193 packages can be upgraded. Run 'apt list --upgradable' to see them.
+apex-rover@raspberrypi:~/ApexRover_Repo $ sudo apt install v4l-utils fswebcam python3-opencv -y
+v4l-utils is already the newest version (1.30.1-1).
+python3-opencv is already the newest version (4.10.0+dfsg-5).
+Installing:
+  fswebcam
+
+Summary:
+  Upgrading: 0, Installing: 1, Removing: 0, Not Upgrading: 193
+  Download size: 48.4 kB
+  Space needed: 160 kB / 20.6 GB available
+
+Get:1 http://deb.debian.org/debian trixie/main arm64 fswebcam arm64 20140113-2+b1 [48.4 kB]
+Fetched 48.4 kB in 1s (82.9 kB/s)
+Selecting previously unselected package fswebcam.
+(Reading database ... 121891 files and directories currently installed.)
+Preparing to unpack .../fswebcam_20140113-2+b1_arm64.deb ...
+Unpacking fswebcam (20140113-2+b1) ...
+Setting up fswebcam (20140113-2+b1) ...
+Processing triggers for man-db (2.13.1-1) ...
+apex-rover@raspberrypi:~/ApexRover_Repo $ 
+
+
+
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ v4l2-ctl --list-devices
+bcm2835-codec-decode (platform:bcm2835-codec):
+	/dev/video10
+	/dev/video11
+	/dev/video12
+	/dev/video18
+	/dev/video31
+
+bcm2835-isp (platform:bcm2835-isp):
+	/dev/video13
+	/dev/video14
+	/dev/video15
+	/dev/video16
+	/dev/video20
+	/dev/video21
+	/dev/video22
+	/dev/video23
+	/dev/media1
+	/dev/media2
+
+rpi-hevc-dec (platform:rpi-hevc-dec):
+	/dev/video19
+	/dev/media0
+
+2K HD Camera: 2K HD Camera (usb-0000:01:00.0-1.3):
+	/dev/video2
+	/dev/video3
+	/dev/media5
+
+HD Pro Webcam C920 (usb-0000:01:00.0-1.4):
+	/dev/video0
+	/dev/video1
+	/dev/media4
+
+bcm2835-codec (vchiq:bcm2835-codec):
+	/dev/media3
+apex-rover@raspberrypi:~/ApexRover_Repo $ 
+
+
+
+note: 2K HD webcam is a front robot camera, logitech is an arm camera
+
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ hostname -I
+192.168.4.2
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ ping -c 4 192.168.4.1
+PING 192.168.4.1 (192.168.4.1) 56(84) bytes of data.
+64 bytes from 192.168.4.1: icmp_seq=1 ttl=64 time=4.68 ms
+64 bytes from 192.168.4.1: icmp_seq=2 ttl=64 time=97.4 ms
+64 bytes from 192.168.4.1: icmp_seq=3 ttl=64 time=65.1 ms
+64 bytes from 192.168.4.1: icmp_seq=4 ttl=64 time=105 ms
+
+--- 192.168.4.1 ping statistics ---
+4 packets transmitted, 4 received, 0% packet loss, time 3005ms
+rtt min/avg/max/mdev = 4.683/68.114/105.190/39.581 ms
+apex-rover@raspberrypi:~/ApexRover_Repo $ 
+
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ curl http://192.168.4.1/get_status
+{"ok":true,"mode":"MANUAL"}apex-rover@raspberrypi:~/ApexRover_Repo $ 
+
+
+
+
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ fswebcam -d /dev/video0 -r 640x480 --no-banner test_video0.jpg--no-banner test_video0.jpg
+--- Opening /dev/video0...
+Trying source module v4l2...
+/dev/video0 opened.
+No input was specified, using the first.
+Error selecting input 0
+VIDIOC_S_INPUT: Device or resource busy
+apex-rover@raspberrypi:~/ApexRover_Repo $ fswebcam -d /dev/video1 -r 640x480 --no-banner test_video1.jpg
+--- Opening /dev/video1...
+Trying source module v4l2...
+/dev/video1 opened.
+No input was specified, using the first.
+Unable to query input 0.
+VIDIOC_ENUMINPUT: Inappropriate ioctl for device
+apex-rover@raspberrypi:~/ApexRover_Repo $ fswebcam -d /dev/video2 -r 640x480 --no-banner test_video2.jpg
+--- Opening /dev/video2...
+Trying source module v4l2...
+/dev/video2 opened.
+No input was specified, using the first.
+--- Capturing frame...
+Captured frame in 0.00 seconds.
+--- Processing captured image...
+Disabling banner.
+Writing JPEG image to 'test_video2.jpg'.
+apex-rover@raspberrypi:~/ApexRover_Repo $ fswebcam -d /dev/video3 -r 640x480 --no-banner test_video3.jpg
+--- Opening /dev/video3...
+Trying source module v4l2...
+/dev/video3 opened.
+No input was specified, using the first.
+Unable to query input 0.
+VIDIOC_ENUMINPUT: Inappropriate ioctl for device
+apex-rover@raspberrypi:~/ApexRover_Repo $ 
+
+
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ ls *.jpg
+test_video2.jpg
+
+
+
+this image captured from a robot camera
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ nano test_two_cameras.py
+apex-rover@raspberrypi:~/ApexRover_Repo $ python3 test_two_cameras.py
+Testing /dev/video0
+[ WARN:0@0.247] global cap_v4l.cpp:999 open VIDEOIO(V4L2:/dev/video0): can't open camera by index
+[ WARN:0@0.247] global cap.cpp:342 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+/dev/video0 not opened
+Testing /dev/video1
+[ WARN:0@0.248] global cap_v4l.cpp:999 open VIDEOIO(V4L2:/dev/video1): can't open camera by index
+[ WARN:0@0.248] global cap.cpp:342 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+/dev/video1 not opened
+Testing /dev/video2
+Saved opencv_test_video2.jpg
+Testing /dev/video3
+[ WARN:0@1.940] global cap_v4l.cpp:999 open VIDEOIO(V4L2:/dev/video3): can't open camera by index
+[ WARN:0@1.940] global cap.cpp:342 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+/dev/video3 not opened
+
+
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ ls opencv_test_video*.jpg
+opencv_test_video2.jpg
+
+
+
+after switching a cameras ports
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ python3 test_two_cameras.py
+Testing /dev/video0
+[ WARN:0@0.265] global cap_v4l.cpp:999 open VIDEOIO(V4L2:/dev/video0): can't open camera by index
+[ WARN:0@0.265] global cap.cpp:342 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+/dev/video0 not opened
+Testing /dev/video1
+Saved opencv_test_video1.jpg
+Testing /dev/video2
+[ WARN:0@0.836] global cap_v4l.cpp:999 open VIDEOIO(V4L2:/dev/video2): can't open camera by index
+[ WARN:0@0.836] global cap.cpp:342 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+/dev/video2 not opened
+Testing /dev/video3
+Saved opencv_test_video3.jpg
+apex-rover@raspberrypi:~/ApexRover_Repo $ ls opencv_test_video*.jpg
+opencv_test_video1.jpg  opencv_test_video2.jpg  opencv_test_video3.jpg
+apex-rover@raspberrypi:~/ApexRover_Repo $ 
+
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ fswebcam -d /dev/video0 -r 640x480 --no-banner test_video0.jpg
+--- Opening /dev/video0...
+stat: No such file or directory
+apex-rover@raspberrypi:~/ApexRover_Repo $ fswebcam -d /dev/video1 -r 640x480 --no-banner test_video1.jpg
+--- Opening /dev/video1...
+Trying source module v4l2...
+/dev/video1 opened.
+No input was specified, using the first.
+--- Capturing frame...
+Captured frame in 0.00 seconds.
+--- Processing captured image...
+Disabling banner.
+Writing JPEG image to 'test_video1.jpg'.
+apex-rover@raspberrypi:~/ApexRover_Repo $ fswebcam -d /dev/video2 -r 640x480 --no-banner test_video2.jpg
+--- Opening /dev/video2...
+Trying source module v4l2...
+/dev/video2 opened.
+No input was specified, using the first.
+Unable to query input 0.
+VIDIOC_ENUMINPUT: Inappropriate ioctl for device
+apex-rover@raspberrypi:~/ApexRover_Repo $ fswebcam -d /dev/video3 -r 640x480 --no-banner test_video3.jpg
+--- Opening /dev/video3...
+Trying source module v4l2...
+/dev/video3 opened.
+No input was specified, using the first.
+--- Capturing frame...
+GD Warning: gd-jpeg: JPEG library reports unrecoverable error: Not a JPEG file: starts with 0x98 0x6dCaptured frame in 0.00 seconds.
+--- Processing captured image...
+Disabling banner.
+Writing JPEG image to 'test_video3.jpg'.
+apex-rover@raspberrypi:~/ApexRover_Repo $ ls *.jpg
+opencv_test_video1.jpg  opencv_test_video3.jpg  test_video2.jpg
+opencv_test_video2.jpg  test_video1.jpg         test_video3.jpg
+apex-rover@raspberrypi:~/ApexRover_Repo $ 
+
+
+
+
+test_video1.jpg from arm camera
+
+
+
+
+apex-rover@raspberrypi:~/ApexRover_Repo $ v4l2-ctl --list-devices
+bcm2835-codec-decode (platform:bcm2835-codec):
+	/dev/video10
+	/dev/video11
+	/dev/video12
+	/dev/video18
+	/dev/video31
+
+bcm2835-isp (platform:bcm2835-isp):
+	/dev/video13
+	/dev/video14
+	/dev/video15
+	/dev/video16
+	/dev/video20
+	/dev/video21
+	/dev/video22
+	/dev/video23
+	/dev/media1
+	/dev/media2
+
+rpi-hevc-dec (platform:rpi-hevc-dec):
+	/dev/video19
+	/dev/media0
+
+HD Pro Webcam C920 (usb-0000:01:00.0-1.3):
+	/dev/video1
+	/dev/video2
+	/dev/media4
+
+2K HD Camera: 2K HD Camera (usb-0000:01:00.0-1.4):
+	/dev/video3
+	/dev/video4
+	/dev/media5
+
+bcm2835-codec (vchiq:bcm2835-codec):
+	/dev/media3
+apex-rover@raspberrypi:~/ApexRover_Repo $ 
+
+
