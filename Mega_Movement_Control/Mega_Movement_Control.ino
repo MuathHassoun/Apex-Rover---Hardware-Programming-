@@ -2,64 +2,29 @@
 #include <math.h>
 
 // ==================================================
-// Arduino Mega - Apex Rover Main Control V2
+// Arduino Mega - Apex Rover Sensors + Motors + Jacks
 //
-// Supports:
-// 1. Raspberry Pi -> Mega using USB Serial
-// 2. ESP32 -> Mega using Serial1
-// 3. Robot movement using 2 BTS7960 motor drivers
-// 4. Normal Mode / Climb Mode
-// 5. MPU6500 / MPU6050 pitch and roll
-// 6. Two ultrasonic sensors for jack height / distance
-// 7. Two linear actuators using L298N
+// Communication:
+// Raspberry Pi USB ---> Mega USB Serial
+// ESP32 G17 TX      ---> Mega RX1 Pin 19 Serial1
 //
-// V2 Updates for Raspberry Pi Brain V3:
-// - Fast Serial timeout to reduce lag
-// - Reduced debug spam on USB Serial
-// - GET:SENSORS response stays clean:
-//     DATA:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20
-// - Supports both command styles:
-//     FORWARD
-//     MOVE:FORWARD
-// - Supports:
-//     STOP
-//     CMD:STOP
-//     JACK:ALL:STOP
-// - ESP32 can forward brain commands to Raspberry Pi:
-//     MODE:OBJECT
-//     MODE:STAIRS
-//     MODE:CLIMB_ASSIST
-//     MODE:MANUAL
-//     MODE:IDLE
-//     TARGET:red
-//     CMD:STOP
+// New behavior:
+// If Raspberry asks directly over USB:
+//   GET:SENSORS
+// Mega replies to Raspberry USB.
+//
+// If Raspberry asks ESP32 over WiFi, ESP32 sends to Mega:
+//   GET:SENSORS
+// Mega sends sensor data directly to Raspberry USB Serial,
+// and only sends ACK to ESP32.
+//
+// Sensor data format sent to Raspberry:
+//   DATA:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20
 // ==================================================
 
 
 // ==================================================
-// 1) SERIAL CONNECTIONS
-// ==================================================
-//
-// Raspberry Pi USB ---> Arduino Mega USB
-// Uses Serial
-//
-// ESP32 G17 TX ---> Mega Pin 19 RX1
-// ESP32 GND    ---> Mega GND
-// Uses Serial1
-// ==================================================
-
-
-// ==================================================
-// 2) BTS7960 MOTOR DRIVER PINS
-// ==================================================
-//
-// Right Side BTS7960:
-// RPWM ---> Mega Pin 9
-// LPWM ---> Mega Pin 11
-//
-// Left Side BTS7960:
-// RPWM ---> Mega Pin 5
-// LPWM ---> Mega Pin 7
+// 1) BTS7960 MOTOR DRIVER PINS
 // ==================================================
 
 #define RIGHT_RPWM 9
@@ -70,16 +35,16 @@
 
 
 // ==================================================
-// 3) ULTRASONIC SENSOR PINS
+// 2) ULTRASONIC SENSOR PINS
 // ==================================================
 //
 // Front Ultrasonic:
-// TRIG ---> Mega Pin A8
-// ECHO ---> Mega Pin A9
+// TRIG ---> Mega A8
+// ECHO ---> Mega A9
 //
-// Rear / Back Ultrasonic:
-// TRIG ---> Mega Pin A11
-// ECHO ---> Mega Pin A12
+// Rear Ultrasonic:
+// TRIG ---> Mega A11
+// ECHO ---> Mega A12
 // ==================================================
 
 #define FRONT_US_TRIG A8
@@ -90,13 +55,11 @@
 
 
 // ==================================================
-// 4) MPU6500 / MPU6050 CONNECTION
+// 3) MPU6500 / MPU6050
 // ==================================================
 //
-// MPU SDA ---> Mega Pin 20 SDA
-// MPU SCL ---> Mega Pin 21 SCL
-// MPU VCC ---> 3.3V or 5V depending on your module
-// MPU GND ---> GND
+// SDA ---> Mega 20
+// SCL ---> Mega 21
 // ==================================================
 
 #define MPU_ADDR 0x68
@@ -110,18 +73,16 @@ float roll = 0;
 
 
 // ==================================================
-// 5) L298N LINEAR ACTUATOR PINS
+// 4) L298N LINEAR ACTUATORS
 // ==================================================
 //
 // Rear Jack:
-// IN1 ---> Mega Pin A0
-// IN2 ---> Mega Pin A1
+// IN1 ---> Mega A0
+// IN2 ---> Mega A1
 //
 // Front Jack:
-// IN3 ---> Mega Pin A3
-// IN4 ---> Mega Pin A4
-//
-// EN pins are already enabled by hardware.
+// IN3 ---> Mega A3
+// IN4 ---> Mega A4
 // ==================================================
 
 #define REAR_JACK_IN1 A0
@@ -132,29 +93,23 @@ float roll = 0;
 
 
 // ==================================================
-// 6) ROBOT STATE
+// 5) ROBOT STATE
 // ==================================================
 
-int motorSpeed = 150;           // PWM value from 0 to 255
-int motorSpeedPercent = 60;     // 0 to 100
+int motorSpeed = 150;
+int motorSpeedPercent = 60;
 
-String currentMode = "NORMAL";  // NORMAL or CLIMB
-String systemMode = "MANUAL"; // MANUAL or AUTO. ESP32 is the central gate.
-String lastMovement = "STOP";   // FORWARD, BACKWARD, LEFT, RIGHT, STOP
+String currentMode = "NORMAL";
+String systemMode = "MANUAL";
+String lastMovement = "STOP";
 
 float frontUltrasonicCM = -1.0;
 float rearUltrasonicCM = -1.0;
 
 unsigned long lastSensorUpdate = 0;
-unsigned long sensorUpdateInterval = 120;
+const unsigned long sensorUpdateInterval = 120;
 
-unsigned long lastDebugPrint = 0;
-unsigned long debugPrintInterval = 2000;
-
-// Keep false during Raspberry Pi autonomous tests to avoid polluting USB Serial.
 bool debugToUSB = false;
-
-// Send debug to ESP32 Serial1 instead of USB if needed.
 bool debugToESP32 = false;
 
 
@@ -163,21 +118,17 @@ bool debugToESP32 = false;
 // ==================================================
 
 void setup() {
-  // USB Serial for Raspberry Pi and Serial Monitor
   Serial.begin(9600);
   Serial.setTimeout(10);
 
-  // Serial1 for ESP32
   Serial1.begin(9600);
   Serial1.setTimeout(10);
 
-  // BTS7960 motor pins
   pinMode(RIGHT_RPWM, OUTPUT);
   pinMode(RIGHT_LPWM, OUTPUT);
   pinMode(LEFT_RPWM, OUTPUT);
   pinMode(LEFT_LPWM, OUTPUT);
 
-  // Ultrasonic pins
   pinMode(FRONT_US_TRIG, OUTPUT);
   pinMode(FRONT_US_ECHO, INPUT);
 
@@ -187,48 +138,39 @@ void setup() {
   digitalWrite(FRONT_US_TRIG, LOW);
   digitalWrite(REAR_US_TRIG, LOW);
 
-  // L298N jack control pins
   pinMode(REAR_JACK_IN1, OUTPUT);
   pinMode(REAR_JACK_IN2, OUTPUT);
 
   pinMode(FRONT_JACK_IN3, OUTPUT);
   pinMode(FRONT_JACK_IN4, OUTPUT);
 
-  // Stop everything at startup
   stopMotors();
   stopAllJacks();
 
-  // MPU setup
   Wire.begin();
   initMPU();
 
   delay(500);
 
+  // USB Serial to Raspberry
   Serial.println("MEGA:READY");
-  Serial.println("MEGA:VERSION:APEX_ROVER_MEGA_V2_WIFI_GATE");
   Serial.println("MEGA:USB_FOR_RASPBERRY_PI");
   Serial.println("MEGA:ESP32_ON_SERIAL1");
+  Serial.println("MEGA:SENSOR_DIRECT_TO_PI_ENABLED");
 
+  // Serial1 ACK to ESP32
   Serial1.println("MEGA:READY");
 }
 
 
 // ==================================================
-// MAIN LOOP
+// LOOP
 // ==================================================
 
 void loop() {
   readRaspberryCommand();
   readESP32Command();
-
   updateSensorsPeriodically();
-
-  if (debugToUSB || debugToESP32) {
-    if (millis() - lastDebugPrint >= debugPrintInterval) {
-      lastDebugPrint = millis();
-      printDebugStatus();
-    }
-  }
 }
 
 
@@ -271,36 +213,21 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
     return;
   }
 
-  // If ESP32 sends brain-level commands, forward them to Raspberry Pi.
-  // Raspberry Pi main_brain.py reads MODE/TARGET/CMD from Mega USB Serial.
-  if (sourceName == "ESP32") {
-    if (
-      command.startsWith("MODE:") ||
-      command.startsWith("TARGET:") ||
-      (command.startsWith("CMD:") && command != "CMD:STOP")
-    ) {
-      Serial.println(command);
-      replyPort.print("ACK:FORWARDED_TO_PI:");
-      replyPort.println(command);
-      return;
-    }
-  }
-
-  // Accept MOVE:FORWARD style from Raspberry Pi or tests.
   if (command.startsWith("MOVE:")) {
     command = command.substring(5);
     command.trim();
   }
 
-  // --------------------------
-  // SYSTEM MODE COMMANDS
-  // --------------------------
+  // =========================
+  // SYSTEM MODE
+  // =========================
 
   if (command == "SYS:MODE:MANUAL") {
     systemMode = "MANUAL";
     stopMotors();
     stopAllJacks();
     lastMovement = "STOP";
+
     replyPort.println("ACK:SYS:MODE:MANUAL");
     return;
   }
@@ -310,22 +237,35 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
     stopMotors();
     stopAllJacks();
     lastMovement = "STOP";
+
     replyPort.println("ACK:SYS:MODE:AUTO");
     return;
   }
 
-  // --------------------------
+  // =========================
   // SENSOR REQUEST
-  // --------------------------
+  // =========================
+  //
+  // Important:
+  // If command came from ESP32, the sensor DATA goes to Raspberry via USB Serial.
+  // ESP32 only receives an ACK.
+  //
+  // If command came from Raspberry USB directly, Raspberry gets DATA directly.
+  // =========================
 
   if (command == "GET:SENSORS") {
-    sendSensorData(replyPort);
+    if (sourceName == "ESP32") {
+      sendSensorDataToRaspberryUSB();
+      replyPort.println("ACK:GET:SENSORS:SENT_TO_PI_USB");
+    } else {
+      sendSensorData(replyPort);
+    }
     return;
   }
 
-  // --------------------------
-  // DEBUG COMMANDS
-  // --------------------------
+  // =========================
+  // DEBUG
+  // =========================
 
   if (command == "DEBUG:USB:ON") {
     debugToUSB = true;
@@ -351,9 +291,9 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
     return;
   }
 
-  // --------------------------
-  // MODE COMMANDS
-  // --------------------------
+  // =========================
+  // OLD MODE COMMANDS
+  // =========================
 
   if (command == "MODE:NORMAL") {
     currentMode = "NORMAL";
@@ -373,9 +313,9 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
     return;
   }
 
-  // --------------------------
+  // =========================
   // JACK COMMANDS
-  // --------------------------
+  // =========================
 
   if (command == "JACK:FRONT:EXTEND") {
     frontJackExtend();
@@ -419,9 +359,9 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
     return;
   }
 
-  // --------------------------
+  // =========================
   // MOVEMENT COMMANDS
-  // --------------------------
+  // =========================
 
   if (command == "FORWARD") {
     lastMovement = "FORWARD";
@@ -460,9 +400,9 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
     return;
   }
 
-  // --------------------------
-  // SPEED COMMAND
-  // --------------------------
+  // =========================
+  // SPEED
+  // =========================
 
   if (command.startsWith("SPEED:")) {
     int speedPercent = command.substring(6).toInt();
@@ -478,18 +418,14 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
     return;
   }
 
-  // --------------------------
-  // STATUS COMMAND
-  // --------------------------
+  // =========================
+  // STATUS
+  // =========================
 
   if (command == "STATUS") {
     sendStatus(replyPort);
     return;
   }
-
-  // --------------------------
-  // UNKNOWN COMMAND
-  // --------------------------
 
   replyPort.print("ERROR:UNKNOWN_COMMAND:");
   replyPort.println(command);
@@ -497,7 +433,7 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
 
 
 // ==================================================
-// SENSOR UPDATE / SENSOR DATA RESPONSE
+// SENSOR UPDATE
 // ==================================================
 
 void updateSensorsPeriodically() {
@@ -514,6 +450,7 @@ void updateSensorsPeriodically() {
 }
 
 
+// This is used when Raspberry asks directly.
 void sendSensorData(Stream &replyPort) {
   readMPU();
 
@@ -532,6 +469,13 @@ void sendSensorData(Stream &replyPort) {
 
   replyPort.print(";UR=");
   replyPort.println(rearUltrasonicCM, 2);
+}
+
+
+// This is used when ESP32 requested sensors for Raspberry.
+// The response must go to USB Serial, not back to ESP32.
+void sendSensorDataToRaspberryUSB() {
+  sendSensorData(Serial);
 }
 
 
@@ -564,7 +508,7 @@ void sendStatus(Stream &replyPort) {
 
 
 // ==================================================
-// ROBOT MOVEMENT FUNCTIONS
+// MOTOR FUNCTIONS
 // ==================================================
 
 void moveForward() {
@@ -615,28 +559,20 @@ void stopMotors() {
 void applyLastMovement() {
   if (lastMovement == "FORWARD") {
     moveForward();
-  }
-
-  else if (lastMovement == "BACKWARD") {
+  } else if (lastMovement == "BACKWARD") {
     moveBackward();
-  }
-
-  else if (lastMovement == "LEFT") {
+  } else if (lastMovement == "LEFT") {
     turnLeft();
-  }
-
-  else if (lastMovement == "RIGHT") {
+  } else if (lastMovement == "RIGHT") {
     turnRight();
-  }
-
-  else {
+  } else {
     stopMotors();
   }
 }
 
 
 // ==================================================
-// LINEAR ACTUATOR FUNCTIONS - L298N
+// JACK FUNCTIONS
 // ==================================================
 
 void rearJackExtend() {
@@ -682,7 +618,7 @@ void stopAllJacks() {
 
 
 // ==================================================
-// ULTRASONIC SENSOR FUNCTIONS
+// ULTRASONIC
 // ==================================================
 
 float readUltrasonicCM(int trigPin, int echoPin) {
@@ -699,19 +635,18 @@ float readUltrasonicCM(int trigPin, int echoPin) {
     return -1.0;
   }
 
-  float distanceCM = duration * 0.0343 / 2.0;
-  return distanceCM;
+  return duration * 0.0343 / 2.0;
 }
 
 
 // ==================================================
-// MPU6500 / MPU6050 BASIC READING
+// MPU
 // ==================================================
 
 void initMPU() {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);   // PWR_MGMT_1 register
-  Wire.write(0x00);   // Wake up MPU
+  Wire.write(0x6B);
+  Wire.write(0x00);
   byte error = Wire.endTransmission();
 
   if (error == 0) {
@@ -724,7 +659,7 @@ void initMPU() {
 
 void readMPU() {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B);   // ACCEL_XOUT_H register
+  Wire.write(0x3B);
   byte error = Wire.endTransmission(false);
 
   if (error != 0) {
@@ -746,56 +681,3 @@ void readMPU() {
     roll = atan2(-accelX, accelZ) * 180.0 / PI;
   }
 }
-
-
-// ==================================================
-// DEBUG PRINTING
-// ==================================================
-
-void printDebugStatus() {
-  Stream *out = nullptr;
-
-  if (debugToUSB) {
-    out = &Serial;
-  }
-
-  else if (debugToESP32) {
-    out = &Serial1;
-  }
-
-  else {
-    return;
-  }
-
-  out->println("----------- MEGA STATUS -----------");
-
-  out->print("System Mode: ");
-  out->println(systemMode);
-
-  out->print("Drive Mode: ");
-  out->println(currentMode);
-
-  out->print("Last Movement: ");
-  out->println(lastMovement);
-
-  out->print("Speed Percent: ");
-  out->println(motorSpeedPercent);
-
-  out->print("Speed PWM: ");
-  out->println(motorSpeed);
-
-  out->print("Pitch: ");
-  out->println(pitch);
-
-  out->print("Roll: ");
-  out->println(roll);
-
-  out->print("Front Ultrasonic cm: ");
-  out->println(frontUltrasonicCM);
-
-  out->print("Rear Ultrasonic cm: ");
-  out->println(rearUltrasonicCM);
-
-  out->println("-----------------------------------");
-}
-
