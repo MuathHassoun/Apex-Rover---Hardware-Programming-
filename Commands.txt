@@ -1,0 +1,7 @@
+sudo nano /etc/systemd/system/apex-brain.service
+sudo systemctl daemon-reload
+sudo systemctl enable apex-brain.service
+sudo systemctl start apex-brain.service
+sudo systemctl status apex-brain.service
+journalctl -u apex-brain.service -n 80
+sudo systemctl restart apex-brain.service
