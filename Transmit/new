@@ -1,0 +1,6 @@
+apex-rover@raspberrypi:~/ApexRover_Repo $ ls -i /dev/v4l/by-id/
+821 usb-046d_HD_Pro_Webcam_C920_A59D7FAF-video-index0
+825 usb-046d_HD_Pro_Webcam_C920_A59D7FAF-video-index1
+845 usb-GENERAL_2K_HD_Camera-video-index0
+844 usb-GENERAL_2K_HD_Camera-video-index1
+apex-rover@raspberrypi:~/ApexRover_Repo $ 
