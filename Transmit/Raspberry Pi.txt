@@ -425,6 +425,303 @@ static const String raspberryBaseUrl = 'http://192.168.4.2:5000';
 
 static const String raspberryBaseUrl = 'http://192.168.4.5:5000';
 
+
+
+==================================================
+11) ملاحظة مهمة: إضافة بث بيانات السنسورات للموبايل
+==================================================
+
+بعد تشغيل بث الكاميرات، صار لازم نشغل كمان جسر السنسورات.
+
+الفيديو يشتغل من:
+Raspberry Pi -> Mobile App
+
+أما السنسورات تشتغل بهذا المسار:
+Arduino Mega -> Raspberry Pi -> ESP32 -> Mobile App
+
+الموبايل ينتظر رسالة WebSocket من ESP32 بهذا الشكل:
+
+SENSOR:PITCH=2.4;ROLL=-1.1;FRONT=35.6;REAR=18.2;BALANCE=STABLE
+
+أو:
+
+SENSOR:PITCH=16.2;ROLL=4.1;FRONT=12.0;REAR=8.5;BALANCE=WARNING
+
+أو:
+
+SENSOR:PITCH=31.5;ROLL=27.2;FRONT=4.0;REAR=5.5;BALANCE=DANGER
+
+لذلك لازم Raspberry Pi يقرأ السنسورات من Mega ويرسلها للـ ESP32 عن طريق endpoint جديد:
+
+http://192.168.4.1/sensor_update
+
+==================================================
+12) تثبيت مكتبات السنسورات على Raspberry Pi
+==================================================
+
+نفذ:
+
+sudo apt update
+sudo apt install python3-serial python3-requests -y
+
+==================================================
+13) معرفة بورت Arduino Mega على Raspberry Pi
+==================================================
+
+وصل Arduino Mega USB مع Raspberry Pi.
+
+ثم نفذ:
+
+ls /dev/ttyACM*
+
+إذا ظهر:
+
+/dev/ttyACM0
+
+خلي MEGA_PORT داخل الكود:
+
+MEGA_PORT = "/dev/ttyACM0"
+
+إذا ظهر:
+
+/dev/ttyACM1
+
+خلي:
+
+MEGA_PORT = "/dev/ttyACM1"
+
+==================================================
+14) إنشاء ملف sensor_bridge.py
+==================================================
+
+نفذ:
+
+cd ~/ApexRover_Repo
+
+nano sensor_bridge.py
+
+انسخ الكود التالي داخل الملف:
+
+--------------------------------------------------
+
+import time
+import serial
+import requests
+
+# ==================================================
+# Apex Rover Sensor Bridge
+#
+# Flow:
+# Arduino Mega -> Raspberry Pi -> ESP32 -> Mobile App
+#
+# Mega should reply:
+# DATA:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20
+#
+# ESP32 receives:
+# /sensor_update?pitch=...&roll=...&front=...&rear=...&balance=...
+# ==================================================
+
+ESP32_URL = "http://192.168.4.1"
+
+# عدّل هذا البورت حسب نتيجة:
+# ls /dev/ttyACM*
+MEGA_PORT = "/dev/ttyACM0"
+
+BAUD_RATE = 9600
+REQUEST_INTERVAL = 0.25
+
+
+def parse_sensor_line(line):
+    line = line.strip()
+
+    if not line.startswith("DATA:"):
+        return None
+
+    payload = line[len("DATA:"):]
+    parts = payload.split(";")
+
+    data = {}
+
+    for part in parts:
+        if "=" not in part:
+            continue
+
+        key, value = part.split("=", 1)
+        key = key.strip().upper()
+        value = value.strip()
+
+        try:
+            data[key] = float(value)
+        except ValueError:
+            data[key] = value
+
+    pitch = float(data.get("PITCH", 0.0))
+    roll = float(data.get("ROLL", 0.0))
+    front = float(data.get("UF", data.get("FRONT", -1.0)))
+    rear = float(data.get("UR", data.get("REAR", -1.0)))
+
+    balance = compute_balance_status(pitch, roll)
+
+    return {
+        "pitch": pitch,
+        "roll": roll,
+        "front": front,
+        "rear": rear,
+        "balance": balance,
+    }
+
+
+def compute_balance_status(pitch, roll):
+    abs_pitch = abs(pitch)
+    abs_roll = abs(roll)
+
+    if abs_pitch >= 30 or abs_roll >= 25:
+        return "DANGER"
+
+    if abs_pitch >= 15 or abs_roll >= 12:
+        return "WARNING"
+
+    return "STABLE"
+
+
+def send_to_esp32(sensor_data):
+    try:
+        response = requests.get(
+            f"{ESP32_URL}/sensor_update",
+            params={
+                "pitch": f"{sensor_data['pitch']:.2f}",
+                "roll": f"{sensor_data['roll']:.2f}",
+                "front": f"{sensor_data['front']:.2f}",
+                "rear": f"{sensor_data['rear']:.2f}",
+                "balance": sensor_data["balance"],
+            },
+            timeout=0.25,
+        )
+
+        print("[ESP32]", response.text)
+
+    except requests.RequestException as e:
+        print("[ERROR] Could not send to ESP32:", e)
+
+
+def main():
+    print("====================================")
+    print("Apex Rover Sensor Bridge")
+    print(f"Mega Port : {MEGA_PORT}")
+    print(f"ESP32 URL : {ESP32_URL}")
+    print("====================================")
+
+    while True:
+        try:
+            with serial.Serial(MEGA_PORT, BAUD_RATE, timeout=0.5) as mega:
+                time.sleep(2)
+                mega.reset_input_buffer()
+
+                print("[OK] Connected to Mega")
+
+                while True:
+                    mega.write(b"GET:SENSORS\n")
+
+                    line = mega.readline().decode(errors="ignore").strip()
+
+                    if line:
+                        print("[MEGA]", line)
+
+                    sensor_data = parse_sensor_line(line)
+
+                    if sensor_data is not None:
+                        print("[SENSOR]", sensor_data)
+                        send_to_esp32(sensor_data)
+
+                    time.sleep(REQUEST_INTERVAL)
+
+        except serial.SerialException as e:
+            print("[ERROR] Mega serial problem:", e)
+            print("[INFO] Retrying in 2 seconds...")
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------
+
+بعد لصق الكود احفظ:
+
+Ctrl + O
+Enter
+Ctrl + X
+
+==================================================
+15) تشغيل Sensor Bridge
+==================================================
+
+افتح Terminal جديد على Raspberry Pi ونفذ:
+
+cd ~/ApexRover_Repo
+
+python3 sensor_bridge.py
+
+لازم يظهر شيء مثل:
+
+[OK] Connected to Mega
+[MEGA] DATA:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20
+[SENSOR] {'pitch': 2.3, 'roll': -1.1, 'front': 8.5, 'rear': 9.2, 'balance': 'STABLE'}
+[ESP32] {"ok":true,...
+
+==================================================
+16) اختبار السنسورات بدون Mega
+==================================================
+
+بعد رفع كود ESP32 الجديد، ومن أي جهاز متصل على شبكة Apex_Rover_Net، نفذ:
+
+curl "http://192.168.4.1/sensor_update?pitch=2.4&roll=-1.1&front=35.6&rear=18.2&balance=STABLE"
+
+ثم افتح تطبيق الموبايل Remote Control.
+
+لازم يظهر:
+
+Balance = STABLE
+Pitch = 2.4°
+Roll = -1.1°
+Front US = 35.6 cm
+Rear US = 18.2 cm
+
+جرّب WARNING:
+
+curl "http://192.168.4.1/sensor_update?pitch=16.2&roll=4.1&front=12.0&rear=8.5&balance=WARNING"
+
+جرّب DANGER:
+
+curl "http://192.168.4.1/sensor_update?pitch=31.5&roll=27.2&front=4.0&rear=5.5&balance=DANGER"
+
+في حالة WARNING أو DANGER المفروض يظهر تنبيه في التطبيق.
+
+==================================================
+17) تشغيل النظام كامل
+==================================================
+
+لازم يكون شغالين على Raspberry Pi:
+
+Terminal 1:
+python3 dual_camera_server.py
+
+Terminal 2:
+python3 sensor_bridge.py
+
+وبعدها افتح تطبيق الموبايل:
+
+Connect
+Control
+Remote Control
+
+المفروض تشوف:
+1. فيديو الكاميرا
+2. بيانات السنسورات فوق الشاشة
+3. أزرار التحكم اليدوي
+
+
+
 ==================================================
 الخلاصة
 ==================================================
