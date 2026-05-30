@@ -1,0 +1,167 @@
+أوامر فحص كاميرتين على Raspberry Pi
+1. وصل الكاميرتين
+
+وصل الكاميرا الأمامية وكاميرا الذراع على Raspberry Pi عن طريق USB.
+
+بعدها افتح Terminal ونفذ:
+
+ls /dev/video*
+
+صوّر أو انسخ الناتج.
+
+2. ثبت أدوات الفحص
+sudo apt update
+sudo apt install v4l-utils fswebcam python3-opencv -y
+3. اعرض أسماء الكاميرات
+
+نفذ:
+
+v4l2-ctl --list-devices
+
+انسخ الناتج كامل وابعثه.
+
+هذا أهم أمر لأنه يبين كل كاميرا على أي /dev/video.
+
+4. اعرف IP الرازبيري على شبكة الروبوت
+
+لازم الرازبيري يكون متصل على شبكة الروبوت، مثلًا:
+
+Apex_Rover_Net
+
+بعد الاتصال نفذ:
+
+hostname -I
+
+ابعث الناتج.
+
+المفروض يطلع شيء مثل:
+
+192.168.4.2
+5. اختبر هل الرازبيري شايف ESP32
+
+نفذ:
+
+ping -c 4 192.168.4.1
+
+بعدها نفذ:
+
+curl http://192.168.4.1/get_status
+
+ابعث الناتج.
+
+إذا كل شيء تمام، المفروض يرجع شيء مثل:
+
+{"ok":true,"mode":"MANUAL"}
+6. اختبر كل /dev/video بصورة
+
+نفذ الأوامر واحد واحد:
+
+fswebcam -d /dev/video0 -r 640x480 --no-banner test_video0.jpg
+fswebcam -d /dev/video1 -r 640x480 --no-banner test_video1.jpg
+fswebcam -d /dev/video2 -r 640x480 --no-banner test_video2.jpg
+fswebcam -d /dev/video3 -r 640x480 --no-banner test_video3.jpg
+
+إذا ظهر خطأ على بعضهم عادي، المهم نعرف أي واحد اشتغل.
+
+بعدها نفذ:
+
+ls *.jpg
+
+افتح الصور وشوف كل صورة من أي كاميرا.
+
+7. افتح الصور للتأكد
+
+إذا عندك واجهة رسومية على الرازبيري:
+
+xdg-open test_video0.jpg
+
+وجرب نفس الشيء للصور الثانية:
+
+xdg-open test_video1.jpg
+xdg-open test_video2.jpg
+xdg-open test_video3.jpg
+
+لو ما عندك واجهة رسومية، ابعث الصور أو صوّر أسماء الملفات وقولي أي صورة طلعت من أي كاميرا.
+
+8. اختبار OpenCV
+
+اعمل ملف اختبار:
+
+nano test_two_cameras.py
+
+حط فيه هذا الكود:
+
+import cv2
+
+camera_ids = [0, 1, 2, 3]
+
+for cam_id in camera_ids:
+    print(f"Testing /dev/video{cam_id}")
+
+    cap = cv2.VideoCapture(cam_id, cv2.CAP_V4L2)
+
+    if not cap.isOpened():
+        print(f"/dev/video{cam_id} not opened")
+        continue
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    ret, frame = cap.read()
+
+    if ret:
+        filename = f"opencv_test_video{cam_id}.jpg"
+        cv2.imwrite(filename, frame)
+        print(f"Saved {filename}")
+    else:
+        print(f"Could not read frame from /dev/video{cam_id}")
+
+    cap.release()
+
+احفظ:
+
+Ctrl + O
+Enter
+Ctrl + X
+
+شغله:
+
+python3 test_two_cameras.py
+
+بعدها:
+
+ls opencv_test_video*.jpg
+
+وافتح الصور:
+
+xdg-open opencv_test_video0.jpg
+xdg-open opencv_test_video1.jpg
+xdg-open opencv_test_video2.jpg
+xdg-open opencv_test_video3.jpg
+
+المطلوب ترجعلي إياه بالضبط
+
+ابعثلي هذه المعلومات:
+
+1. ناتج:
+ls /dev/video*
+
+2. ناتج:
+v4l2-ctl --list-devices
+
+3. Raspberry IP من:
+hostname -I
+
+4. نتيجة:
+curl http://192.168.4.1/get_status
+
+5. أي كاميرا اشتغلت على أي منفذ:
+Front Camera = /dev/video?
+Arm Camera   = /dev/video?
+
+6. ملاحظات:
+- هل صورة Front Camera واضحة؟
+- هل صورة Arm Camera واضحة؟
+- هل واحدة منهم مقلوبة؟
+- هل واحدة منهم معكوسة يمين/يسار؟
+- هل فيه تأخير أو تقطيع؟
