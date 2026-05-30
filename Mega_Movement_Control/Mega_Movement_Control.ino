@@ -3,7 +3,7 @@
 #include <math.h>
 
 // ==================================================
-// Arduino Mega - Apex Rover Main Control V3 Manual/Automatic Gate
+// Arduino Mega - Apex Rover Main Control V2
 //
 // Supports:
 // 1. Raspberry Pi -> Mega using USB Serial
@@ -140,7 +140,7 @@ int motorSpeed = 150;           // PWM value from 0 to 255
 int motorSpeedPercent = 60;     // 0 to 100
 
 String currentMode = "NORMAL";  // NORMAL or CLIMB
-String systemMode = "MANUAL"; // MANUAL = ESP32/Mobile, AUTO = Raspberry Pi
+String systemMode = "MANUAL"; // MANUAL or AUTO. ESP32 is the central gate.
 String lastMovement = "STOP";   // FORWARD, BACKWARD, LEFT, RIGHT, STOP
 
 float frontUltrasonicCM = -1.0;
@@ -206,13 +206,11 @@ void setup() {
   delay(500);
 
   Serial.println("MEGA:READY");
-  Serial.println("MEGA:VERSION:APEX_ROVER_MEGA_V2");
+  Serial.println("MEGA:VERSION:APEX_ROVER_MEGA_V2_WIFI_GATE");
   Serial.println("MEGA:USB_FOR_RASPBERRY_PI");
   Serial.println("MEGA:ESP32_ON_SERIAL1");
-  Serial.println("MEGA:DEFAULT_SYSTEM_MODE:MANUAL");
 
   Serial1.println("MEGA:READY");
-  Serial1.println("MEGA:DEFAULT_SYSTEM_MODE:MANUAL");
 }
 
 
@@ -274,42 +272,13 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
     return;
   }
 
-  // --------------------------
-  // SYSTEM CONTROL MODE
-  // --------------------------
-  //
-  // MANUAL = accept movement/jack commands from ESP32/Mobile only.
-  // AUTO   = accept movement/jack commands from Raspberry Pi USB only.
-  // Safety/status commands are allowed from both sources.
-  // --------------------------
-
-  if (command == "SYS:MODE:MANUAL") {
-    systemMode = "MANUAL";
-    stopMotors();
-    stopAllJacks();
-    lastMovement = "STOP";
-
-    replyPort.println("ACK:SYS:MODE:MANUAL");
-    return;
-  }
-
-  if (command == "SYS:MODE:AUTO") {
-    systemMode = "AUTO";
-    stopMotors();
-    stopAllJacks();
-    lastMovement = "STOP";
-
-    replyPort.println("ACK:SYS:MODE:AUTO");
-    return;
-  }
-
   // If ESP32 sends brain-level commands, forward them to Raspberry Pi.
   // Raspberry Pi main_brain.py reads MODE/TARGET/CMD from Mega USB Serial.
   if (sourceName == "ESP32") {
     if (
       command.startsWith("MODE:") ||
       command.startsWith("TARGET:") ||
-      command.startsWith("CMD:")
+      (command.startsWith("CMD:") && command != "CMD:STOP")
     ) {
       Serial.println(command);
       replyPort.print("ACK:FORWARDED_TO_PI:");
@@ -322,6 +291,28 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
   if (command.startsWith("MOVE:")) {
     command = command.substring(5);
     command.trim();
+  }
+
+  // --------------------------
+  // SYSTEM MODE COMMANDS
+  // --------------------------
+
+  if (command == "SYS:MODE:MANUAL") {
+    systemMode = "MANUAL";
+    stopMotors();
+    stopAllJacks();
+    lastMovement = "STOP";
+    replyPort.println("ACK:SYS:MODE:MANUAL");
+    return;
+  }
+
+  if (command == "SYS:MODE:AUTO") {
+    systemMode = "AUTO";
+    stopMotors();
+    stopAllJacks();
+    lastMovement = "STOP";
+    replyPort.println("ACK:SYS:MODE:AUTO");
+    return;
   }
 
   // --------------------------
@@ -358,66 +349,6 @@ void handleCommand(String command, Stream &replyPort, String sourceName) {
   if (command == "DEBUG:ESP32:OFF") {
     debugToESP32 = false;
     replyPort.println("ACK:DEBUG:ESP32:OFF");
-    return;
-  }
-
-  // --------------------------
-  // ALWAYS-ALLOWED SAFETY / STATUS COMMANDS
-  // --------------------------
-
-  if (command == "STOP" || command == "CMD:STOP" || command == "ESTOP") {
-    lastMovement = "STOP";
-    stopMotors();
-    stopAllJacks();
-
-    replyPort.println("ACK:STOP");
-    return;
-  }
-
-  if (command == "JACK:FRONT:STOP") {
-    frontJackStop();
-    replyPort.println("ACK:JACK:FRONT:STOP");
-    return;
-  }
-
-  if (command == "JACK:REAR:STOP") {
-    rearJackStop();
-    replyPort.println("ACK:JACK:REAR:STOP");
-    return;
-  }
-
-  if (command == "JACK:ALL:STOP" || command == "JACK:STOP" || command == "JSTOP") {
-    stopAllJacks();
-    replyPort.println("ACK:JACK:ALL:STOP");
-    return;
-  }
-
-  if (command == "STATUS") {
-    sendStatus(replyPort);
-    return;
-  }
-
-  // --------------------------
-  // MANUAL / AUTO SOURCE GATE
-  // --------------------------
-
-  bool sourceAllowed = false;
-
-  if (systemMode == "MANUAL" && sourceName == "ESP32") {
-    sourceAllowed = true;
-  }
-
-  if (systemMode == "AUTO" && sourceName == "RASPBERRY_PI") {
-    sourceAllowed = true;
-  }
-
-  if (!sourceAllowed) {
-    replyPort.print("IGNORED:");
-    replyPort.print(command);
-    replyPort.print(":SYSTEM_MODE=");
-    replyPort.print(systemMode);
-    replyPort.print(":SOURCE=");
-    replyPort.println(sourceName);
     return;
   }
 
@@ -607,7 +538,7 @@ void sendSensorData(Stream &replyPort) {
 
 void sendStatus(Stream &replyPort) {
   replyPort.print("DATA:STATUS:");
-  replyPort.print("SYSTEM_MODE=");
+  replyPort.print("SYSTEM=");
   replyPort.print(systemMode);
 
   replyPort.print(";MODE=");
@@ -842,7 +773,7 @@ void printDebugStatus() {
   out->print("System Mode: ");
   out->println(systemMode);
 
-  out->print("Mode: ");
+  out->print("Drive Mode: ");
   out->println(currentMode);
 
   out->print("Last Movement: ");
@@ -868,3 +799,4 @@ void printDebugStatus() {
 
   out->println("-----------------------------------");
 }
+
