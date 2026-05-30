@@ -79,7 +79,16 @@ class ControlBrain:
     def update_sensor_data(self, data: SensorData):
         self.latest_sensor_data = data
 
-    def request_sensors_every_second(self):
+    def request_sensors_every_second(self, current_mode: str = ""):
+        """
+        Request sensor data from Mega every second.
+        In MANUAL mode the Raspberry Pi is not in control,
+        so we stop sending GET:SENSORS to avoid interfering.
+        """
+        from config import MODE_MANUAL
+        if current_mode == MODE_MANUAL:
+            return
+
         now = time.time()
 
         if now - self.last_sensor_request_time < 1.0:

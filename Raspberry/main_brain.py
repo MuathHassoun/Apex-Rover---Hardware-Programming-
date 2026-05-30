@@ -1062,7 +1062,7 @@ class ApexMainBrain:
         while self.running:
             self.handle_incoming_mega_lines()
             self.handle_incoming_uno_lines()
-            self.control.request_sensors_every_second()
+            self.control.request_sensors_every_second(self.mode)
 
             ret, frame = self.vision.read_frame()
 
