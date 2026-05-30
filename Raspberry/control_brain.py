@@ -2,6 +2,7 @@ import time
 
 from serial_device import SerialDevice
 from esp_bridge import EspBridge
+from hybrid_device import HybridDevice
 from sensors import SensorData
 from config import (
     MEGA_PORT,
@@ -9,6 +10,7 @@ from config import (
     BAUD_RATE,
     ESP32_IP,
     ESP32_HTTP_TIMEOUT,
+    USE_HYBRID,
     USE_ESP32_BRIDGE,
     DEFAULT_SPEED,
     STAIRS_SPEED,
@@ -45,12 +47,17 @@ class ControlBrain:
     """
 
     def __init__(self):
-        if USE_ESP32_BRIDGE:
-            # All commands go through the ESP32 WiFi HTTP bridge.
+        if USE_HYBRID:
+            # Hybrid mode: send commands via ESP32 HTTP, read replies via USB Serial.
+            # Both USB cables (Pi <-> Mega and Pi <-> UNO) must be connected.
+            self.mega = HybridDevice("Mega", ESP32_IP, MEGA_PORT, BAUD_RATE, ESP32_HTTP_TIMEOUT)
+            self.uno  = HybridDevice("UNO",  ESP32_IP, UNO_PORT,  BAUD_RATE, ESP32_HTTP_TIMEOUT)
+        elif USE_ESP32_BRIDGE:
+            # HTTP-only mode: commands and sensor reads both go through ESP32.
             self.mega = EspBridge("Mega-via-ESP32", ESP32_IP, ESP32_HTTP_TIMEOUT)
             self.uno  = EspBridge("UNO-via-ESP32",  ESP32_IP, ESP32_HTTP_TIMEOUT)
         else:
-            # Direct USB Serial (bench/debug mode).
+            # Full USB Serial (bench/debug mode — no ESP32 needed).
             self.mega = SerialDevice("Arduino Mega", MEGA_PORT, BAUD_RATE)
             self.uno  = SerialDevice("Arduino UNO",  UNO_PORT,  BAUD_RATE)
 
@@ -111,11 +118,11 @@ class ControlBrain:
 
         self.last_sensor_request_time = now
 
-        if USE_ESP32_BRIDGE:
-            # EspBridge.fetch_sensors() calls /get_sensors and queues the reply.
-            self.mega.fetch_sensors()
-        else:
-            self.mega.send("GET:SENSORS")
+        # HybridDevice.fetch_sensors() sends GET:SENSORS via HTTP;
+        # the reply arrives automatically on the USB Serial read thread.
+        # EspBridge.fetch_sensors() calls /get_sensors endpoint.
+        # SerialDevice path sends GET:SENSORS directly.
+        self.mega.fetch_sensors()
 
     def check_safety_before_movement(self) -> bool:
         data = self.latest_sensor_data

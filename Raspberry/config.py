@@ -19,9 +19,23 @@ MEGA_PORT = "/dev/ttyUSB0"
 UNO_PORT = "/dev/ttyACM0"
 BAUD_RATE = 9600
 
-# Set True  = route all commands through ESP32 WiFi (production)
-# Set False = use USB Serial directly (debug / bench testing)
-USE_ESP32_BRIDGE = True
+# Communication mode — pick exactly one:
+#
+#   USE_HYBRID     = True   (RECOMMENDED for production)
+#       SEND -> HTTP -> ESP32 -> Arduino
+#       READ <- USB Serial direct <- Arduino
+#       Gives full two-way comms: commands through WiFi,
+#       sensor replies directly over USB cable.
+#
+#   USE_ESP32_BRIDGE = True, USE_HYBRID = False
+#       Both send and receive through ESP32 HTTP only.
+#       Read replies are limited to /get_sensors endpoint.
+#
+#   USE_ESP32_BRIDGE = False, USE_HYBRID = False
+#       Full USB Serial direct (bench / debug only).
+
+USE_HYBRID       = True    # hybrid mode: send=HTTP, read=USB Serial
+USE_ESP32_BRIDGE = True    # ignored when USE_HYBRID is True
 
 # Faster serial reads. The old larger timeout makes the loop feel delayed.
 SERIAL_TIMEOUT = 0.01
