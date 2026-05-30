@@ -1,4 +1,7 @@
+<<<<<<< HEAD
 
+=======
+>>>>>>> 9af8dd9 (Apex_Rover_Net)
 #include <Servo.h>
 #include <SoftwareSerial.h>
 
@@ -37,6 +40,25 @@ const int SERVO_MAX = 150;
 const int SERVO_STEP = 5;
 const bool INVERT_SERVO_VERTICAL = true;
 
+<<<<<<< HEAD
+=======
+// ==================================================
+// Stepper position tracking
+// stepPosition  = current absolute position (in steps from power-on)
+// homePosition  = the saved zero / reference point
+// stepsToGo     = steps remaining in a CAM:STEPS:N command
+// returnToHome  = true while executing CAM:GOTO:HOME
+// ==================================================
+long stepPosition   = 0;
+long homePosition   = 0;
+long stepsToGo      = 0;
+bool returnToHome   = false;
+
+// ==================================================
+// Setup
+// ==================================================
+
+>>>>>>> 9af8dd9 (Apex_Rover_Net)
 void setup() {
   Serial.begin(9600);
   Serial.setTimeout(50);

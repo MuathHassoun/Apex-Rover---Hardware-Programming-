@@ -1,4 +1,3 @@
-
 #include <WiFi.h>
 #include <WebSocketsServer.h>
 #include <WebServer.h>
@@ -24,7 +23,7 @@
 // Default mode = MANUAL
 // ==================================================
 
-const char* ssid = "ApexRover";
+const char* ssid = "Apex_Rover_Net";
 const char* password = "12345678";
 
 WebSocketsServer webSocket = WebSocketsServer(81);
