@@ -1,3 +1,4 @@
+
 # ============================================================
 # Apex Rover Brain Configuration - V2 Fast Modular Version
 # ============================================================
@@ -9,6 +10,22 @@ BAUD_RATE = 9600
 # Faster serial reads. The old larger timeout makes the loop feel delayed.
 SERIAL_TIMEOUT = 0.01
 SERIAL_WRITE_TIMEOUT = 0.2
+
+# ============================================================
+# ESP32 WiFi bridge settings
+# Raspberry Pi connects to ESP32 Access Point:
+# SSID: ApexRover
+# Password: 12345678
+# ESP32 AP IP is usually 192.168.4.1
+# ============================================================
+ESP32_IP = "192.168.4.1"
+ESP32_BASE_URL = f"http://{ESP32_IP}"
+ESP32_HTTP_TIMEOUT = 0.25
+
+# In the new architecture, Raspberry Pi does NOT talk directly
+# to Mega/UNO over USB serial. It sends HTTP commands to ESP32.
+# ESP32 then routes commands to Mega/UNO.
+USE_ESP32_NETWORK_BRIDGE = True
 
 CAMERA_DEVICE = "/dev/video0"
 FRAME_WIDTH = 640
@@ -61,6 +78,7 @@ COLOR_RANGES = {
 
 # ============================================================
 # Auto stair climb optimized settings - V5
+# Note: Raspberry brain only becomes active when ESP32 reports SYS mode AUTO.
 # ============================================================
 DEFAULT_MODE = MODE_CLIMB_ASSIST
 
