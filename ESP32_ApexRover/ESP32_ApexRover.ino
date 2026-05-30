@@ -2,290 +2,339 @@
 #include <WebSocketsServer.h>
 #include <WebServer.h>
 
-// ==================================================
+// =================================================================
 // ESP32 - Apex Rover Central WiFi Bridge
 //
 // Architecture:
-// Mobile App  -> WebSocket -> ESP32
-// Raspberry Pi -> HTTP     -> ESP32
-// ESP32 -> Mega using Serial2
-// ESP32 -> UNO  using Serial1
+//   Mobile App   ->  WebSocket (port 81)  ->  ESP32
+//   Raspberry Pi ->  HTTP      (port 80)  ->  ESP32
+//   ESP32        ->  Serial2              ->  Arduino Mega
+//   ESP32        ->  Serial1              ->  Arduino UNO
 //
-// MANUAL mode:
-// - Mobile commands are accepted.
-// - Raspberry commands are rejected except status/sensor reads.
+// Modes:
+//   MANUAL : Mobile app controls the robot. Raspberry commands blocked.
+//   AUTO   : Raspberry Pi controls the robot. Mobile drive commands blocked.
 //
-// AUTO mode:
-// - Raspberry commands are accepted.
-// - Mobile drive/camera/jack commands are rejected for safety.
-// - Mobile can still send SYS:MODE:MANUAL and STOP.
+// Routing rules:
+//   CAM:*          -> UNO  (stepper + servo)
+//   ARM:*          -> UNO
+//   Everything else -> Mega (motors, jacks, sensors, mode)
 //
-// Default mode = MANUAL
-// ==================================================
+// Commands always allowed from any source and any mode:
+//   SYS:MODE:MANUAL
+//   SYS:MODE:AUTO
+//   STOP  /  ESTOP  /  CMD:STOP
+//   JACK:FRONT:STOP  /  JACK:REAR:STOP  /  JACK:ALL:STOP
+//   CAM:STOP
+// =================================================================
 
-const char* ssid = "Apex_Rover_Net";
-const char* password = "12345678";
+// -----------------------------------------------------------------
+// WiFi credentials
+// -----------------------------------------------------------------
+const char* WIFI_SSID     = "Apex_Rover_Net";
+const char* WIFI_PASSWORD = "12345678";
 
-WebSocketsServer webSocket = WebSocketsServer(81);
-WebServer server(80);
-
-String currentMode = "MANUAL";
-
-// ==================================================
-// Serial pins
-// ==================================================
-// Mega:
-// ESP32 GPIO17 TX -> Mega RX1 Pin 19
-// ESP32 GND       -> Mega GND
-#define MEGA_RX 16
-#define MEGA_TX 17
-
-// UNO:
-// ESP32 GPIO4 TX -> UNO D2 SoftwareSerial RX
-// ESP32 GND      -> UNO GND
-#define UNO_RX 15   // not used now
-#define UNO_TX 4
+// -----------------------------------------------------------------
+// Serial pin mapping
+//   Serial2: ESP32 GPIO17 TX  ->  Mega  RX1 (pin 19)
+//   Serial1: ESP32 GPIO4  TX  ->  UNO   D2  (SoftwareSerial RX)
+// -----------------------------------------------------------------
+#define MEGA_RX_PIN  16
+#define MEGA_TX_PIN  17
+#define UNO_RX_PIN   15   // not wired; kept so HardwareSerial init works
+#define UNO_TX_PIN    4
 
 HardwareSerial MegaSerial(2);
 HardwareSerial UnoSerial(1);
 
-// ==================================================
-// Helpers
-// ==================================================
-String urlDecode(String input) {
-  input.replace("%3A", ":");
-  input.replace("%2F", "/");
-  input.replace("%20", " ");
-  return input;
+// -----------------------------------------------------------------
+// Server objects
+// -----------------------------------------------------------------
+WebSocketsServer webSocket = WebSocketsServer(81);
+WebServer        httpServer(80);
+
+// -----------------------------------------------------------------
+// System state
+// -----------------------------------------------------------------
+String currentMode = "MANUAL";   // default on power-up
+
+// =================================================================
+// Low-level send helpers
+// =================================================================
+
+void sendToMega(const String& cmd) {
+  MegaSerial.println(cmd);
+  Serial.print("[-> MEGA] ");
+  Serial.println(cmd);
 }
 
-bool isSystemModeCommand(const String &cmd) {
+void sendToUno(const String& cmd) {
+  UnoSerial.println(cmd);
+  Serial.print("[-> UNO] ");
+  Serial.println(cmd);
+}
+
+// Wait up to timeoutMs for one complete line from the Mega.
+// Returns an empty string if nothing arrives in time.
+String readMegaLine(unsigned int timeoutMs) {
+  unsigned long start = millis();
+  String buffer = "";
+
+  while (millis() - start < timeoutMs) {
+    while (MegaSerial.available()) {
+      char c = MegaSerial.read();
+      if (c == '\n') {
+        buffer.trim();
+        return buffer;
+      }
+      buffer += c;
+    }
+    delay(1);
+  }
+
+  buffer.trim();
+  return buffer;
+}
+
+// =================================================================
+// Command classification helpers
+// =================================================================
+
+// Returns true for the two system-mode switch commands.
+bool isSystemModeCommand(const String& cmd) {
   return cmd == "SYS:MODE:MANUAL" || cmd == "SYS:MODE:AUTO";
 }
 
-bool isEmergencyCommand(const String &cmd) {
-  return cmd == "STOP" || cmd == "CMD:STOP" || cmd == "ESTOP" ||
-         cmd == "JACK:ALL:STOP" || cmd == "JACK:STOP" ||
-         cmd == "JACK:FRONT:STOP" || cmd == "JACK:REAR:STOP" ||
-         cmd == "CAM:STOP" || cmd == "ARM:BASE:STOP";
+// Returns true for any command that must execute regardless of mode
+// (hard stops and mode switches).
+bool isAlwaysAllowed(const String& cmd) {
+  return isSystemModeCommand(cmd)     ||
+         cmd == "STOP"                ||
+         cmd == "ESTOP"               ||
+         cmd == "CMD:STOP"            ||
+         cmd == "JACK:FRONT:STOP"     ||
+         cmd == "JACK:REAR:STOP"      ||
+         cmd == "JACK:ALL:STOP"       ||
+         cmd == "JACK:STOP"           ||
+         cmd == "CAM:STOP"            ||
+         cmd == "ARM:BASE:STOP";
 }
 
-void sendToMega(String command) {
-  command.trim();
-  if (command.length() == 0) return;
-  MegaSerial.println(command);
-  Serial.print("[TO MEGA] ");
-  Serial.println(command);
-}
+// =================================================================
+// Central router
+// Decides which serial bus receives the command and applies the
+// mode switch if the command is SYS:MODE:*.
+// =================================================================
+void routeCommand(const String& cmd) {
+  if (cmd.length() == 0) return;
 
-void sendToUno(String command) {
-  command.trim();
-  if (command.length() == 0) return;
-  UnoSerial.println(command);
-  Serial.print("[TO UNO] ");
-  Serial.println(command);
-}
-
-void routeCommand(String command) {
-  command.trim();
-  if (command.length() == 0) return;
-
-  if (isSystemModeCommand(command)) {
-    if (command == "SYS:MODE:MANUAL") currentMode = "MANUAL";
-    if (command == "SYS:MODE:AUTO") currentMode = "AUTO";
-
-    // Tell both controllers the active mode.
-    sendToMega(command);
-    sendToUno(command);
+  // Apply mode change locally first.
+  if (cmd == "SYS:MODE:MANUAL") {
+    currentMode = "MANUAL";
+    sendToMega(cmd);
+    sendToUno(cmd);
+    Serial.println("[MODE] Switched to MANUAL");
+    return;
+  }
+  if (cmd == "SYS:MODE:AUTO") {
+    currentMode = "AUTO";
+    sendToMega(cmd);
+    sendToUno(cmd);
+    Serial.println("[MODE] Switched to AUTO");
     return;
   }
 
-  // Camera and old arm commands go to UNO.
-  if (command.startsWith("CAM:") || command.startsWith("ARM:")) {
-    sendToUno(command);
+  // Camera stand and arm commands go to the UNO.
+  if (cmd.startsWith("CAM:") || cmd.startsWith("ARM:")) {
+    sendToUno(cmd);
     return;
   }
 
-  // Movement, speed, jacks, sensor requests go to Mega.
-  sendToMega(command);
+  // Everything else (movement, speed, jacks, sensors, robot modes) goes to the Mega.
+  sendToMega(cmd);
 }
 
-String readMegaLine(unsigned long timeoutMs) {
-  unsigned long start = millis();
-  String line = "";
-  while (millis() - start < timeoutMs) {
-    if (MegaSerial.available() > 0) {
-      line = MegaSerial.readStringUntil('\n');
-      line.trim();
-      if (line.length() > 0) return line;
-    }
-    delay(2);
+// =================================================================
+// HTTP URL helper — decode the most common percent-encoded chars
+// =================================================================
+String urlDecode(String s) {
+  s.replace("%3A", ":");
+  s.replace("%3a", ":");
+  s.replace("%2F", "/");
+  s.replace("%2f", "/");
+  s.replace("%20", " ");
+  s.replace("+",   " ");
+  return s;
+}
+
+// =================================================================
+// HTTP handlers  (Raspberry Pi interface)
+// =================================================================
+
+// GET /
+void handleRoot() {
+  server.send(200, "text/plain",
+    "Apex Rover ESP32 Bridge | mode=" + currentMode);
+}
+
+// GET /get_status
+// Returns current mode as JSON.
+void handleGetStatus() {
+  String json = "{\"ok\":true,\"mode\":\"" + currentMode + "\"}";
+  httpServer.send(200, "application/json", json);
+}
+
+// GET /get_sensors
+// Always allowed (read-only). Asks the Mega for a fresh sensor line
+// and returns it as JSON: {"ok":true,"raw":"DATA:PITCH=..."}
+void handleGetSensors() {
+  sendToMega("GET:SENSORS");
+  String line = readMegaLine(300);
+
+  String json = "{\"ok\":";
+  json += (line.length() > 0) ? "true" : "false";
+  json += ",\"raw\":\"" + line + "\"}";
+  httpServer.send(200, "application/json", json);
+}
+
+// POST /command  (param: cmd=<command>)
+// Main entry point for all Raspberry Pi commands.
+void handleCommandHttp() {
+  if (!httpServer.hasArg("cmd")) {
+    httpServer.send(400, "application/json",
+      "{\"ok\":false,\"error\":\"missing cmd parameter\"}");
+    return;
   }
-  return "";
-}
 
-// ==================================================
-// WebSocket commands from Mobile App
-// ==================================================
-void handleMobileCommand(String command) {
+  String command = urlDecode(httpServer.arg("cmd"));
   command.trim();
-  if (command.length() == 0) return;
 
-  Serial.print("[MOBILE WS] ");
+  if (command.length() == 0) {
+    httpServer.send(400, "application/json",
+      "{\"ok\":false,\"error\":\"empty command\"}");
+    return;
+  }
+
+  Serial.print("[HTTP from Pi] ");
   Serial.println(command);
 
-  // Mode change is always allowed from mobile.
-  if (isSystemModeCommand(command)) {
+  // Hard-stop and mode-switch commands are always executed.
+  if (isAlwaysAllowed(command)) {
     routeCommand(command);
+    httpServer.send(200, "application/json",
+      "{\"ok\":true,\"type\":\"always_allowed\"}");
     return;
   }
 
-  // STOP is always allowed for safety.
-  if (isEmergencyCommand(command)) {
-    routeCommand(command);
+  // In MANUAL mode the Raspberry Pi is not the active controller;
+  // block its movement/camera/jack commands.
+  if (currentMode == "MANUAL") {
+    httpServer.send(403, "application/json",
+      "{\"ok\":false,\"error\":\"system is MANUAL; command blocked\"}");
+    Serial.println("[BLOCKED Pi] system is MANUAL");
     return;
   }
 
-  // In AUTO mode, block manual mobile commands.
-  if (currentMode == "AUTO") {
-    Serial.print("[BLOCKED MOBILE IN AUTO] ");
-    Serial.println(command);
-    return;
-  }
-
+  // AUTO mode: route the command normally.
   routeCommand(command);
+  httpServer.send(200, "application/json", "{\"ok\":true}");
 }
 
-void webSocketEvent(uint8_t clientNumber, WStype_t type, uint8_t * payload, size_t length) {
+// =================================================================
+// WebSocket handler  (Mobile App interface)
+// =================================================================
+void webSocketEvent(uint8_t clientId, WStype_t type,
+                    uint8_t* payload, size_t length) {
   switch (type) {
+
     case WStype_CONNECTED:
-      Serial.print("Mobile connected, client: ");
-      Serial.println(clientNumber);
-      webSocket.sendTXT(clientNumber, "ESP32 Connected | Mode=" + currentMode);
+      Serial.print("[WS] App connected, client=");
+      Serial.println(clientId);
+      webSocket.sendTXT(clientId,
+        "{\"event\":\"connected\",\"mode\":\"" + currentMode + "\"}");
       break;
 
     case WStype_DISCONNECTED:
-      Serial.print("Mobile disconnected, client: ");
-      Serial.println(clientNumber);
-      // Safety stop on disconnect.
+      Serial.print("[WS] App disconnected, client=");
+      Serial.println(clientId);
+      // Safety stop when the mobile app drops its connection.
       routeCommand("STOP");
       routeCommand("JACK:ALL:STOP");
       routeCommand("CAM:STOP");
       break;
 
-    case WStype_TEXT:
-      handleMobileCommand(String((char*)payload));
+    case WStype_TEXT: {
+      String command = String((char*)payload);
+      command.trim();
+
+      Serial.print("[WS from App] ");
+      Serial.println(command);
+
+      // Hard-stop and mode-switch always go through.
+      if (isAlwaysAllowed(command)) {
+        routeCommand(command);
+        return;
+      }
+
+      // In AUTO mode the robot is driven by the Raspberry Pi;
+      // block app drive/camera/jack commands to avoid conflicts.
+      if (currentMode == "AUTO") {
+        webSocket.sendTXT(clientId,
+          "{\"ok\":false,\"error\":\"system is AUTO; command blocked\"}");
+        Serial.println("[BLOCKED App] system is AUTO");
+        return;
+      }
+
+      // MANUAL mode: route the app command normally.
+      routeCommand(command);
       break;
+    }
 
     default:
       break;
   }
 }
 
-// ==================================================
-// HTTP endpoints for Raspberry Pi
-// ==================================================
-void handleRoot() {
-  server.send(200, "text/plain", "Apex Rover ESP32 Bridge Running");
-}
-
-void handleGetStatus() {
-  String json = "{";
-  json += "\"mode\":\"" + currentMode + "\",";
-  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
-  json += "}";
-  server.send(200, "application/json", json);
-}
-
-void handleCommandHttp() {
-  if (!server.hasArg("cmd")) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing cmd\"}");
-    return;
-  }
-
-  String command = urlDecode(server.arg("cmd"));
-  command.trim();
-
-  Serial.print("[RASPBERRY HTTP] ");
-  Serial.println(command);
-
-  // Mode command through HTTP is allowed, but usually mobile sets mode.
-  if (isSystemModeCommand(command)) {
-    routeCommand(command);
-    server.send(200, "application/json", "{\"ok\":true,\"source\":\"http\",\"type\":\"mode\"}");
-    return;
-  }
-
-  // Safety stop is always allowed.
-  if (isEmergencyCommand(command)) {
-    routeCommand(command);
-    server.send(200, "application/json", "{\"ok\":true,\"source\":\"http\",\"type\":\"emergency\"}");
-    return;
-  }
-
-  // Raspberry controls only in AUTO.
-  if (currentMode != "AUTO") {
-    server.send(423, "application/json", "{\"ok\":false,\"error\":\"system is MANUAL; raspberry command blocked\"}");
-    Serial.println("[BLOCKED RASPBERRY IN MANUAL]");
-    return;
-  }
-
-  routeCommand(command);
-  server.send(200, "application/json", "{\"ok\":true,\"source\":\"http\"}");
-}
-
-void handleGetSensors() {
-  // Sensor request can be allowed in both modes because it is read-only.
-  sendToMega("GET:SENSORS");
-  String line = readMegaLine(300);
-
-  String json = "{";
-  json += "\"ok\":";
-  json += (line.length() > 0 ? "true" : "false");
-  json += ",\"raw\":\"" + line + "\"";
-  json += "}";
-
-  server.send(200, "application/json", json);
-}
-
-void setupHttpServer() {
-  server.on("/", handleRoot);
-  server.on("/get_status", handleGetStatus);
-  server.on("/command", handleCommandHttp);
-  server.on("/get_sensors", handleGetSensors);
-  server.begin();
-}
-
-// ==================================================
-// Setup / Loop
-// ==================================================
+// =================================================================
+// Setup
+// =================================================================
 void setup() {
   Serial.begin(115200);
 
-  MegaSerial.begin(9600, SERIAL_8N1, MEGA_RX, MEGA_TX);
-  UnoSerial.begin(9600, SERIAL_8N1, UNO_RX, UNO_TX);
+  MegaSerial.begin(9600, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
+  UnoSerial.begin(9600, SERIAL_8N1, UNO_RX_PIN,  UNO_TX_PIN);
 
-  WiFi.softAP(ssid, password);
+  // Start WiFi access point.
+  WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
 
+  // Start WebSocket server for the mobile app.
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
 
-  setupHttpServer();
+  // Register HTTP endpoints for the Raspberry Pi.
+  httpServer.on("/",            handleRoot);
+  httpServer.on("/get_status",  handleGetStatus);
+  httpServer.on("/get_sensors", handleGetSensors);
+  httpServer.on("/command",     handleCommandHttp);
+  httpServer.begin();
 
-  Serial.println("====================================");
-  Serial.println("ESP32 Apex Rover Central Bridge Ready");
-  Serial.print("SSID: "); Serial.println(ssid);
-  Serial.print("Password: "); Serial.println(password);
-  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
-  Serial.println("WebSocket: port 81");
-  Serial.println("HTTP: port 80");
-  Serial.println("Default mode: MANUAL");
-  Serial.println("====================================");
-
+  // Ensure both Arduinos start in MANUAL mode.
   routeCommand("SYS:MODE:MANUAL");
+
+  Serial.println("=========================================");
+  Serial.println("ESP32 Apex Rover Bridge Ready");
+  Serial.print  ("SSID     : "); Serial.println(WIFI_SSID);
+  Serial.print  ("AP IP    : "); Serial.println(WiFi.softAPIP());
+  Serial.println("WebSocket: port 81");
+  Serial.println("HTTP     : port 80");
+  Serial.println("Default  : MANUAL");
+  Serial.println("=========================================");
 }
 
+// =================================================================
+// Loop
+// =================================================================
 void loop() {
   webSocket.loop();
-  server.handleClient();
+  httpServer.handleClient();
 }

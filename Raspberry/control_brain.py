@@ -1,69 +1,59 @@
-
 import time
-import requests
 
-from sensors import SensorData, parse_sensor_data
+from serial_device import SerialDevice
+from esp_bridge import EspBridge
+from sensors import SensorData
 from config import (
+    MEGA_PORT,
+    UNO_PORT,
+    BAUD_RATE,
+    ESP32_IP,
+    ESP32_HTTP_TIMEOUT,
+    USE_ESP32_BRIDGE,
     DEFAULT_SPEED,
     STAIRS_SPEED,
     AUTO_COMMAND_INTERVAL,
-    AUTO_CAMERA_COMMAND_INTERVAL,
-    ESP32_BASE_URL,
-    ESP32_HTTP_TIMEOUT,
+    AUTO_CAMERA_COMMAND_INTERVAL
 )
-
-
-class NetworkEndpoint:
-    """
-    Compatibility object so old main_brain.py can still call:
-        self.control.mega.read_line()
-        self.control.uno.read_line()
-
-    In the new architecture Raspberry Pi does not read directly from
-    Mega/UNO serial. It talks to ESP32 over Wi-Fi/HTTP.
-    """
-
-    def __init__(self, name: str, parent: "ControlBrain"):
-        self.name = name
-        self.parent = parent
-
-    def connect(self) -> bool:
-        return self.parent.check_esp32_connection()
-
-    def send(self, command: str) -> bool:
-        return self.parent.send_command(command)
-
-    def read_line(self):
-        return None
-
-    def close(self):
-        pass
 
 
 class ControlBrain:
     """
-    Apex Rover Control Brain - ESP32 WiFi Bridge Version
+    Apex Rover Control Brain V3
 
-    New architecture:
-        Raspberry Pi  -> Wi-Fi HTTP -> ESP32
-        ESP32         -> Serial     -> Mega / UNO
+    This class talks to:
+    - Arduino Mega: motors, jacks, sensors
+    - Arduino UNO : camera stand stepper + servo
 
-    Raspberry Pi no longer needs direct USB serial to Mega/UNO.
-
-    ESP32 endpoints expected:
-        GET /get_status
-            returns: {"mode":"MANUAL"} or {"mode":"AUTO"}
-
-        GET /command?cmd=...
-            sends command to ESP32, ESP32 routes it:
-                CAM:* / ARM:* -> UNO
-                FORWARD/SPEED/JACK/STOP/GET:SENSORS -> Mega
-
-        GET /get_sensors
-            returns: {"ok":true,"raw":"DATA:PITCH=...;ROLL=...;UF=...;UR=..."}
+    Important V3 camera fix:
+    - Python does NOT invert camera UP/DOWN anymore.
+    - UNO V3 handles servo inversion using INVERT_SERVO_VERTICAL.
+    - Python sends raw CAM commands exactly:
+        CAM:LEFT
+        CAM:RIGHT
+        CAM:STOP
+        CAM:UP
+        CAM:DOWN
+        CAM:CENTER
+        CAM:ENABLE
+        CAM:DISABLE
+        CAM:STATUS
+        CAM:DIR:LEFT
+        CAM:DIR:RIGHT
+        CAM:STEPS:200
+        CAM:SPEED:1200
     """
 
     def __init__(self):
+        if USE_ESP32_BRIDGE:
+            # All commands go through the ESP32 WiFi HTTP bridge.
+            self.mega = EspBridge("Mega-via-ESP32", ESP32_IP, ESP32_HTTP_TIMEOUT)
+            self.uno  = EspBridge("UNO-via-ESP32",  ESP32_IP, ESP32_HTTP_TIMEOUT)
+        else:
+            # Direct USB Serial (bench/debug mode).
+            self.mega = SerialDevice("Arduino Mega", MEGA_PORT, BAUD_RATE)
+            self.uno  = SerialDevice("Arduino UNO",  UNO_PORT,  BAUD_RATE)
+
         self.latest_sensor_data = SensorData()
         self.speed = DEFAULT_SPEED
 
@@ -76,93 +66,20 @@ class ControlBrain:
         self.last_auto_camera_time = 0.0
         self.auto_camera_interval = AUTO_CAMERA_COMMAND_INTERVAL
 
-        self.last_known_system_mode = "MANUAL"
-
-        # Compatibility handles used by main_brain.py
-        self.mega = NetworkEndpoint("ESP32->Mega", self)
-        self.uno = NetworkEndpoint("ESP32->UNO", self)
-
-    # ========================================================
-    # ESP32 HTTP helpers
-    # ========================================================
-
-    def check_esp32_connection(self) -> bool:
-        try:
-            r = requests.get(
-                f"{ESP32_BASE_URL}/get_status",
-                timeout=ESP32_HTTP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                self.last_known_system_mode = data.get("mode", "MANUAL")
-                print(f"[OK] ESP32 bridge connected | mode={self.last_known_system_mode}")
-                return True
-
-            print(f"[WARNING] ESP32 status HTTP {r.status_code}: {r.text}")
-            return False
-        except Exception as e:
-            print("[ERROR] Could not connect to ESP32 WiFi bridge")
-            print(e)
-            return False
-
-    def get_system_mode(self) -> str:
-        try:
-            r = requests.get(
-                f"{ESP32_BASE_URL}/get_status",
-                timeout=ESP32_HTTP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                self.last_known_system_mode = data.get("mode", "MANUAL").upper()
-                return self.last_known_system_mode
-        except Exception:
-            pass
-
-        # Safe fallback: if Raspberry cannot reach ESP32, behave as MANUAL/idle.
-        self.last_known_system_mode = "MANUAL"
-        return "MANUAL"
-
-    def is_auto_mode(self) -> bool:
-        return self.get_system_mode() == "AUTO"
-
-    def send_command(self, command: str, avoid_print: bool = False) -> bool:
-        command = command.strip()
-        if not command:
-            return False
-
-        try:
-            r = requests.get(
-                f"{ESP32_BASE_URL}/command",
-                params={"cmd": command},
-                timeout=ESP32_HTTP_TIMEOUT,
-            )
-
-            if r.status_code == 200:
-                if not avoid_print:
-                    print(f"[SEND VIA ESP32] {command}")
-                return True
-
-            if not avoid_print:
-                print(f"[BLOCK/ERROR VIA ESP32] {command} -> {r.status_code}: {r.text}")
-            return False
-
-        except Exception as e:
-            if not avoid_print:
-                print(f"[ERROR] Failed to send via ESP32: {command}")
-                print(e)
-            return False
-
     # ========================================================
     # Connections
     # ========================================================
 
     def connect_all(self):
-        print("Connecting Apex Rover through ESP32 WiFi bridge...")
-        print("---------------------------------------------------")
-        ok = self.check_esp32_connection()
-        print("---------------------------------------------------")
-        print("[READY] ESP32 bridge ready" if ok else "[WARNING] ESP32 bridge not ready")
-        print("[INFO] Raspberry will control only when ESP32 mode is AUTO")
+        print("Connecting Apex Rover controllers...")
+        print("-----------------------------------")
+
+        mega_ok = self.mega.connect()
+        uno_ok = self.uno.connect()
+
+        print("-----------------------------------")
+        print("[READY] Mega controller ready" if mega_ok else "[WARNING] Mega controller not ready")
+        print("[READY] UNO camera controller ready" if uno_ok else "[WARNING] UNO camera controller not ready")
         print()
 
     # ========================================================
@@ -172,7 +89,21 @@ class ControlBrain:
     def update_sensor_data(self, data: SensorData):
         self.latest_sensor_data = data
 
-    def request_sensors_every_second(self):
+    def request_sensors_every_second(self, current_mode: str = ""):
+        """
+        Request sensor data from Mega every second.
+        In MANUAL mode the Raspberry Pi is not in control,
+        so we stop sending GET:SENSORS to avoid interfering.
+
+        In ESP32-bridge mode the sensor data is fetched via
+        the dedicated /get_sensors HTTP endpoint; the response
+        is pushed straight into the mega rx queue and will be
+        picked up by handle_incoming_mega_lines() on the next loop.
+        """
+        from config import MODE_MANUAL
+        if current_mode == MODE_MANUAL:
+            return
+
         now = time.time()
 
         if now - self.last_sensor_request_time < 1.0:
@@ -180,27 +111,11 @@ class ControlBrain:
 
         self.last_sensor_request_time = now
 
-        try:
-            r = requests.get(
-                f"{ESP32_BASE_URL}/get_sensors",
-                timeout=ESP32_HTTP_TIMEOUT,
-            )
-            if r.status_code != 200:
-                print(f"[SENSOR ERROR] HTTP {r.status_code}: {r.text}")
-                return
-
-            raw = r.json().get("raw", "")
-            if not raw:
-                return
-
-            print(f"[SENSORS RAW] {raw}")
-            data = parse_sensor_data(raw)
-            if data:
-                self.update_sensor_data(data)
-
-        except Exception as e:
-            print("[SENSOR ERROR] Failed to get sensors from ESP32")
-            print(e)
+        if USE_ESP32_BRIDGE:
+            # EspBridge.fetch_sensors() calls /get_sensors and queues the reply.
+            self.mega.fetch_sensors()
+        else:
+            self.mega.send("GET:SENSORS")
 
     def check_safety_before_movement(self) -> bool:
         data = self.latest_sensor_data
@@ -224,39 +139,43 @@ class ControlBrain:
         print(f"Front Ultrasonic   : {data.front_ultrasonic:.2f} cm")
         print(f"Rear Ultrasonic    : {data.rear_ultrasonic:.2f} cm")
         print(f"Safe Angle         : {data.is_safe_angle()}")
-        print(f"ESP32 System Mode  : {self.last_known_system_mode}")
         print("========================================")
         print()
 
     # ========================================================
-    # Mega Movement
+    # Mega Movement - manual direct
     # ========================================================
 
     def set_speed(self, speed: int):
-        speed = max(0, min(100, int(speed)))
+        speed = max(0, min(100, speed))
         self.speed = speed
-        self.send_command(f"SPEED:{speed}")
+        self.mega.send(f"SPEED:{speed}")
 
     def forward(self):
         if self.check_safety_before_movement():
-            self.send_command("FORWARD")
+            self.mega.send("FORWARD")
 
     def backward(self):
         if self.check_safety_before_movement():
-            self.send_command("BACKWARD")
+            self.mega.send("BACKWARD")
 
     def left(self):
         if self.check_safety_before_movement():
-            self.send_command("LEFT")
+            self.mega.send("LEFT")
 
     def right(self):
         if self.check_safety_before_movement():
-            self.send_command("RIGHT")
+            self.mega.send("RIGHT")
 
     def stop(self):
-        self.send_command("STOP")
+        self.mega.send("STOP")
 
     def apply_auto_move_command(self, command: str):
+        """
+        Used by autonomous modes only.
+        Manual keyboard commands do not use this throttle.
+        """
+
         command = command.strip().upper()
 
         if command.startswith("MOVE:"):
@@ -275,17 +194,23 @@ class ControlBrain:
 
         if command == "FORWARD":
             self.forward()
+
         elif command == "BACKWARD":
             self.backward()
+
         elif command == "LEFT":
             self.left()
+
         elif command == "RIGHT":
             self.right()
+
         elif command == "SLOW":
             self.set_speed(STAIRS_SPEED)
             self.forward()
+
         elif command == "STOP":
             self.stop()
+
         else:
             print(f"[WARNING] Unknown move command: {command}")
 
@@ -294,50 +219,64 @@ class ControlBrain:
     # ========================================================
 
     def mode_normal(self):
-        self.send_command("MODE:NORMAL")
+        self.mega.send("MODE:NORMAL")
 
     def mode_climb(self):
-        self.send_command("MODE:CLIMB")
+        self.mega.send("MODE:CLIMB")
 
     # ========================================================
-    # Mega Jacks
+    # Mega Jacks - direct and repeatable
     # ========================================================
 
     def front_jack_extend(self):
-        self.send_command("JACK:FRONT:EXTEND")
+        self.mega.send("JACK:FRONT:EXTEND")
 
     def front_jack_retract(self):
-        self.send_command("JACK:FRONT:RETRACT")
+        self.mega.send("JACK:FRONT:RETRACT")
 
     def front_jack_stop(self):
-        self.send_command("JACK:FRONT:STOP")
+        self.mega.send("JACK:FRONT:STOP")
 
     def rear_jack_extend(self):
-        self.send_command("JACK:REAR:EXTEND")
+        self.mega.send("JACK:REAR:EXTEND")
 
     def rear_jack_retract(self):
-        self.send_command("JACK:REAR:RETRACT")
+        self.mega.send("JACK:REAR:RETRACT")
 
     def rear_jack_stop(self):
-        self.send_command("JACK:REAR:STOP")
+        self.mega.send("JACK:REAR:STOP")
 
     def stop_all_jacks(self):
-        self.send_command("JACK:ALL:STOP")
         self.front_jack_stop()
         self.rear_jack_stop()
 
     # ========================================================
-    # UNO Camera
+    # UNO Camera - raw exact commands
     # ========================================================
 
     def send_uno_raw(self, command: str):
+        """
+        Send exact raw command to UNO V3.
+        Use this for all camera stand commands.
+        """
+
         command = command.strip()
+
         if not command:
             return
-        self.send_command(command)
-        print(f"[CAM RAW VIA ESP32] {command}")
+
+        self.uno.send(command)
+        print(f"[UNO RAW] {command}")
 
     def send_camera_command(self, command: str):
+        """
+        Camera command bridge for vision decisions.
+
+        Only sends known CAM commands.
+        Python does not invert up/down here.
+        UNO V3 owns servo inversion.
+        """
+
         command = command.strip().upper()
 
         allowed_exact = [
@@ -352,7 +291,7 @@ class ControlBrain:
             "CAM:STATUS",
             "CAM:START",
             "CAM:DIR:LEFT",
-            "CAM:DIR:RIGHT",
+            "CAM:DIR:RIGHT"
         ]
 
         if command in allowed_exact:
@@ -370,6 +309,12 @@ class ControlBrain:
         print(f"[WARNING] Unknown camera command: {command}")
 
     def apply_auto_camera_command(self, command: str):
+        """
+        For autonomous object/stairs vision only.
+        Prevents sending CAM:LEFT/CAM:RIGHT/CAM:STOP hundreds of times per second.
+        Manual keys do not use this throttle.
+        """
+
         command = command.strip().upper()
         now = time.time()
 
@@ -381,8 +326,10 @@ class ControlBrain:
 
         self.last_auto_camera_command = command
         self.last_auto_camera_time = now
+
         self.send_camera_command(command)
 
+    # Convenience wrappers
     def camera_left(self):
         self.send_uno_raw("CAM:LEFT")
 
@@ -436,9 +383,13 @@ class ControlBrain:
 
     def shutdown(self):
         print("[CONTROL] Shutdown")
+
         try:
             self.emergency_stop()
         except Exception:
             pass
+
         time.sleep(0.3)
 
+        self.mega.close()
+        self.uno.close()

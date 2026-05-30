@@ -1,31 +1,31 @@
-
 # ============================================================
 # Apex Rover Brain Configuration - V2 Fast Modular Version
 # ============================================================
 
+# ------------------------------------------------------------------
+# ESP32 WiFi Bridge — Raspberry Pi connects to the ESP32 hotspot
+# (SSID: Apex_Rover_Net, password: 12345678) and sends all commands
+# through HTTP instead of USB Serial.
+#
+# The ESP32 default gateway on its softAP network is always 192.168.4.1.
+# Change this only if you configured a custom IP on the ESP32.
+# ------------------------------------------------------------------
+ESP32_IP = "192.168.4.1"
+ESP32_HTTP_TIMEOUT = 0.4   # seconds per HTTP request
+
+# Legacy serial ports — kept for reference but no longer used when
+# USE_ESP32_BRIDGE = True.
 MEGA_PORT = "/dev/ttyUSB0"
 UNO_PORT = "/dev/ttyACM0"
 BAUD_RATE = 9600
 
+# Set True  = route all commands through ESP32 WiFi (production)
+# Set False = use USB Serial directly (debug / bench testing)
+USE_ESP32_BRIDGE = True
+
 # Faster serial reads. The old larger timeout makes the loop feel delayed.
 SERIAL_TIMEOUT = 0.01
 SERIAL_WRITE_TIMEOUT = 0.2
-
-# ============================================================
-# ESP32 WiFi bridge settings
-# Raspberry Pi connects to ESP32 Access Point:
-# SSID: ApexRover
-# Password: 12345678
-# ESP32 AP IP is usually 192.168.4.1
-# ============================================================
-ESP32_IP = "192.168.4.1"
-ESP32_BASE_URL = f"http://{ESP32_IP}"
-ESP32_HTTP_TIMEOUT = 0.25
-
-# In the new architecture, Raspberry Pi does NOT talk directly
-# to Mega/UNO over USB serial. It sends HTTP commands to ESP32.
-# ESP32 then routes commands to Mega/UNO.
-USE_ESP32_NETWORK_BRIDGE = True
 
 CAMERA_DEVICE = "/dev/video0"
 FRAME_WIDTH = 640
@@ -78,7 +78,6 @@ COLOR_RANGES = {
 
 # ============================================================
 # Auto stair climb optimized settings - V5
-# Note: Raspberry brain only becomes active when ESP32 reports SYS mode AUTO.
 # ============================================================
 DEFAULT_MODE = MODE_CLIMB_ASSIST
 

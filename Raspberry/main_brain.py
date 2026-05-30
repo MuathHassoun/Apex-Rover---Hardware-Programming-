@@ -1,4 +1,3 @@
-
 import time
 import cv2
 
@@ -191,7 +190,6 @@ class ApexMainBrain:
         print("  q = quit")
         print()
         print("CLIMB_ASSIST uses camera + MPU6500 + ultrasonics + jacks.")
-        print("New network mode: Raspberry controls only when ESP32 reports AUTO.")
         print("=================================================")
         print()
 
@@ -1061,31 +1059,10 @@ class ApexMainBrain:
     # ========================================================
 
     def run_loop(self):
-        last_manual_idle_print = 0.0
-
         while self.running:
-            # ====================================================
-            # New ESP32 WiFi architecture:
-            # Raspberry Pi is allowed to control only when ESP32 mode is AUTO.
-            # In MANUAL, mobile app owns control through ESP32, so Raspberry stays idle.
-            # ====================================================
-            esp32_mode = self.control.get_system_mode()
-
-            if esp32_mode != "AUTO":
-                now = time.time()
-                if now - last_manual_idle_print > 2.0:
-                    last_manual_idle_print = now
-                    print("[ESP32 MODE] MANUAL - Raspberry brain idle. Select Automatic from mobile Home to start auto stairs.")
-                time.sleep(0.25)
-                continue
-
-            if self.mode != MODE_CLIMB_ASSIST:
-                print("[ESP32 MODE] AUTO - Starting CLIMB_ASSIST brain")
-                self.change_mode(MODE_CLIMB_ASSIST)
-
             self.handle_incoming_mega_lines()
             self.handle_incoming_uno_lines()
-            self.control.request_sensors_every_second()
+            self.control.request_sensors_every_second(self.mode)
 
             ret, frame = self.vision.read_frame()
 

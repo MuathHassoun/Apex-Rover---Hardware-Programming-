@@ -1,4 +1,3 @@
-
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
@@ -301,4 +300,3 @@ class SmartMotionObserver:
             f"dCX={d.get('center', 0.0):.1f} dYA={d.get('yellow_area', 0.0):.0f} "
             f"ultra={self.ultrasonic_real_change_detected()}"
         )
-

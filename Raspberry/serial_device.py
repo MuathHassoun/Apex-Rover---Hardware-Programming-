@@ -1,4 +1,3 @@
-
 import time
 import threading
 import serial
@@ -71,4 +70,3 @@ class SerialDevice:
                 print(f"[OK] Closed {self.name}")
         except Exception:
             pass
-

@@ -1,4 +1,3 @@
-
 import cv2
 import math
 import numpy as np
@@ -251,8 +250,15 @@ class VisionBrain:
         error_x = None
 
         if yellow_tracks_found:
-            path_center_x = int((left_yellow_x + right_yellow_x) / 2)
-            # Camera is mounted on the robot right side. Use robot-center compensation.
+            # The robot drives ON TOP of the two yellow tracks (not between them).
+            # The camera is mounted on the RIGHT side of the robot body.
+            # When the camera sees the RIGHT yellow track directly in front,
+            # the robot is correctly aligned ON the tracks.
+            #
+            # So we center on the RIGHT track, not the midpoint between the two tracks.
+            # error_x > 0 => right track is right of camera center => turn RIGHT
+            # error_x < 0 => right track is left  of camera center => turn LEFT
+            path_center_x = int(right_yellow_x)
             robot_center_x = frame_center_x + CAMERA_MOUNT_OFFSET_X_PIXELS
             error_x = path_center_x - robot_center_x
 
@@ -491,4 +497,3 @@ class VisionBrain:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
 
         return debug
-
