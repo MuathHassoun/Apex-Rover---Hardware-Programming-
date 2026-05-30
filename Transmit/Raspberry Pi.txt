@@ -1,167 +1,449 @@
-أوامر فحص كاميرتين على Raspberry Pi
-1. وصل الكاميرتين
 
-وصل الكاميرا الأمامية وكاميرا الذراع على Raspberry Pi عن طريق USB.
+Raspberry Pi Steps for Apex Rover Dual Camera Server
 
-بعدها افتح Terminal ونفذ:
+الهدف:
+تشغيل كاميرتين على Raspberry Pi:
+1. Front Camera للروبوت
+2. Arm Camera للذراع
 
-ls /dev/video*
+وبعدها نعرضهم في تطبيق الموبايل.
 
-صوّر أو انسخ الناتج.
+==================================================
+1) الدخول على مشروع Apex Rover
+==================================================
 
-2. ثبت أدوات الفحص
-sudo apt update
-sudo apt install v4l-utils fswebcam python3-opencv -y
-3. اعرض أسماء الكاميرات
+cd ~/ApexRover_Repo
 
-نفذ:
+pwd
 
-v4l2-ctl --list-devices
+git status
 
-انسخ الناتج كامل وابعثه.
+git pull origin main
 
-هذا أهم أمر لأنه يبين كل كاميرا على أي /dev/video.
+ls
 
-4. اعرف IP الرازبيري على شبكة الروبوت
+ملاحظة:
+أمر ls فقط للتأكد أن ملفات المشروع موجودة بعد التحديث.
 
-لازم الرازبيري يكون متصل على شبكة الروبوت، مثلًا:
+==================================================
+2) الاتصال بشبكة ESP32
+==================================================
+
+لازم Raspberry Pi يكون متصل على شبكة الروبوت:
 
 Apex_Rover_Net
 
-بعد الاتصال نفذ:
+لو مش متصل، نفذ:
+
+sudo nmcli dev wifi connect "Apex_Rover_Net" password "12345678"
+
+بعدها افحص IP الرازبيري:
 
 hostname -I
-
-ابعث الناتج.
 
 المفروض يطلع شيء مثل:
 
 192.168.4.2
-5. اختبر هل الرازبيري شايف ESP32
 
-نفذ:
+بعدها افحص الاتصال مع ESP32:
 
 ping -c 4 192.168.4.1
 
-بعدها نفذ:
+ثم:
 
 curl http://192.168.4.1/get_status
 
-ابعث الناتج.
-
-إذا كل شيء تمام، المفروض يرجع شيء مثل:
+المفروض يرجع:
 
 {"ok":true,"mode":"MANUAL"}
-6. اختبر كل /dev/video بصورة
 
-نفذ الأوامر واحد واحد:
+==================================================
+3) تثبيت مكتبات الكاميرا والسيرفر
+==================================================
 
-fswebcam -d /dev/video0 -r 640x480 --no-banner test_video0.jpg
-fswebcam -d /dev/video1 -r 640x480 --no-banner test_video1.jpg
-fswebcam -d /dev/video2 -r 640x480 --no-banner test_video2.jpg
-fswebcam -d /dev/video3 -r 640x480 --no-banner test_video3.jpg
+sudo apt update
+sudo apt install python3-flask python3-opencv v4l-utils fswebcam -y
 
-إذا ظهر خطأ على بعضهم عادي، المهم نعرف أي واحد اشتغل.
+==================================================
+4) التأكد من الكاميرات
+==================================================
 
-بعدها نفذ:
+ls -l /dev/v4l/by-id/
 
-ls *.jpg
+المفروض يظهر شيء قريب من:
 
-افتح الصور وشوف كل صورة من أي كاميرا.
+usb-046d_HD_Pro_Webcam_C920_A59D7FAF-video-index0
+usb-046d_HD_Pro_Webcam_C920_A59D7FAF-video-index1
+usb-GENERAL_2K_HD_Camera-video-index0
+usb-GENERAL_2K_HD_Camera-video-index1
 
-7. افتح الصور للتأكد
+حسب الفحص السابق عندنا:
 
-إذا عندك واجهة رسومية على الرازبيري:
+Front Camera = usb-GENERAL_2K_HD_Camera-video-index0
+Arm Camera   = usb-046d_HD_Pro_Webcam_C920_A59D7FAF-video-index0
 
-xdg-open test_video0.jpg
+==================================================
+5) إنشاء ملف بث الكاميرتين
+==================================================
 
-وجرب نفس الشيء للصور الثانية:
+cd ~/ApexRover_Repo
 
-xdg-open test_video1.jpg
-xdg-open test_video2.jpg
-xdg-open test_video3.jpg
+nano dual_camera_server.py
 
-لو ما عندك واجهة رسومية، ابعث الصور أو صوّر أسماء الملفات وقولي أي صورة طلعت من أي كاميرا.
+انسخ الكود التالي كامل داخل الملف:
 
-8. اختبار OpenCV
-
-اعمل ملف اختبار:
-
-nano test_two_cameras.py
-
-حط فيه هذا الكود:
+--------------------------------------------------
 
 import cv2
+import time
+from flask import Flask, Response, jsonify
 
-camera_ids = [0, 1, 2, 3]
+# ==================================================
+# Apex Rover Dual Camera Server
+#
+# Front Camera:
+#   GENERAL 2K HD Camera
+#
+# Arm Camera:
+#   Logitech C920
+#
+# Mobile App URLs:
+#   http://192.168.4.2:5000/front_camera
+#   http://192.168.4.2:5000/arm_camera
+#   http://192.168.4.2:5000/front_snapshot
+#   http://192.168.4.2:5000/arm_snapshot
+#   http://192.168.4.2:5000/status
+# ==================================================
 
-for cam_id in camera_ids:
-    print(f"Testing /dev/video{cam_id}")
+FRONT_CAMERA_DEVICE = "/dev/v4l/by-id/usb-GENERAL_2K_HD_Camera-video-index0"
+ARM_CAMERA_DEVICE = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_A59D7FAF-video-index0"
 
-    cap = cv2.VideoCapture(cam_id, cv2.CAP_V4L2)
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+JPEG_QUALITY = 70
 
-    if not cap.isOpened():
-        print(f"/dev/video{cam_id} not opened")
-        continue
+app = Flask(__name__)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    ret, frame = cap.read()
+class CameraStream:
+    def __init__(self, name, device):
+        self.name = name
+        self.device = device
+        self.cap = None
+        self.opened = False
 
-    if ret:
-        filename = f"opencv_test_video{cam_id}.jpg"
-        cv2.imwrite(filename, frame)
-        print(f"Saved {filename}")
-    else:
-        print(f"Could not read frame from /dev/video{cam_id}")
+    def open(self):
+        if self.cap is not None:
+            self.cap.release()
 
-    cap.release()
+        print(f"[INFO] Opening {self.name}: {self.device}")
 
-احفظ:
+        self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, 20)
+
+        self.opened = self.cap.isOpened()
+
+        if self.opened:
+            print(f"[OK] {self.name} opened")
+        else:
+            print(f"[ERROR] Could not open {self.name}")
+
+        return self.opened
+
+    def read_frame(self):
+        if self.cap is None or not self.cap.isOpened():
+            self.open()
+
+        if self.cap is None or not self.cap.isOpened():
+            return None
+
+        ret, frame = self.cap.read()
+
+        if not ret or frame is None:
+            print(f"[WARN] Failed to read from {self.name}, reopening...")
+            self.open()
+            return None
+
+        return frame
+
+    def generate_mjpeg(self):
+        while True:
+            frame = self.read_frame()
+
+            if frame is None:
+                time.sleep(0.1)
+                continue
+
+            ok, buffer = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+            )
+
+            if not ok:
+                continue
+
+            jpg = buffer.tobytes()
+
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            )
+
+            time.sleep(0.03)
+
+    def snapshot(self):
+        frame = self.read_frame()
+
+        if frame is None:
+            return None
+
+        ok, buffer = cv2.imencode(
+            ".jpg",
+            frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+        )
+
+        if not ok:
+            return None
+
+        return buffer.tobytes()
+
+
+front_camera = CameraStream("Front Camera", FRONT_CAMERA_DEVICE)
+arm_camera = CameraStream("Arm Camera", ARM_CAMERA_DEVICE)
+
+
+@app.route("/")
+def home():
+    return """
+Apex Rover Dual Camera Server Running
+
+Front Camera:
+  /front_camera
+  /front_snapshot
+
+Arm Camera:
+  /arm_camera
+  /arm_snapshot
+
+Status:
+  /status
+"""
+
+
+@app.route("/status")
+def status():
+    return jsonify({
+        "ok": True,
+        "front_camera_device": FRONT_CAMERA_DEVICE,
+        "arm_camera_device": ARM_CAMERA_DEVICE,
+        "front_opened": front_camera.cap is not None and front_camera.cap.isOpened(),
+        "arm_opened": arm_camera.cap is not None and arm_camera.cap.isOpened(),
+        "front_stream": "/front_camera",
+        "arm_stream": "/arm_camera",
+        "front_snapshot": "/front_snapshot",
+        "arm_snapshot": "/arm_snapshot",
+    })
+
+
+@app.route("/front_camera")
+def front_camera_stream():
+    return Response(
+        front_camera.generate_mjpeg(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/arm_camera")
+def arm_camera_stream():
+    return Response(
+        arm_camera.generate_mjpeg(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/front_snapshot")
+def front_snapshot():
+    jpg = front_camera.snapshot()
+
+    if jpg is None:
+        return "Front camera not available", 503
+
+    return Response(jpg, mimetype="image/jpeg")
+
+
+@app.route("/arm_snapshot")
+def arm_snapshot():
+    jpg = arm_camera.snapshot()
+
+    if jpg is None:
+        return "Arm camera not available", 503
+
+    return Response(jpg, mimetype="image/jpeg")
+
+
+if __name__ == "__main__":
+    front_camera.open()
+    arm_camera.open()
+
+    print("====================================")
+    print("Apex Rover Dual Camera Server")
+    print("Front stream   : http://192.168.4.2:5000/front_camera")
+    print("Arm stream     : http://192.168.4.2:5000/arm_camera")
+    print("Front snapshot : http://192.168.4.2:5000/front_snapshot")
+    print("Arm snapshot   : http://192.168.4.2:5000/arm_snapshot")
+    print("Status         : http://192.168.4.2:5000/status")
+    print("====================================")
+
+    app.run(host="0.0.0.0", port=5000, threaded=True)
+
+--------------------------------------------------
+
+بعد لصق الكود احفظ:
 
 Ctrl + O
 Enter
 Ctrl + X
 
-شغله:
+==================================================
+6) تشغيل سيرفر الكاميرات
+==================================================
 
-python3 test_two_cameras.py
+cd ~/ApexRover_Repo
+
+python3 dual_camera_server.py
+
+لازم يظهر شيء مثل:
+
+[OK] Front Camera opened
+[OK] Arm Camera opened
+Apex Rover Dual Camera Server
+
+إذا ظهرت ERROR لأي كاميرا، أرسل الرسالة.
+
+==================================================
+7) اختبار السيرفر من Raspberry
+==================================================
+
+افتح Terminal ثاني ونفذ:
+
+curl http://127.0.0.1:5000/status
+
+بعدها جرّب تحفظ صورة من الكاميرا الأمامية:
+
+curl http://127.0.0.1:5000/front_snapshot --output front_test.jpg
+
+وجرّب كاميرا الذراع:
+
+curl http://127.0.0.1:5000/arm_snapshot --output arm_test.jpg
 
 بعدها:
 
-ls opencv_test_video*.jpg
+ls *.jpg
 
-وافتح الصور:
+المفروض تشوف:
 
-xdg-open opencv_test_video0.jpg
-xdg-open opencv_test_video1.jpg
-xdg-open opencv_test_video2.jpg
-xdg-open opencv_test_video3.jpg
+front_test.jpg
+arm_test.jpg
 
-المطلوب ترجعلي إياه بالضبط
+==================================================
+8) اختبار من الموبايل
+==================================================
 
-ابعثلي هذه المعلومات:
+الموبايل لازم يكون متصل على نفس شبكة الروبوت:
 
-1. ناتج:
-ls /dev/video*
+Apex_Rover_Net
 
-2. ناتج:
-v4l2-ctl --list-devices
+من متصفح الموبايل افتح:
 
-3. Raspberry IP من:
+http://192.168.4.2:5000/status
+
+ثم:
+
+http://192.168.4.2:5000/front_snapshot
+
+ثم:
+
+http://192.168.4.2:5000/arm_snapshot
+
+إذا الصور ظهرت في المتصفح، تطبيق الموبايل رح يقدر يعرضها.
+
+==================================================
+9) تشغيل تطبيق الموبايل
+==================================================
+
+على اللابتوب داخل مشروع Flutter:
+
+cd C:\RobotGitHup\Apex-Rover
+
+git pull origin main
+
+flutter pub get
+
+flutter run
+
+من التطبيق:
+
+Connect
+Control
+Remote Control
+
+المفروض:
+
+Basic / Rear Jack / Front Jack يعرضوا Front Camera
+
+Arm Mode يعرض Arm Camera
+
+==================================================
+10) إذا IP الرازبيري تغيّر
+==================================================
+
+إذا الأمر:
+
 hostname -I
 
-4. نتيجة:
-curl http://192.168.4.1/get_status
+طلع IP غير:
 
-5. أي كاميرا اشتغلت على أي منفذ:
-Front Camera = /dev/video?
-Arm Camera   = /dev/video?
+192.168.4.2
 
-6. ملاحظات:
-- هل صورة Front Camera واضحة؟
-- هل صورة Arm Camera واضحة؟
-- هل واحدة منهم مقلوبة؟
-- هل واحدة منهم معكوسة يمين/يسار؟
-- هل فيه تأخير أو تقطيع؟
+مثلاً:
+
+192.168.4.5
+
+لازم نعدل في Flutter داخل:
+
+lib/screens/remote_control_screen.dart
+
+هذا السطر:
+
+static const String raspberryBaseUrl = 'http://192.168.4.2:5000';
+
+إلى:
+
+static const String raspberryBaseUrl = 'http://192.168.4.5:5000';
+
+==================================================
+الخلاصة
+==================================================
+
+الترتيب الصحيح:
+
+1. Raspberry يتصل على Apex_Rover_Net
+2. يتأكد من ESP32:
+   curl http://192.168.4.1/get_status
+
+3. يتأكد من الكاميرات:
+   ls -l /dev/v4l/by-id/
+
+4. ينشئ dual_camera_server.py
+5. يشغل:
+   python3 dual_camera_server.py
+
+6. يجرب من الموبايل:
+   http://192.168.4.2:5000/front_snapshot
+   http://192.168.4.2:5000/arm_snapshot
+
+7. يشغل التطبيق ويفتح Remote Control
