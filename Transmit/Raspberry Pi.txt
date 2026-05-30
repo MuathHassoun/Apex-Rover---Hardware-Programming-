@@ -1,16 +1,36 @@
-
-Raspberry Pi Steps for Apex Rover Dual Camera Server
+Raspberry Pi Steps for Apex Rover
+Dual Camera Server + Sensor Bridge
 
 الهدف:
-تشغيل كاميرتين على Raspberry Pi:
-1. Front Camera للروبوت
-2. Arm Camera للذراع
+تشغيل Raspberry Pi عشان يعمل شيئين:
 
-وبعدها نعرضهم في تطبيق الموبايل.
+1. بث كاميرتين للموبايل:
+
+   * Front Camera للروبوت
+   * Arm Camera للذراع
+
+2. نقل بيانات السنسورات:
+
+   * Arduino Mega يرسل بيانات السنسورات إلى Raspberry Pi
+   * Raspberry Pi يرسلها إلى ESP32
+   * ESP32 يبثها إلى تطبيق الموبايل عبر WebSocket
+
+مهم:
+Raspberry Pi لا يتحكم بحركة الروبوت.
+كل التحكم Manual فقط من الموبايل:
+
+Mobile App → ESP32 → Mega / UNO
+
+أما Raspberry Pi وظيفته فقط:
+
+Camera Stream + Sensor Bridge
 
 ==================================================
-1) الدخول على مشروع Apex Rover
-==================================================
+
+1. الدخول على مشروع Apex Rover
+   ==================================================
+
+نفذ على Raspberry Pi:
 
 cd ~/ApexRover_Repo
 
@@ -27,7 +47,7 @@ ls
 
 ==================================================
 2) الاتصال بشبكة ESP32
-==================================================
+======================
 
 لازم Raspberry Pi يكون متصل على شبكة الروبوت:
 
@@ -53,20 +73,27 @@ ping -c 4 192.168.4.1
 
 curl http://192.168.4.1/get_status
 
-المفروض يرجع:
+المفروض يرجع شيء قريب من:
 
 {"ok":true,"mode":"MANUAL"}
 
+أو يظهر أن ESP32 شغال Manual Only.
+
 ==================================================
 3) تثبيت مكتبات الكاميرا والسيرفر
-==================================================
+=================================
+
+نفذ:
 
 sudo apt update
+
 sudo apt install python3-flask python3-opencv v4l-utils fswebcam -y
 
 ==================================================
 4) التأكد من الكاميرات
-==================================================
+======================
+
+نفذ:
 
 ls -l /dev/v4l/by-id/
 
@@ -84,7 +111,9 @@ Arm Camera   = usb-046d_HD_Pro_Webcam_C920_A59D7FAF-video-index0
 
 ==================================================
 5) إنشاء ملف بث الكاميرتين
-==================================================
+==========================
+
+نفذ:
 
 cd ~/ApexRover_Repo
 
@@ -92,27 +121,42 @@ nano dual_camera_server.py
 
 انسخ الكود التالي كامل داخل الملف:
 
---------------------------------------------------
+---
 
 import cv2
 import time
 from flask import Flask, Response, jsonify
 
 # ==================================================
+
 # Apex Rover Dual Camera Server
+
 #
+
 # Front Camera:
-#   GENERAL 2K HD Camera
+
+# GENERAL 2K HD Camera
+
 #
+
 # Arm Camera:
-#   Logitech C920
+
+# Logitech C920
+
 #
+
 # Mobile App URLs:
-#   http://192.168.4.2:5000/front_camera
-#   http://192.168.4.2:5000/arm_camera
-#   http://192.168.4.2:5000/front_snapshot
-#   http://192.168.4.2:5000/arm_snapshot
-#   http://192.168.4.2:5000/status
+
+# http://192.168.4.2:5000/front_camera
+
+# http://192.168.4.2:5000/arm_camera
+
+# http://192.168.4.2:5000/front_snapshot
+
+# http://192.168.4.2:5000/arm_snapshot
+
+# http://192.168.4.2:5000/status
+
 # ==================================================
 
 FRONT_CAMERA_DEVICE = "/dev/v4l/by-id/usb-GENERAL_2K_HD_Camera-video-index0"
@@ -122,83 +166,59 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 JPEG_QUALITY = 70
 
-app = Flask(__name__)
-
+app = Flask(**name**)
 
 class CameraStream:
-    def __init__(self, name, device):
-        self.name = name
-        self.device = device
-        self.cap = None
-        self.opened = False
+def **init**(self, name, device):
+self.name = name
+self.device = device
+self.cap = None
+self.opened = False
 
-    def open(self):
-        if self.cap is not None:
-            self.cap.release()
+```
+def open(self):
+    if self.cap is not None:
+        self.cap.release()
 
-        print(f"[INFO] Opening {self.name}: {self.device}")
+    print(f"[INFO] Opening {self.name}: {self.device}")
 
-        self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        self.cap.set(cv2.CAP_PROP_FPS, 20)
+    self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    self.cap.set(cv2.CAP_PROP_FPS, 20)
 
-        self.opened = self.cap.isOpened()
+    self.opened = self.cap.isOpened()
 
-        if self.opened:
-            print(f"[OK] {self.name} opened")
-        else:
-            print(f"[ERROR] Could not open {self.name}")
+    if self.opened:
+        print(f"[OK] {self.name} opened")
+    else:
+        print(f"[ERROR] Could not open {self.name}")
 
-        return self.opened
+    return self.opened
 
-    def read_frame(self):
-        if self.cap is None or not self.cap.isOpened():
-            self.open()
+def read_frame(self):
+    if self.cap is None or not self.cap.isOpened():
+        self.open()
 
-        if self.cap is None or not self.cap.isOpened():
-            return None
+    if self.cap is None or not self.cap.isOpened():
+        return None
 
-        ret, frame = self.cap.read()
+    ret, frame = self.cap.read()
 
-        if not ret or frame is None:
-            print(f"[WARN] Failed to read from {self.name}, reopening...")
-            self.open()
-            return None
+    if not ret or frame is None:
+        print(f"[WARN] Failed to read from {self.name}, reopening...")
+        self.open()
+        return None
 
-        return frame
+    return frame
 
-    def generate_mjpeg(self):
-        while True:
-            frame = self.read_frame()
-
-            if frame is None:
-                time.sleep(0.1)
-                continue
-
-            ok, buffer = cv2.imencode(
-                ".jpg",
-                frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
-            )
-
-            if not ok:
-                continue
-
-            jpg = buffer.tobytes()
-
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-            )
-
-            time.sleep(0.03)
-
-    def snapshot(self):
+def generate_mjpeg(self):
+    while True:
         frame = self.read_frame()
 
         if frame is None:
-            return None
+            time.sleep(0.1)
+            continue
 
         ok, buffer = cv2.imencode(
             ".jpg",
@@ -207,100 +227,123 @@ class CameraStream:
         )
 
         if not ok:
-            return None
+            continue
 
-        return buffer.tobytes()
+        jpg = buffer.tobytes()
 
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+        )
+
+        time.sleep(0.03)
+
+def snapshot(self):
+    frame = self.read_frame()
+
+    if frame is None:
+        return None
+
+    ok, buffer = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+    )
+
+    if not ok:
+        return None
+
+    return buffer.tobytes()
+```
 
 front_camera = CameraStream("Front Camera", FRONT_CAMERA_DEVICE)
 arm_camera = CameraStream("Arm Camera", ARM_CAMERA_DEVICE)
 
-
 @app.route("/")
 def home():
-    return """
+return """
 Apex Rover Dual Camera Server Running
 
 Front Camera:
-  /front_camera
-  /front_snapshot
+/front_camera
+/front_snapshot
 
 Arm Camera:
-  /arm_camera
-  /arm_snapshot
+/arm_camera
+/arm_snapshot
 
 Status:
-  /status
+/status
 """
-
 
 @app.route("/status")
 def status():
-    return jsonify({
-        "ok": True,
-        "front_camera_device": FRONT_CAMERA_DEVICE,
-        "arm_camera_device": ARM_CAMERA_DEVICE,
-        "front_opened": front_camera.cap is not None and front_camera.cap.isOpened(),
-        "arm_opened": arm_camera.cap is not None and arm_camera.cap.isOpened(),
-        "front_stream": "/front_camera",
-        "arm_stream": "/arm_camera",
-        "front_snapshot": "/front_snapshot",
-        "arm_snapshot": "/arm_snapshot",
-    })
-
+return jsonify({
+"ok": True,
+"front_camera_device": FRONT_CAMERA_DEVICE,
+"arm_camera_device": ARM_CAMERA_DEVICE,
+"front_opened": front_camera.cap is not None and front_camera.cap.isOpened(),
+"arm_opened": arm_camera.cap is not None and arm_camera.cap.isOpened(),
+"front_stream": "/front_camera",
+"arm_stream": "/arm_camera",
+"front_snapshot": "/front_snapshot",
+"arm_snapshot": "/arm_snapshot",
+})
 
 @app.route("/front_camera")
 def front_camera_stream():
-    return Response(
-        front_camera.generate_mjpeg(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
-
+return Response(
+front_camera.generate_mjpeg(),
+mimetype="multipart/x-mixed-replace; boundary=frame",
+)
 
 @app.route("/arm_camera")
 def arm_camera_stream():
-    return Response(
-        arm_camera.generate_mjpeg(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
-
+return Response(
+arm_camera.generate_mjpeg(),
+mimetype="multipart/x-mixed-replace; boundary=frame",
+)
 
 @app.route("/front_snapshot")
 def front_snapshot():
-    jpg = front_camera.snapshot()
+jpg = front_camera.snapshot()
 
-    if jpg is None:
-        return "Front camera not available", 503
+```
+if jpg is None:
+    return "Front camera not available", 503
 
-    return Response(jpg, mimetype="image/jpeg")
-
+return Response(jpg, mimetype="image/jpeg")
+```
 
 @app.route("/arm_snapshot")
 def arm_snapshot():
-    jpg = arm_camera.snapshot()
+jpg = arm_camera.snapshot()
 
-    if jpg is None:
-        return "Arm camera not available", 503
+```
+if jpg is None:
+    return "Arm camera not available", 503
 
-    return Response(jpg, mimetype="image/jpeg")
+return Response(jpg, mimetype="image/jpeg")
+```
 
+if **name** == "**main**":
+front_camera.open()
+arm_camera.open()
 
-if __name__ == "__main__":
-    front_camera.open()
-    arm_camera.open()
+```
+print("====================================")
+print("Apex Rover Dual Camera Server")
+print("Front stream   : http://192.168.4.2:5000/front_camera")
+print("Arm stream     : http://192.168.4.2:5000/arm_camera")
+print("Front snapshot : http://192.168.4.2:5000/front_snapshot")
+print("Arm snapshot   : http://192.168.4.2:5000/arm_snapshot")
+print("Status         : http://192.168.4.2:5000/status")
+print("====================================")
 
-    print("====================================")
-    print("Apex Rover Dual Camera Server")
-    print("Front stream   : http://192.168.4.2:5000/front_camera")
-    print("Arm stream     : http://192.168.4.2:5000/arm_camera")
-    print("Front snapshot : http://192.168.4.2:5000/front_snapshot")
-    print("Arm snapshot   : http://192.168.4.2:5000/arm_snapshot")
-    print("Status         : http://192.168.4.2:5000/status")
-    print("====================================")
+app.run(host="0.0.0.0", port=5000, threaded=True)
+```
 
-    app.run(host="0.0.0.0", port=5000, threaded=True)
-
---------------------------------------------------
+---
 
 بعد لصق الكود احفظ:
 
@@ -310,7 +353,9 @@ Ctrl + X
 
 ==================================================
 6) تشغيل سيرفر الكاميرات
-==================================================
+========================
+
+نفذ:
 
 cd ~/ApexRover_Repo
 
@@ -326,7 +371,7 @@ Apex Rover Dual Camera Server
 
 ==================================================
 7) اختبار السيرفر من Raspberry
-==================================================
+==============================
 
 افتح Terminal ثاني ونفذ:
 
@@ -350,8 +395,8 @@ front_test.jpg
 arm_test.jpg
 
 ==================================================
-8) اختبار من الموبايل
-==================================================
+8) اختبار الكاميرا من الموبايل
+==============================
 
 الموبايل لازم يكون متصل على نفس شبكة الروبوت:
 
@@ -373,11 +418,21 @@ http://192.168.4.2:5000/arm_snapshot
 
 ==================================================
 9) تشغيل تطبيق الموبايل
-==================================================
+=======================
 
-على اللابتوب داخل مشروع Flutter:
+إذا المشروع على Windows:
 
 cd C:\RobotGitHup\Apex-Rover
+
+git pull origin main
+
+flutter pub get
+
+flutter run
+
+إذا المشروع على Linux، ادخل لمسار مشروع Flutter عندك، مثلًا:
+
+cd ~/VS_StormProjects/ApexRover/robot_master_control
 
 git pull origin main
 
@@ -399,7 +454,7 @@ Arm Mode يعرض Arm Camera
 
 ==================================================
 10) إذا IP الرازبيري تغيّر
-==================================================
+==========================
 
 إذا الأمر:
 
@@ -425,18 +480,18 @@ static const String raspberryBaseUrl = 'http://192.168.4.2:5000';
 
 static const String raspberryBaseUrl = 'http://192.168.4.5:5000';
 
-
-
 ==================================================
-11) ملاحظة مهمة: إضافة بث بيانات السنسورات للموبايل
-==================================================
+11) إضافة بث بيانات السنسورات للموبايل
+======================================
 
 بعد تشغيل بث الكاميرات، صار لازم نشغل كمان جسر السنسورات.
 
 الفيديو يشتغل من:
+
 Raspberry Pi -> Mobile App
 
 أما السنسورات تشتغل بهذا المسار:
+
 Arduino Mega -> Raspberry Pi -> ESP32 -> Mobile App
 
 الموبايل ينتظر رسالة WebSocket من ESP32 بهذا الشكل:
@@ -451,22 +506,32 @@ SENSOR:PITCH=16.2;ROLL=4.1;FRONT=12.0;REAR=8.5;BALANCE=WARNING
 
 SENSOR:PITCH=31.5;ROLL=27.2;FRONT=4.0;REAR=5.5;BALANCE=DANGER
 
-لذلك لازم Raspberry Pi يقرأ السنسورات من Mega ويرسلها للـ ESP32 عن طريق endpoint جديد:
+لذلك لازم Raspberry Pi يقرأ السنسورات من Mega ويرسلها للـ ESP32 عن طريق endpoint:
 
 http://192.168.4.1/sensor_update
 
+مهم جدًا:
+Mega في الخطة النهائية يرسل السنسورات تلقائيًا بهذا الشكل:
+
+SENSOR:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20;ALERT=NONE
+
+لذلك sensor_bridge.py لازم يقرأ SENSOR مباشرة.
+لا نستخدم GET:SENSORS.
+لا ننتظر DATA:.
+
 ==================================================
 12) تثبيت مكتبات السنسورات على Raspberry Pi
-==================================================
+===========================================
 
 نفذ:
 
 sudo apt update
+
 sudo apt install python3-serial python3-requests -y
 
 ==================================================
 13) معرفة بورت Arduino Mega على Raspberry Pi
-==================================================
+============================================
 
 وصل Arduino Mega USB مع Raspberry Pi.
 
@@ -490,9 +555,17 @@ MEGA_PORT = "/dev/ttyACM0"
 
 MEGA_PORT = "/dev/ttyACM1"
 
+إذا لم يظهر شيء، جرب:
+
+ls /dev/ttyUSB*
+
+وقد يكون البورت:
+
+/dev/ttyUSB0
+
 ==================================================
 14) إنشاء ملف sensor_bridge.py
-==================================================
+==============================
 
 نفذ:
 
@@ -502,149 +575,170 @@ nano sensor_bridge.py
 
 انسخ الكود التالي داخل الملف:
 
---------------------------------------------------
+---
 
 import time
 import serial
 import requests
 
 # ==================================================
+
 # Apex Rover Sensor Bridge
+
 #
+
 # Flow:
+
 # Arduino Mega -> Raspberry Pi -> ESP32 -> Mobile App
+
 #
-# Mega should reply:
-# DATA:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20
+
+# Mega sends automatically:
+
+# SENSOR:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20;ALERT=NONE
+
 #
+
 # ESP32 receives:
+
 # /sensor_update?pitch=...&roll=...&front=...&rear=...&balance=...
+
 # ==================================================
 
 ESP32_URL = "http://192.168.4.1"
 
 # عدّل هذا البورت حسب نتيجة:
+
 # ls /dev/ttyACM*
+
+# أو:
+
+# ls /dev/ttyUSB*
+
 MEGA_PORT = "/dev/ttyACM0"
 
 BAUD_RATE = 9600
-REQUEST_INTERVAL = 0.25
-
+FORWARD_TIMEOUT = 0.5
 
 def parse_sensor_line(line):
-    line = line.strip()
+line = line.strip()
 
-    if not line.startswith("DATA:"):
-        return None
+```
+if not line.startswith("SENSOR:"):
+    return None
 
-    payload = line[len("DATA:"):]
-    parts = payload.split(";")
+payload = line[len("SENSOR:"):]
+parts = payload.split(";")
 
-    data = {}
+data = {}
 
-    for part in parts:
-        if "=" not in part:
-            continue
+for part in parts:
+    if "=" not in part:
+        continue
 
-        key, value = part.split("=", 1)
-        key = key.strip().upper()
-        value = value.strip()
+    key, value = part.split("=", 1)
+    key = key.strip().upper()
+    value = value.strip()
+    data[key] = value
 
-        try:
-            data[key] = float(value)
-        except ValueError:
-            data[key] = value
+pitch = float(data.get("PITCH", 0.0))
+roll = float(data.get("ROLL", 0.0))
+front = float(data.get("UF", data.get("FRONT", -1.0)))
+rear = float(data.get("UR", data.get("REAR", -1.0)))
+alert = data.get("ALERT", "NONE").upper()
 
-    pitch = float(data.get("PITCH", 0.0))
-    roll = float(data.get("ROLL", 0.0))
-    front = float(data.get("UF", data.get("FRONT", -1.0)))
-    rear = float(data.get("UR", data.get("REAR", -1.0)))
+balance = compute_balance_status(pitch, roll, alert)
 
-    balance = compute_balance_status(pitch, roll)
+return {
+    "pitch": pitch,
+    "roll": roll,
+    "front": front,
+    "rear": rear,
+    "balance": balance,
+    "alert": alert,
+}
+```
 
-    return {
-        "pitch": pitch,
-        "roll": roll,
-        "front": front,
-        "rear": rear,
-        "balance": balance,
-    }
+def compute_balance_status(pitch, roll, alert):
+abs_pitch = abs(pitch)
+abs_roll = abs(roll)
 
+```
+if alert == "TILT_DANGER":
+    return "DANGER"
 
-def compute_balance_status(pitch, roll):
-    abs_pitch = abs(pitch)
-    abs_roll = abs(roll)
+if alert in ("OBSTACLE_FRONT", "OBSTACLE_REAR"):
+    return "WARNING"
 
-    if abs_pitch >= 30 or abs_roll >= 25:
-        return "DANGER"
+if abs_pitch >= 30 or abs_roll >= 25:
+    return "DANGER"
 
-    if abs_pitch >= 15 or abs_roll >= 12:
-        return "WARNING"
+if abs_pitch >= 15 or abs_roll >= 12:
+    return "WARNING"
 
-    return "STABLE"
-
+return "STABLE"
+```
 
 def send_to_esp32(sensor_data):
-    try:
-        response = requests.get(
-            f"{ESP32_URL}/sensor_update",
-            params={
-                "pitch": f"{sensor_data['pitch']:.2f}",
-                "roll": f"{sensor_data['roll']:.2f}",
-                "front": f"{sensor_data['front']:.2f}",
-                "rear": f"{sensor_data['rear']:.2f}",
-                "balance": sensor_data["balance"],
-            },
-            timeout=0.25,
-        )
+try:
+response = requests.get(
+f"{ESP32_URL}/sensor_update",
+params={
+"pitch": f"{sensor_data['pitch']:.2f}",
+"roll": f"{sensor_data['roll']:.2f}",
+"front": f"{sensor_data['front']:.2f}",
+"rear": f"{sensor_data['rear']:.2f}",
+"balance": sensor_data["balance"],
+},
+timeout=FORWARD_TIMEOUT,
+)
 
-        print("[ESP32]", response.text)
+```
+    print("[ESP32]", response.text)
 
-    except requests.RequestException as e:
-        print("[ERROR] Could not send to ESP32:", e)
-
+except requests.RequestException as e:
+    print("[ERROR] Could not send to ESP32:", e)
+```
 
 def main():
-    print("====================================")
-    print("Apex Rover Sensor Bridge")
-    print(f"Mega Port : {MEGA_PORT}")
-    print(f"ESP32 URL : {ESP32_URL}")
-    print("====================================")
+print("====================================")
+print("Apex Rover Sensor Bridge")
+print(f"Mega Port : {MEGA_PORT}")
+print(f"ESP32 URL : {ESP32_URL}")
+print("====================================")
 
-    while True:
-        try:
-            with serial.Serial(MEGA_PORT, BAUD_RATE, timeout=0.5) as mega:
-                time.sleep(2)
-                mega.reset_input_buffer()
-
-                print("[OK] Connected to Mega")
-
-                while True:
-                    mega.write(b"GET:SENSORS\n")
-
-                    line = mega.readline().decode(errors="ignore").strip()
-
-                    if line:
-                        print("[MEGA]", line)
-
-                    sensor_data = parse_sensor_line(line)
-
-                    if sensor_data is not None:
-                        print("[SENSOR]", sensor_data)
-                        send_to_esp32(sensor_data)
-
-                    time.sleep(REQUEST_INTERVAL)
-
-        except serial.SerialException as e:
-            print("[ERROR] Mega serial problem:", e)
-            print("[INFO] Retrying in 2 seconds...")
+```
+while True:
+    try:
+        with serial.Serial(MEGA_PORT, BAUD_RATE, timeout=0.5) as mega:
             time.sleep(2)
+            mega.reset_input_buffer()
 
+            print("[OK] Connected to Mega")
+            print("[INFO] Waiting for SENSOR lines from Mega...")
 
-if __name__ == "__main__":
-    main()
+            while True:
+                line = mega.readline().decode(errors="ignore").strip()
 
---------------------------------------------------
+                if line:
+                    print("[MEGA]", line)
+
+                sensor_data = parse_sensor_line(line)
+
+                if sensor_data is not None:
+                    print("[SENSOR]", sensor_data)
+                    send_to_esp32(sensor_data)
+
+    except serial.SerialException as e:
+        print("[ERROR] Mega serial problem:", e)
+        print("[INFO] Retrying in 2 seconds...")
+        time.sleep(2)
+```
+
+if **name** == "**main**":
+main()
+
+---
 
 بعد لصق الكود احفظ:
 
@@ -654,7 +748,7 @@ Ctrl + X
 
 ==================================================
 15) تشغيل Sensor Bridge
-==================================================
+=======================
 
 افتح Terminal جديد على Raspberry Pi ونفذ:
 
@@ -665,13 +759,20 @@ python3 sensor_bridge.py
 لازم يظهر شيء مثل:
 
 [OK] Connected to Mega
-[MEGA] DATA:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20
-[SENSOR] {'pitch': 2.3, 'roll': -1.1, 'front': 8.5, 'rear': 9.2, 'balance': 'STABLE'}
+[INFO] Waiting for SENSOR lines from Mega...
+[MEGA] SENSOR:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20;ALERT=NONE
+[SENSOR] {'pitch': 2.3, 'roll': -1.1, 'front': 8.5, 'rear': 9.2, 'balance': 'STABLE', 'alert': 'NONE'}
 [ESP32] {"ok":true,...
+
+إذا بقي واقف على:
+
+[INFO] Waiting for SENSOR lines from Mega...
+
+معناه Mega لا يرسل SENSOR lines، أو البورت غلط، أو كود Mega غير مرفوع صح.
 
 ==================================================
 16) اختبار السنسورات بدون Mega
-==================================================
+==============================
 
 بعد رفع كود ESP32 الجديد، ومن أي جهاز متصل على شبكة Apex_Rover_Net، نفذ:
 
@@ -699,14 +800,18 @@ curl "http://192.168.4.1/sensor_update?pitch=31.5&roll=27.2&front=4.0&rear=5.5&b
 
 ==================================================
 17) تشغيل النظام كامل
-==================================================
+=====================
 
 لازم يكون شغالين على Raspberry Pi:
 
 Terminal 1:
+
+cd ~/ApexRover_Repo
 python3 dual_camera_server.py
 
 Terminal 2:
+
+cd ~/ApexRover_Repo
 python3 sensor_bridge.py
 
 وبعدها افتح تطبيق الموبايل:
@@ -716,31 +821,64 @@ Control
 Remote Control
 
 المفروض تشوف:
+
 1. فيديو الكاميرا
 2. بيانات السنسورات فوق الشاشة
 3. أزرار التحكم اليدوي
 
-
-
 ==================================================
-الخلاصة
-==================================================
+18) الخلاصة
+===========
 
 الترتيب الصحيح:
 
 1. Raspberry يتصل على Apex_Rover_Net
+
 2. يتأكد من ESP32:
-   curl http://192.168.4.1/get_status
+
+curl http://192.168.4.1/get_status
 
 3. يتأكد من الكاميرات:
-   ls -l /dev/v4l/by-id/
+
+ls -l /dev/v4l/by-id/
 
 4. ينشئ dual_camera_server.py
+
 5. يشغل:
-   python3 dual_camera_server.py
+
+python3 dual_camera_server.py
 
 6. يجرب من الموبايل:
-   http://192.168.4.2:5000/front_snapshot
-   http://192.168.4.2:5000/arm_snapshot
 
-7. يشغل التطبيق ويفتح Remote Control
+http://192.168.4.2:5000/front_snapshot
+http://192.168.4.2:5000/arm_snapshot
+
+7. ينشئ sensor_bridge.py
+
+8. يشغل:
+
+python3 sensor_bridge.py
+
+9. يجرب السنسورات:
+
+curl "http://192.168.4.1/sensor_update?pitch=2.4&roll=-1.1&front=35.6&rear=18.2&balance=STABLE"
+
+10. يشغل التطبيق ويفتح Remote Control
+
+==================================================
+19) ملاحظات مهمة
+================
+
+1. Raspberry Pi لا يتحكم بحركة الروبوت.
+2. التحكم فقط من الموبايل.
+3. Raspberry Pi يستخدم فقط للكاميرات والسنسورات.
+4. Mega يرسل SENSOR lines إلى Raspberry Pi.
+5. ESP32 يستقبل sensor_update ويبثها للموبايل.
+6. إذا تغير IP الرازبيري، لازم نعدل IP داخل Flutter.
+7. إذا لم تظهر بيانات السنسورات، افحص:
+
+   * كود ESP32 مرفوع وفيه /sensor_update
+   * كود Mega يرسل SENSOR:
+   * البورت MEGA_PORT صحيح
+   * Raspberry متصل على Apex_Rover_Net
+   * الموبايل متصل WebSocket مع ESP32
