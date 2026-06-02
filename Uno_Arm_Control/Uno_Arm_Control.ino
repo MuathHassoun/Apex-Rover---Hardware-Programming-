@@ -326,7 +326,7 @@ byte usbCmdIndex = 0;
 // ==================================================
 int clampAngle(int value, int minValue, int maxValue) {
   if (value < minValue) return minValue;
-  if (value > maxValue) return maxValue;
+  if (value > maxValue) return value > maxValue ? maxValue : value;
   return value;
 }
 
@@ -895,13 +895,20 @@ void handleArmCommand(const char *cmd) {
     return;
   }
 
+  // ==================================================
+  // IMPORTANT:
+  // UP / DOWN are intentionally inverted here
+  // to match the Remote Control arm buttons.
+  // Do not change camera, base, or gripper logic.
+  // ==================================================
+
   if (equalsCmd(cmd, "ARM:SHOULDER:UP")) {
-    setShoulderAngle(shoulderAngle + ARM_SERVO_STEP);
+    setShoulderAngle(shoulderAngle - ARM_SERVO_STEP);
     return;
   }
 
   if (equalsCmd(cmd, "ARM:SHOULDER:DOWN")) {
-    setShoulderAngle(shoulderAngle - ARM_SERVO_STEP);
+    setShoulderAngle(shoulderAngle + ARM_SERVO_STEP);
     return;
   }
 
@@ -911,12 +918,12 @@ void handleArmCommand(const char *cmd) {
   }
 
   if (equalsCmd(cmd, "ARM:ELBOW:UP")) {
-    setElbowAngle(elbowAngle + ARM_SERVO_STEP);
+    setElbowAngle(elbowAngle - ARM_SERVO_STEP);
     return;
   }
 
   if (equalsCmd(cmd, "ARM:ELBOW:DOWN")) {
-    setElbowAngle(elbowAngle - ARM_SERVO_STEP);
+    setElbowAngle(elbowAngle + ARM_SERVO_STEP);
     return;
   }
 
@@ -926,12 +933,12 @@ void handleArmCommand(const char *cmd) {
   }
 
   if (equalsCmd(cmd, "ARM:WRIST:UP")) {
-    setWristAngle(wristAngle + ARM_SERVO_STEP);
+    setWristAngle(wristAngle - ARM_SERVO_STEP);
     return;
   }
 
   if (equalsCmd(cmd, "ARM:WRIST:DOWN")) {
-    setWristAngle(wristAngle - ARM_SERVO_STEP);
+    setWristAngle(wristAngle + ARM_SERVO_STEP);
     return;
   }
 
@@ -956,12 +963,12 @@ void handleArmCommand(const char *cmd) {
   }
 
   if (equalsCmd(cmd, "ARM:AUX:UP")) {
-    setAuxAngle(auxAngle + ARM_SERVO_STEP);
+    setAuxAngle(auxAngle - ARM_SERVO_STEP);
     return;
   }
 
   if (equalsCmd(cmd, "ARM:AUX:DOWN")) {
-    setAuxAngle(auxAngle - ARM_SERVO_STEP);
+    setAuxAngle(auxAngle + ARM_SERVO_STEP);
     return;
   }
 
