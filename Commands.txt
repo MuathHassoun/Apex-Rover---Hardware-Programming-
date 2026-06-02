@@ -6,3 +6,8 @@ sudo systemctl stop apex-rover.service
 sudo systemctl restart apex-rover.service
 sudo systemctl status apex-rover.service
 journalctl -u apex-rover.service -n 80
+
+
+sudo fuser -k 5050/tcp
+sudo lsof -i ;5050
+sudo kill -9 [process_id]
