@@ -1,0 +1,28 @@
+apex-rover@raspberrypi:~/Apex_Rover $ python3 main_startup.py 
+==========================================
+Apex Rover Raspberry Mode Manager
+Default mode: MANUAL
+Manual: dual cameras + sensors
+Auto  : front camera + MPU + auto brain
+API port: 5050
+==========================================
+==========================================
+SWITCH TO MANUAL MODE
+==========================================
+[WARN] websocket-client not installed
+[WARN] websocket-client not installed
+[WARN] websocket-client not installed
+[WARN] websocket-client not installed
+[START] Sensor Bridge
+[FILE] /home/apex-rover/Apex_Rover/Manual/sensor_bridge.py
+[LOG]  /tmp/apex_rover_logs/sensor_bridge.log
+[START] Manual Dual Camera Server
+[FILE] /home/apex-rover/Apex_Rover/Manual/dual_camera_server.py
+[LOG]  /tmp/apex_rover_logs/manual_dual_camera.log
+[WARN] websocket-client not installed
+ * Serving Flask app 'main_startup'
+ * Debug mode: off
+Address already in use
+Port 5000 is in use by another program. Either identify and stop that program, or start the server with a different port.
+apex-rover@raspberrypi:~/Apex_Rover $ 
+
