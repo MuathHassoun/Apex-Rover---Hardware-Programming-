@@ -2,6 +2,7 @@ sudo nano /etc/systemd/system/apex-rover.service
 sudo systemctl daemon-reload
 sudo systemctl enable apex-rover.service
 sudo systemctl start apex-rover.service
+sudo systemctl stop apex-rover.service
 sudo systemctl restart apex-rover.service
 sudo systemctl status apex-rover.service
 journalctl -u apex-rover.service -n 80
