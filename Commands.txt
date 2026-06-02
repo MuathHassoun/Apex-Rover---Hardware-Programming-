@@ -1,7 +1,7 @@
-sudo nano /etc/systemd/system/apex-brain.service
+sudo nano /etc/systemd/system/apex-rover.service
 sudo systemctl daemon-reload
-sudo systemctl enable apex-brain.service
-sudo systemctl start apex-brain.service
-sudo systemctl status apex-brain.service
-journalctl -u apex-brain.service -n 80
-sudo systemctl restart apex-brain.service
+sudo systemctl enable apex-rover.service
+sudo systemctl start apex-rover.service
+sudo systemctl restart apex-rover.service
+sudo systemctl status apex-rover.service
+journalctl -u apex-rover.service -n 80
