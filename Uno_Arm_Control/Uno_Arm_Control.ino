@@ -32,10 +32,18 @@
 //   Gripper Servo         -> UNO D10
 //   Aux / Axis Servo      -> UNO D11
 //
+// New config commands from mobile:
+//   ARM:CONFIG:STEPPER_STEPS:N
+//   ARM:CONFIG:SERVO_STEP:N
+//   CAM:CONFIG:STEPPER_STEPS:N
+//   CAM:CONFIG:SERVO_STEP:N
+//
 // Supported CAM commands:
 //   CAM:LEFT
 //   CAM:RIGHT
 //   CAM:STOP
+//   CAM:STEP_LEFT
+//   CAM:STEP_RIGHT
 //   CAM:STEP_LEFT:N
 //   CAM:STEP_RIGHT:N
 //   CAM:UP
@@ -53,6 +61,8 @@
 //   ARM:BASE:LEFT
 //   ARM:BASE:RIGHT
 //   ARM:BASE:STOP
+//   ARM:BASE:STEP_LEFT
+//   ARM:BASE:STEP_RIGHT
 //   ARM:BASE:STEP_LEFT:N
 //   ARM:BASE:STEP_RIGHT:N
 //   ARM:BASE:SPEED:N
@@ -90,9 +100,6 @@
 // ==================================================
 // ESP32 -> UNO Serial
 // ==================================================
-// ESP32 GPIO4 TX -> UNO D2 RX
-// D3 TX is not wired, but SoftwareSerial needs a TX pin.
-// ==================================================
 SoftwareSerial espSerial(2, 3);
 
 
@@ -107,7 +114,6 @@ SoftwareSerial espSerial(2, 3);
 
 // ==================================================
 // Arm Base Stepper Pins
-// EN = 4, STEP = 8, DIR = 7
 // ==================================================
 #define ARM_EN_PIN       4
 #define ARM_STEP_PIN     8
@@ -116,7 +122,6 @@ SoftwareSerial espSerial(2, 3);
 
 // ==================================================
 // Arm Servo Pins
-// Shoulder 5, Elbow 6, Wrist 9, Gripper 10, Aux/Axis 11
 // ==================================================
 #define SHOULDER_PIN     5
 #define ELBOW_PIN        6
@@ -154,11 +159,32 @@ const unsigned long ARM_HOLD_REFRESH_MS = 35;
 
 
 // ==================================================
+// Configurable Motion Settings
+//
+// These are changed by mobile commands:
+//   ARM:CONFIG:STEPPER_STEPS:N
+//   ARM:CONFIG:SERVO_STEP:N
+//
+// They are shared by camera stand and arm.
+// ==================================================
+const long DEFAULT_STEPPER_STEPS = 100;
+const int DEFAULT_SERVO_STEP = 5;
+
+long configuredStepperSteps = DEFAULT_STEPPER_STEPS;
+int configuredServoStep = DEFAULT_SERVO_STEP;
+
+const long MIN_STEPPER_STEPS = 1;
+const long MAX_STEPPER_STEPS = 50000;
+
+const int MIN_SERVO_STEP = 1;
+const int MAX_SERVO_STEP = 30;
+
+
+// ==================================================
 // Camera Servo Range
 // ==================================================
 const int CAM_SERVO_MIN = 30;
 const int CAM_SERVO_MAX = 150;
-const int CAM_SERVO_STEP = 5;
 const int CAM_SERVO_CENTER = 90;
 
 const bool INVERT_CAMERA_VERTICAL = true;
@@ -182,13 +208,9 @@ const int AUX_MAX = 170;
 const int GRIPPER_MIN = 120;
 const int GRIPPER_MAX = 180;
 
-const int ARM_SERVO_STEP = 5;
-
 
 // ==================================================
 // Arm READY Pose
-// READY means the arm is active and facing the front.
-// Adjust these values after testing.
 // ==================================================
 const int READY_SHOULDER = 90;
 const int READY_ELBOW = 30;
@@ -199,8 +221,6 @@ const int READY_GRIPPER = 180;
 
 // ==================================================
 // Arm HOME Pose
-// HOME means the arm is resting on the rear stand.
-// Adjust these values after testing.
 // ==================================================
 const int HOME_SHOULDER = 60;
 const int HOME_ELBOW = 10;
@@ -211,7 +231,6 @@ const int HOME_GRIPPER = 180;
 
 // ==================================================
 // Gripper Angles
-// Change OPEN/CLOSE if gripper direction is reversed.
 // ==================================================
 const int GRIPPER_OPEN_ANGLE = 180;
 const int GRIPPER_CLOSE_ANGLE = 120;
@@ -219,10 +238,6 @@ const int GRIPPER_CLOSE_ANGLE = 120;
 
 // ==================================================
 // Arm Base Stepper Position Settings
-//
-// Position is software-based.
-// The robot must start from a known position.
-// In this code, setup assumes the arm starts at HOME position.
 // ==================================================
 const long ARM_BASE_STEPS_PER_DEG = 10;
 
@@ -262,7 +277,6 @@ unsigned long cameraDetachStartMs = 0;
 
 // ==================================================
 // Arm Servo State
-// Last angle of each servo is always saved here.
 // ==================================================
 int shoulderAngle = HOME_SHOULDER;
 int elbowAngle = HOME_ELBOW;
@@ -284,7 +298,6 @@ unsigned long homeDetachStartMs = 0;
 
 // ==================================================
 // Camera Stepper State
-// -1 = left, 0 = stop, 1 = right
 // ==================================================
 int cameraStepperDirection = 0;
 
@@ -297,7 +310,6 @@ unsigned long cameraStepIntervalMicros = 700;
 
 // ==================================================
 // Arm Base Stepper State
-// -1 = left, 0 = stop, 1 = right
 // ==================================================
 int armBaseStepperDirection = 0;
 
@@ -326,7 +338,13 @@ byte usbCmdIndex = 0;
 // ==================================================
 int clampAngle(int value, int minValue, int maxValue) {
   if (value < minValue) return minValue;
-  if (value > maxValue) return value > maxValue ? maxValue : value;
+  if (value > maxValue) return maxValue;
+  return value;
+}
+
+long clampLong(long value, long minValue, long maxValue) {
+  if (value < minValue) return minValue;
+  if (value > maxValue) return maxValue;
   return value;
 }
 
@@ -339,9 +357,46 @@ long parseLastLong(const char *cmd) {
 long parsePositiveSteps(const char *cmd) {
   long value = parseLastLong(cmd);
   if (value < 0) value = -value;
-  if (value < 1) value = 1;
-  if (value > 50000) value = 50000;
-  return value;
+  return clampLong(value, MIN_STEPPER_STEPS, MAX_STEPPER_STEPS);
+}
+
+long parseStepsOrDefault(const char *cmd) {
+  const char *lastColon = strrchr(cmd, ':');
+
+  if (lastColon == NULL) {
+    return configuredStepperSteps;
+  }
+
+  const char *afterColon = lastColon + 1;
+
+  if (afterColon == NULL || afterColon[0] == '\0') {
+    return configuredStepperSteps;
+  }
+
+  bool hasDigit = false;
+
+  for (int i = 0; afterColon[i] != '\0'; i++) {
+    if (afterColon[i] >= '0' && afterColon[i] <= '9') {
+      hasDigit = true;
+      break;
+    }
+  }
+
+  if (!hasDigit) {
+    return configuredStepperSteps;
+  }
+
+  return parsePositiveSteps(cmd);
+}
+
+int parseServoStepOrDefault(const char *cmd) {
+  long value = parseLastLong(cmd);
+
+  if (value <= 0) {
+    return configuredServoStep;
+  }
+
+  return (int)clampLong(value, MIN_SERVO_STEP, MAX_SERVO_STEP);
 }
 
 bool equalsCmd(const char *cmd, const char *target) {
@@ -362,6 +417,57 @@ void disableDriver(int enPin) {
 
 long degToArmBaseSteps(long deg) {
   return deg * ARM_BASE_STEPS_PER_DEG;
+}
+
+void sendAck(const char *msg) {
+  Serial.print("ACK:");
+  Serial.println(msg);
+}
+
+
+// ==================================================
+// Config Command Handler
+// ==================================================
+bool handleConfigCommand(const char *cmd) {
+  if (startsWithCmd(cmd, "ARM:CONFIG:STEPPER_STEPS:") ||
+      startsWithCmd(cmd, "CAM:CONFIG:STEPPER_STEPS:")) {
+    long value = parseLastLong(cmd);
+    configuredStepperSteps = clampLong(value, MIN_STEPPER_STEPS, MAX_STEPPER_STEPS);
+
+    Serial.print("ACK:CONFIG:STEPPER_STEPS:");
+    Serial.println(configuredStepperSteps);
+    return true;
+  }
+
+  if (startsWithCmd(cmd, "ARM:CONFIG:SERVO_STEP:") ||
+      startsWithCmd(cmd, "CAM:CONFIG:SERVO_STEP:")) {
+    long value = parseLastLong(cmd);
+    configuredServoStep = (int)clampLong(value, MIN_SERVO_STEP, MAX_SERVO_STEP);
+
+    Serial.print("ACK:CONFIG:SERVO_STEP:");
+    Serial.println(configuredServoStep);
+    return true;
+  }
+
+  if (equalsCmd(cmd, "ARM:CONFIG:RESET") ||
+      equalsCmd(cmd, "CAM:CONFIG:RESET")) {
+    configuredStepperSteps = DEFAULT_STEPPER_STEPS;
+    configuredServoStep = DEFAULT_SERVO_STEP;
+
+    Serial.println("ACK:CONFIG:RESET");
+    return true;
+  }
+
+  if (equalsCmd(cmd, "ARM:CONFIG:STATUS") ||
+      equalsCmd(cmd, "CAM:CONFIG:STATUS")) {
+    Serial.print("CONFIG:STEPPER_STEPS=");
+    Serial.print(configuredStepperSteps);
+    Serial.print(";SERVO_STEP=");
+    Serial.println(configuredServoStep);
+    return true;
+  }
+
+  return false;
 }
 
 
@@ -701,6 +807,10 @@ void setAuxAngle(int angle) {
 // Camera Command Handler
 // ==================================================
 void handleCameraCommand(const char *cmd) {
+  if (handleConfigCommand(cmd)) {
+    return;
+  }
+
   if (equalsCmd(cmd, "CAM:STOP")) {
     stopCameraMotion();
     return;
@@ -730,8 +840,8 @@ void handleCameraCommand(const char *cmd) {
     return;
   }
 
-  if (startsWithCmd(cmd, "CAM:STEP_LEFT:")) {
-    cameraFiniteStepsRemaining = parsePositiveSteps(cmd);
+  if (equalsCmd(cmd, "CAM:STEP_LEFT") || startsWithCmd(cmd, "CAM:STEP_LEFT:")) {
+    cameraFiniteStepsRemaining = parseStepsOrDefault(cmd);
     cameraStepperDirection = -1;
 
     digitalWrite(CAM_DIR_PIN, LOW);
@@ -739,8 +849,8 @@ void handleCameraCommand(const char *cmd) {
     return;
   }
 
-  if (startsWithCmd(cmd, "CAM:STEP_RIGHT:")) {
-    cameraFiniteStepsRemaining = parsePositiveSteps(cmd);
+  if (equalsCmd(cmd, "CAM:STEP_RIGHT") || startsWithCmd(cmd, "CAM:STEP_RIGHT:")) {
+    cameraFiniteStepsRemaining = parseStepsOrDefault(cmd);
     cameraStepperDirection = 1;
 
     digitalWrite(CAM_DIR_PIN, HIGH);
@@ -749,13 +859,27 @@ void handleCameraCommand(const char *cmd) {
   }
 
   if (equalsCmd(cmd, "CAM:UP")) {
-    int delta = INVERT_CAMERA_VERTICAL ? -CAM_SERVO_STEP : CAM_SERVO_STEP;
+    int delta = INVERT_CAMERA_VERTICAL ? -configuredServoStep : configuredServoStep;
     setCameraAngle(cameraServoAngle + delta);
     return;
   }
 
   if (equalsCmd(cmd, "CAM:DOWN")) {
-    int delta = INVERT_CAMERA_VERTICAL ? CAM_SERVO_STEP : -CAM_SERVO_STEP;
+    int delta = INVERT_CAMERA_VERTICAL ? configuredServoStep : -configuredServoStep;
+    setCameraAngle(cameraServoAngle + delta);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "CAM:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    int delta = INVERT_CAMERA_VERTICAL ? -step : step;
+    setCameraAngle(cameraServoAngle + delta);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "CAM:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    int delta = INVERT_CAMERA_VERTICAL ? step : -step;
     setCameraAngle(cameraServoAngle + delta);
     return;
   }
@@ -782,6 +906,10 @@ void handleCameraCommand(const char *cmd) {
 // Arm Command Handler
 // ==================================================
 void handleArmCommand(const char *cmd) {
+  if (handleConfigCommand(cmd)) {
+    return;
+  }
+
   if (equalsCmd(cmd, "ARM:STOP")) {
     stopAllArmMotion();
     return;
@@ -831,11 +959,12 @@ void handleArmCommand(const char *cmd) {
     return;
   }
 
-  if (startsWithCmd(cmd, "ARM:BASE:STEP_LEFT:")) {
+  if (equalsCmd(cmd, "ARM:BASE:STEP_LEFT") ||
+      startsWithCmd(cmd, "ARM:BASE:STEP_LEFT:")) {
     markArmActive();
 
     armBaseTargetMode = false;
-    armBaseFiniteStepsRemaining = parsePositiveSteps(cmd);
+    armBaseFiniteStepsRemaining = parseStepsOrDefault(cmd);
     armBaseStepperDirection = -1;
 
     digitalWrite(ARM_DIR_PIN, LOW);
@@ -843,11 +972,12 @@ void handleArmCommand(const char *cmd) {
     return;
   }
 
-  if (startsWithCmd(cmd, "ARM:BASE:STEP_RIGHT:")) {
+  if (equalsCmd(cmd, "ARM:BASE:STEP_RIGHT") ||
+      startsWithCmd(cmd, "ARM:BASE:STEP_RIGHT:")) {
     markArmActive();
 
     armBaseTargetMode = false;
-    armBaseFiniteStepsRemaining = parsePositiveSteps(cmd);
+    armBaseFiniteStepsRemaining = parseStepsOrDefault(cmd);
     armBaseStepperDirection = 1;
 
     digitalWrite(ARM_DIR_PIN, HIGH);
@@ -899,16 +1029,28 @@ void handleArmCommand(const char *cmd) {
   // IMPORTANT:
   // UP / DOWN are intentionally inverted here
   // to match the Remote Control arm buttons.
-  // Do not change camera, base, or gripper logic.
+  // Servo step is configurable from mobile.
   // ==================================================
 
   if (equalsCmd(cmd, "ARM:SHOULDER:UP")) {
-    setShoulderAngle(shoulderAngle - ARM_SERVO_STEP);
+    setShoulderAngle(shoulderAngle - configuredServoStep);
     return;
   }
 
   if (equalsCmd(cmd, "ARM:SHOULDER:DOWN")) {
-    setShoulderAngle(shoulderAngle + ARM_SERVO_STEP);
+    setShoulderAngle(shoulderAngle + configuredServoStep);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:SHOULDER:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setShoulderAngle(shoulderAngle - step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:SHOULDER:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setShoulderAngle(shoulderAngle + step);
     return;
   }
 
@@ -918,12 +1060,24 @@ void handleArmCommand(const char *cmd) {
   }
 
   if (equalsCmd(cmd, "ARM:ELBOW:UP")) {
-    setElbowAngle(elbowAngle - ARM_SERVO_STEP);
+    setElbowAngle(elbowAngle - configuredServoStep);
     return;
   }
 
   if (equalsCmd(cmd, "ARM:ELBOW:DOWN")) {
-    setElbowAngle(elbowAngle + ARM_SERVO_STEP);
+    setElbowAngle(elbowAngle + configuredServoStep);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:ELBOW:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setElbowAngle(elbowAngle - step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:ELBOW:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setElbowAngle(elbowAngle + step);
     return;
   }
 
@@ -933,12 +1087,24 @@ void handleArmCommand(const char *cmd) {
   }
 
   if (equalsCmd(cmd, "ARM:WRIST:UP")) {
-    setWristAngle(wristAngle - ARM_SERVO_STEP);
+    setWristAngle(wristAngle - configuredServoStep);
     return;
   }
 
   if (equalsCmd(cmd, "ARM:WRIST:DOWN")) {
-    setWristAngle(wristAngle + ARM_SERVO_STEP);
+    setWristAngle(wristAngle + configuredServoStep);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:WRIST:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setWristAngle(wristAngle - step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:WRIST:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setWristAngle(wristAngle + step);
     return;
   }
 
@@ -963,12 +1129,24 @@ void handleArmCommand(const char *cmd) {
   }
 
   if (equalsCmd(cmd, "ARM:AUX:UP")) {
-    setAuxAngle(auxAngle - ARM_SERVO_STEP);
+    setAuxAngle(auxAngle - configuredServoStep);
     return;
   }
 
   if (equalsCmd(cmd, "ARM:AUX:DOWN")) {
-    setAuxAngle(auxAngle + ARM_SERVO_STEP);
+    setAuxAngle(auxAngle + configuredServoStep);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:AUX:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setAuxAngle(auxAngle - step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:AUX:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setAuxAngle(auxAngle + step);
     return;
   }
 
@@ -1007,8 +1185,6 @@ void handleSystemCommand(const char *cmd) {
 
 // ==================================================
 // Main Command Router
-// Camera commands never control arm servos.
-// Arm commands never control camera servo.
 // ==================================================
 void handleCommand(const char *cmd) {
   if (startsWithCmd(cmd, "CAM:")) {
@@ -1169,6 +1345,10 @@ void setup() {
 
   Serial.println("UNO_READY");
   Serial.println("UNO_ARM_READY_ON_STARTUP");
+  Serial.print("UNO_CONFIG:STEPPER_STEPS=");
+  Serial.print(configuredStepperSteps);
+  Serial.print(";SERVO_STEP=");
+  Serial.println(configuredServoStep);
 }
 
 
