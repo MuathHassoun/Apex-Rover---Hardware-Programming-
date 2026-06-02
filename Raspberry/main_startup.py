@@ -5,14 +5,16 @@ main_startup.py - Apex Rover Raspberry Mode Manager
 This manager switches Raspberry Pi between:
 
 MANUAL:
-  - Runs Manual/apex_rover_startup.py
-  - That old manual startup file starts:
-      1) Manual/dual_camera_server.py
+  - Runs Manual/apex_rover_manual_servers_startup.py
+  - That manual startup file starts:
+      1) Manual/camera_admin_server.py
       2) Manual/sensor_bridge.py
-  - This keeps the old working manual camera system unchanged.
+  - Manual camera mode opens only one camera at a time:
+      Front camera for Basic / Rear Jack / Front Jack
+      Arm camera for Arm mode
 
 AUTO:
-  - Stops Manual/apex_rover_startup.py
+  - Stops Manual/apex_rover_manual_servers_startup.py
   - Starts Manual/sensor_bridge.py only
   - Starts Auto/front_camera_server.py
   - Starts Auto/auto_stair_climb.py
@@ -47,7 +49,10 @@ BASE_DIR = Path(__file__).resolve().parent
 MANUAL_DIR = BASE_DIR / "Manual"
 AUTO_DIR = BASE_DIR / "Auto"
 
-MANUAL_STARTUP_FILE = MANUAL_DIR / "apex_rover_startup.py"
+# IMPORTANT:
+# Your manual startup file name is:
+#   apex_rover_manual_servers_startup.py
+MANUAL_STARTUP_FILE = MANUAL_DIR / "apex_rover_manual_servers_startup.py"
 MANUAL_SENSOR_BRIDGE_FILE = MANUAL_DIR / "sensor_bridge.py"
 
 AUTO_FRONT_CAMERA_FILE = AUTO_DIR / "front_camera_server.py"
@@ -185,17 +190,18 @@ def safe_stop_robot():
 
 def start_manual_startup():
     """
-    Manual mode uses the old working startup file.
+    Manual mode uses:
+      Manual/apex_rover_manual_servers_startup.py
 
-    Manual/apex_rover_startup.py starts:
-      - dual_camera_server.py on port 5000
+    That file should start:
+      - camera_admin_server.py on port 5000
       - sensor_bridge.py
     """
     global manual_startup_process
 
     if not is_running(manual_startup_process):
         manual_startup_process = start_process(
-            name="Manual Startup Manager",
+            name="Manual Services Startup Manager",
             file_path=MANUAL_STARTUP_FILE,
             log_name="manual_startup.log",
         )
@@ -205,7 +211,7 @@ def start_manual_startup():
 
 def start_manual_sensor_bridge_only():
     """
-    Auto mode still needs sensor_bridge, but not dual camera server.
+    Auto mode still needs sensor_bridge, but not the manual camera admin.
     So in Auto we run sensor_bridge.py alone.
     """
     global manual_sensor_process
@@ -262,7 +268,6 @@ def switch_to_manual():
     print("==========================================", flush=True)
 
     with process_lock:
-        # Stop Auto brain first for safety.
         auto_brain_process = stop_process(
             "Auto Stair Climb Brain",
             auto_brain_process,
@@ -270,7 +275,7 @@ def switch_to_manual():
 
         safe_stop_robot()
 
-        # Stop Auto front camera because Manual uses port 5000 through dual camera server.
+        # Stop Auto front camera because Manual camera admin uses port 5000.
         auto_front_camera_process = stop_process(
             "Auto Front Camera Server",
             auto_front_camera_process,
@@ -283,7 +288,6 @@ def switch_to_manual():
             manual_sensor_process,
         )
 
-        # Start old working Manual startup.
         start_manual_startup()
 
         send_esp32_command("SYS:MODE:MANUAL")
@@ -293,7 +297,7 @@ def switch_to_manual():
     return {
         "ok": True,
         "mode": current_mode,
-        "message": "Manual mode active: old manual startup running dual cameras + sensors.",
+        "message": "Manual mode active: camera admin + sensors.",
     }
 
 
@@ -311,17 +315,17 @@ def switch_to_auto():
     with process_lock:
         safe_stop_robot()
 
-        # Stop old Manual startup.
-        # This also stops dual_camera_server.py and its sensor_bridge.py child.
+        # Stop Manual startup.
+        # This stops camera_admin_server.py and its sensor_bridge.py child.
         manual_startup_process = stop_process(
-            "Manual Startup Manager",
+            "Manual Services Startup Manager",
             manual_startup_process,
         )
 
         # Give port 5000 and Mega serial time to release.
         time.sleep(2)
 
-        # Auto needs sensor data, but not dual cameras.
+        # Auto needs sensor data, but not manual cameras.
         start_manual_sensor_bridge_only()
 
         # Auto uses front camera only.
@@ -378,7 +382,7 @@ def stop_auto_and_return_manual():
     return {
         "ok": True,
         "mode": current_mode,
-        "message": "Auto stopped. Manual startup restored.",
+        "message": "Auto stopped. Manual camera admin restored.",
     }
 
 
@@ -403,22 +407,27 @@ def home():
 
 @app.route("/status")
 def status():
+    manual_running = is_running(manual_startup_process)
+    sensor_bridge_running = manual_running or is_running(manual_sensor_process)
+
     return jsonify({
         "ok": True,
         "mode": current_mode,
 
-        # Names expected by the mobile app
-        "manual_dual_camera_running": is_running(manual_startup_process),
-        "sensor_bridge_running": (
-            is_running(manual_startup_process) or
-            is_running(manual_sensor_process)
-        ),
+        # Keep these names because the mobile app already expects them.
+        # In the new manual system this means:
+        # manual camera admin service is running, not two cameras opened together.
+        "manual_dual_camera_running": manual_running,
+        "sensor_bridge_running": sensor_bridge_running,
         "auto_front_camera_running": is_running(auto_front_camera_process),
         "auto_brain_running": is_running(auto_brain_process),
 
         # Extra detailed status
-        "manual_startup_running": is_running(manual_startup_process),
+        "manual_camera_admin_running": manual_running,
+        "manual_startup_running": manual_running,
         "sensor_bridge_only_running": is_running(manual_sensor_process),
+
+        "manual_startup_file": str(MANUAL_STARTUP_FILE),
 
         "logs": {
             "manual_startup": str(LOG_DIR / "manual_startup.log"),
@@ -470,12 +479,12 @@ def monitor_loop():
 
         with process_lock:
             if current_mode == "MANUAL":
-                # Manual must keep old manual startup running.
                 if not is_running(manual_startup_process):
                     print("[MONITOR] Manual startup is down, restarting...", flush=True)
                     start_manual_startup()
 
                 # In Manual, do not run sensor_bridge_only.
+                # Manual startup runs sensor_bridge.py.
                 if is_running(manual_sensor_process):
                     manual_sensor_process = stop_process(
                         "Sensor Bridge Only",
@@ -483,10 +492,10 @@ def monitor_loop():
                     )
 
             elif current_mode == "AUTO":
-                # In Auto, old manual startup must be off to avoid dual cameras.
+                # In Auto, manual startup must be off to avoid camera/port conflicts.
                 if is_running(manual_startup_process):
                     manual_startup_process = stop_process(
-                        "Manual Startup Manager",
+                        "Manual Services Startup Manager",
                         manual_startup_process,
                     )
 
@@ -534,7 +543,7 @@ def shutdown_handler(sig, frame):
         )
 
         manual_startup_process = stop_process(
-            "Manual Startup Manager",
+            "Manual Services Startup Manager",
             manual_startup_process,
         )
 
@@ -552,7 +561,7 @@ def main():
     print("==========================================", flush=True)
     print("Apex Rover Raspberry Mode Manager", flush=True)
     print("Default mode: MANUAL", flush=True)
-    print("Manual: Manual/apex_rover_startup.py", flush=True)
+    print("Manual: Manual/apex_rover_manual_servers_startup.py", flush=True)
     print("Auto  : Sensor bridge only + front camera + auto brain", flush=True)
     print("API port: 5050", flush=True)
     print("==========================================", flush=True)

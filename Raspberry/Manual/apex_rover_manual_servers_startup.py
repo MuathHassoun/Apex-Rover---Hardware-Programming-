@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
 """
-apex_rover_startup.py
+apex_rover_manual_servers_startup.py
 
-Apex Rover Raspberry Pi Main Startup Manager
+Apex Rover Raspberry Pi Manual Services Startup Manager
 
-This file starts and monitors Raspberry Pi microservices:
+This file starts and monitors Raspberry Pi MANUAL mode microservices:
 
-1. dual_camera_server.py
-   - Front camera stream
-   - Arm camera stream
+1. camera_admin_server.py
+   - Smart manual camera admin
+   - Opens ONLY ONE camera at a time
+   - Front camera for Basic / Rear Jack / Front Jack modes
+   - Arm camera for Arm mode
    - Flask server on port 5000
+   - Keeps old URLs working:
+       /front_snapshot
+       /arm_snapshot
+       /front_camera
+       /arm_camera
+       /status
 
 2. sensor_bridge.py
-   - Reads SENSOR lines from Arduino Mega
+   - Reads SENSOR lines from Arduino Mega over USB Serial
+   - Saves latest MPU/sensor data to /tmp/apex_last_sensor.json
    - Sends sensor updates to ESP32 /sensor_update
 
 Important:
-Raspberry Pi does NOT control robot movement.
-All movement commands come from:
+Raspberry Pi does NOT control robot movement in Manual mode.
+All manual movement commands come from:
+
 Mobile App -> ESP32 -> Mega / UNO
 """
 
@@ -26,6 +36,7 @@ import sys
 import time
 import signal
 import subprocess
+import threading
 from datetime import datetime
 
 
@@ -33,8 +44,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SERVICES = [
     {
-        "name": "camera_service",
-        "file": "dual_camera_server.py",
+        "name": "camera_admin_service",
+        "file": "camera_admin_server.py",
         "restart_delay": 3,
     },
     {
@@ -65,7 +76,14 @@ def start_service(service):
         log(f"[ERROR] {name}: file not found: {path}")
         return None
 
-    log(f"[START] {name}: python3 {path}")
+    old_item = processes.get(name)
+    if old_item:
+        old_process = old_item.get("process")
+        if old_process is not None and old_process.poll() is None:
+            log(f"[INFO] {name} already running")
+            return old_process
+
+    log(f"[START] {name}: {sys.executable} -u {path}")
 
     process = subprocess.Popen(
         [sys.executable, "-u", path],
@@ -81,6 +99,13 @@ def start_service(service):
         "service": service,
         "last_restart": time.time(),
     }
+
+    output_thread = threading.Thread(
+        target=print_service_output,
+        args=(name, process),
+        daemon=True,
+    )
+    output_thread.start()
 
     return process
 
@@ -98,6 +123,7 @@ def stop_service(name):
 
         try:
             process.wait(timeout=5)
+            log(f"[OK] {name} stopped")
         except subprocess.TimeoutExpired:
             log(f"[KILL] {name}")
             process.kill()
@@ -106,16 +132,17 @@ def stop_service(name):
 
 
 def stop_all_services():
-    log("[INFO] Stopping all services...")
+    log("[INFO] Stopping all manual services...")
 
     for name in list(processes.keys()):
         stop_service(name)
 
-    log("[OK] All services stopped")
+    log("[OK] All manual services stopped")
 
 
 def handle_shutdown(signum, frame):
     global running
+
     log(f"[INFO] Shutdown signal received: {signum}")
     running = False
     stop_all_services()
@@ -123,14 +150,13 @@ def handle_shutdown(signum, frame):
 
 
 def print_service_output(name, process):
-    """
-    Non-blocking output reader is not used here to keep code simple.
-    We read output line-by-line using a small background process loop.
-    """
     if process.stdout is None:
         return
 
-    while running and process.poll() is None:
+    while running:
+        if process.poll() is not None:
+            break
+
         line = process.stdout.readline()
 
         if line:
@@ -143,18 +169,18 @@ def monitor_services():
     global running
 
     log("=" * 60)
-    log("Apex Rover Startup Manager")
-    log("Mode: Manual only")
-    log("Starting Raspberry Pi microservices...")
+    log("Apex Rover Manual Services Startup Manager")
+    log("Mode: MANUAL")
+    log("Camera: Smart camera admin, one camera active at a time")
+    log("Sensors: Mega sensor bridge")
     log("=" * 60)
 
     for service in SERVICES:
         start_service(service)
 
-    log("[OK] Startup manager is running")
+    log("[OK] Manual services manager is running")
     log("[INFO] Press Ctrl+C to stop")
 
-    # Simple monitor loop
     while running:
         for service in SERVICES:
             name = service["name"]
@@ -165,7 +191,6 @@ def monitor_services():
                 continue
 
             process = processes[name]["process"]
-
             exit_code = process.poll()
 
             if exit_code is not None:
