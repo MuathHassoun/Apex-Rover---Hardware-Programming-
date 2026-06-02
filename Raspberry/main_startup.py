@@ -2,26 +2,25 @@
 """
 main_startup.py - Apex Rover Raspberry Mode Manager
 
-This file is the main Raspberry controller.
+This file controls which Raspberry mode is running.
 
-It does NOT drive motors directly.
+Manual Mode:
+  - Starts Manual/dual_camera_server.py
+  - Starts Manual/sensor_bridge.py
+  - Stops Auto/front_camera_server.py
+  - Stops Auto/auto_stair_climb.py
 
-Manual mode:
-  - Starts two-camera server.
-  - Starts sensor bridge.
-  - Mobile App controls robot through ESP32.
-
-Auto mode:
-  - Keeps camera/sensor services running.
-  - Starts Auto stair climb brain.
-  - Auto brain sends commands to ESP32.
-  - ESP32 routes commands to Mega / UNO.
+Auto Mode:
+  - Stops Manual/dual_camera_server.py
+  - Starts Auto/front_camera_server.py
+  - Keeps Manual/sensor_bridge.py running
+  - Starts Auto/auto_stair_climb.py
 
 Important:
-  ESP32 remains the main command gateway.
+  ESP32 remains the command gateway.
+  Raspberry does not send commands directly to Mega or UNO.
 """
 
-import os
 import sys
 import time
 import signal
@@ -29,7 +28,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 
 try:
     import websocket
@@ -46,9 +45,10 @@ BASE_DIR = Path(__file__).resolve().parent
 MANUAL_DIR = BASE_DIR / "Manual"
 AUTO_DIR = BASE_DIR / "Auto"
 
-MANUAL_CAMERA_FILE = MANUAL_DIR / "dual_camera_server.py"
-MANUAL_SENSOR_FILE = MANUAL_DIR / "sensor_bridge.py"
+MANUAL_DUAL_CAMERA_FILE = MANUAL_DIR / "dual_camera_server.py"
+MANUAL_SENSOR_BRIDGE_FILE = MANUAL_DIR / "sensor_bridge.py"
 
+AUTO_FRONT_CAMERA_FILE = AUTO_DIR / "front_camera_server.py"
 AUTO_BRAIN_FILE = AUTO_DIR / "auto_stair_climb.py"
 
 LOG_DIR = Path("/tmp/apex_rover_logs")
@@ -66,7 +66,7 @@ SERVER_PORT = 5050
 
 
 # ============================================================
-# GLOBAL STATE
+# FLASK + STATE
 # ============================================================
 
 app = Flask(__name__)
@@ -75,7 +75,9 @@ current_mode = "MANUAL"
 
 manual_camera_process = None
 manual_sensor_process = None
-auto_process = None
+
+auto_front_camera_process = None
+auto_brain_process = None
 
 process_lock = threading.Lock()
 
@@ -84,7 +86,7 @@ process_lock = threading.Lock()
 # PROCESS HELPERS
 # ============================================================
 
-def is_process_running(process):
+def is_running(process):
     return process is not None and process.poll() is None
 
 
@@ -94,13 +96,13 @@ def start_process(name, file_path, log_name):
         return None
 
     log_path = LOG_DIR / log_name
-
     log_file = open(log_path, "a", buffering=1)
 
     print(f"[START] {name}")
-    print(f"[LOG] {log_path}")
+    print(f"[FILE] {file_path}")
+    print(f"[LOG]  {log_path}")
 
-    process = subprocess.Popen(
+    return subprocess.Popen(
         [sys.executable, str(file_path)],
         cwd=str(file_path.parent),
         stdout=log_file,
@@ -108,10 +110,8 @@ def start_process(name, file_path, log_name):
         text=True,
     )
 
-    return process
 
-
-def stop_process(name, process, timeout=4):
+def stop_process(name, process, timeout=5):
     if process is None:
         return None
 
@@ -142,10 +142,10 @@ def stop_process(name, process, timeout=4):
 
 
 # ============================================================
-# ESP32 COMMANDS
+# ESP32 SAFETY COMMANDS
 # ============================================================
 
-def send_esp32_command(command, wait_after=0.05):
+def send_esp32_command(command):
     if websocket is None:
         print("[WARN] websocket-client not installed")
         return False
@@ -156,14 +156,12 @@ def send_esp32_command(command, wait_after=0.05):
         ws.close()
 
         print(f"[ESP32 CMD] {command}")
-
-        if wait_after > 0:
-            time.sleep(wait_after)
+        time.sleep(0.05)
 
         return True
 
     except Exception as e:
-        print(f"[ESP32 CMD ERROR] {command}: {e}")
+        print(f"[ESP32 ERROR] {command}: {e}")
         return False
 
 
@@ -180,118 +178,177 @@ def safe_stop_robot():
 
 
 # ============================================================
-# MODE MANAGEMENT
+# SERVICE STARTERS
 # ============================================================
 
-def ensure_manual_services_running():
-    global manual_camera_process
+def ensure_sensor_bridge_running():
     global manual_sensor_process
 
-    with process_lock:
-        if not is_process_running(manual_camera_process):
-            manual_camera_process = start_process(
-                name="Manual Camera Server",
-                file_path=MANUAL_CAMERA_FILE,
-                log_name="manual_camera.log",
-            )
-            time.sleep(1)
-
-        if not is_process_running(manual_sensor_process):
-            manual_sensor_process = start_process(
-                name="Manual Sensor Bridge",
-                file_path=MANUAL_SENSOR_FILE,
-                log_name="manual_sensor_bridge.log",
-            )
-            time.sleep(1)
+    if not is_running(manual_sensor_process):
+        manual_sensor_process = start_process(
+            name="Sensor Bridge",
+            file_path=MANUAL_SENSOR_BRIDGE_FILE,
+            log_name="sensor_bridge.log",
+        )
+        time.sleep(1)
 
 
-def start_manual_mode():
-    global current_mode
-    global auto_process
+def start_manual_camera_server():
+    global manual_camera_process
 
-    print("===================================")
-    print("Switching to MANUAL mode")
-    print("===================================")
-
-    with process_lock:
-        auto_process = stop_process("Auto Stair Climb", auto_process)
-
-    safe_stop_robot()
-
-    send_esp32_command("SYS:MODE:MANUAL")
-
-    ensure_manual_services_running()
-
-    current_mode = "MANUAL"
-
-    return {
-        "ok": True,
-        "mode": current_mode,
-        "message": "Manual mode active. Cameras and sensors are running.",
-    }
+    if not is_running(manual_camera_process):
+        manual_camera_process = start_process(
+            name="Manual Dual Camera Server",
+            file_path=MANUAL_DUAL_CAMERA_FILE,
+            log_name="manual_dual_camera.log",
+        )
+        time.sleep(2)
 
 
-def start_auto_mode():
-    global current_mode
-    global auto_process
+def start_auto_front_camera_server():
+    global auto_front_camera_process
 
-    print("===================================")
-    print("Switching to AUTO mode")
-    print("===================================")
+    if not is_running(auto_front_camera_process):
+        auto_front_camera_process = start_process(
+            name="Auto Front Camera Server",
+            file_path=AUTO_FRONT_CAMERA_FILE,
+            log_name="auto_front_camera.log",
+        )
+        time.sleep(2)
 
-    ensure_manual_services_running()
 
-    safe_stop_robot()
+def start_auto_brain():
+    global auto_brain_process
 
-    send_esp32_command("SYS:MODE:AUTO")
-    send_esp32_command("SPEED:45")
-
-    with process_lock:
-        if is_process_running(auto_process):
-            return {
-                "ok": True,
-                "mode": "AUTO",
-                "message": "Auto mode already running.",
-            }
-
-        auto_process = start_process(
-            name="Auto Stair Climb",
+    if not is_running(auto_brain_process):
+        auto_brain_process = start_process(
+            name="Auto Stair Climb Brain",
             file_path=AUTO_BRAIN_FILE,
             log_name="auto_stair_climb.log",
         )
+        time.sleep(1)
 
-    current_mode = "AUTO"
+
+# ============================================================
+# MODE SWITCHING
+# ============================================================
+
+def switch_to_manual():
+    global current_mode
+    global manual_camera_process
+    global auto_front_camera_process
+    global auto_brain_process
+
+    print("==========================================")
+    print("SWITCH TO MANUAL MODE")
+    print("==========================================")
+
+    with process_lock:
+        # Stop auto movement first.
+        auto_brain_process = stop_process(
+            "Auto Stair Climb Brain",
+            auto_brain_process,
+        )
+
+        safe_stop_robot()
+
+        # Stop auto front camera, because manual uses dual camera on same port.
+        auto_front_camera_process = stop_process(
+            "Auto Front Camera Server",
+            auto_front_camera_process,
+        )
+
+        # Start manual services.
+        ensure_sensor_bridge_running()
+        start_manual_camera_server()
+
+        send_esp32_command("SYS:MODE:MANUAL")
+
+        current_mode = "MANUAL"
 
     return {
         "ok": True,
         "mode": current_mode,
-        "message": "Auto stair climb started.",
+        "message": "Manual mode active: dual cameras + sensors running.",
     }
 
 
-def stop_auto_only():
+def switch_to_auto():
     global current_mode
-    global auto_process
+    global manual_camera_process
+    global auto_front_camera_process
+    global auto_brain_process
 
-    print("===================================")
-    print("Stopping AUTO only")
-    print("===================================")
+    print("==========================================")
+    print("SWITCH TO AUTO MODE")
+    print("==========================================")
 
     with process_lock:
-        auto_process = stop_process("Auto Stair Climb", auto_process)
+        # Safety first.
+        safe_stop_robot()
 
-    safe_stop_robot()
+        # Keep sensor bridge running because Auto reads MPU from:
+        # /tmp/apex_last_sensor.json
+        ensure_sensor_bridge_running()
 
-    current_mode = "MANUAL"
+        # Stop manual dual camera to reduce Raspberry load.
+        # Auto needs front camera only.
+        manual_camera_process = stop_process(
+            "Manual Dual Camera Server",
+            manual_camera_process,
+        )
 
-    send_esp32_command("SYS:MODE:MANUAL")
+        # Start front camera only.
+        start_auto_front_camera_server()
 
-    ensure_manual_services_running()
+        send_esp32_command("SYS:MODE:AUTO")
+        send_esp32_command("SPEED:55")
+
+        # Start auto brain.
+        start_auto_brain()
+
+        current_mode = "AUTO"
 
     return {
         "ok": True,
         "mode": current_mode,
-        "message": "Auto stopped. Manual services still running.",
+        "message": "Auto mode active: front camera + MPU + auto brain.",
+    }
+
+
+def stop_auto_and_return_manual():
+    global current_mode
+    global auto_brain_process
+    global auto_front_camera_process
+
+    print("==========================================")
+    print("STOP AUTO AND RETURN TO MANUAL")
+    print("==========================================")
+
+    with process_lock:
+        auto_brain_process = stop_process(
+            "Auto Stair Climb Brain",
+            auto_brain_process,
+        )
+
+        safe_stop_robot()
+
+        auto_front_camera_process = stop_process(
+            "Auto Front Camera Server",
+            auto_front_camera_process,
+        )
+
+        ensure_sensor_bridge_running()
+        start_manual_camera_server()
+
+        send_esp32_command("SYS:MODE:MANUAL")
+
+        current_mode = "MANUAL"
+
+    return {
+        "ok": True,
+        "mode": current_mode,
+        "message": "Auto stopped. Manual mode restored.",
     }
 
 
@@ -304,11 +361,13 @@ def home():
     return jsonify({
         "service": "Apex Rover Raspberry Mode Manager",
         "mode": current_mode,
-        "manual_services": {
-            "camera": is_process_running(manual_camera_process),
-            "sensor_bridge": is_process_running(manual_sensor_process),
-        },
-        "auto_running": is_process_running(auto_process),
+        "endpoints": [
+            "/status",
+            "/mode/manual",
+            "/mode/auto",
+            "/mode/stop",
+            "/robot/stop",
+        ],
     })
 
 
@@ -317,12 +376,14 @@ def status():
     return jsonify({
         "ok": True,
         "mode": current_mode,
-        "manual_camera_running": is_process_running(manual_camera_process),
-        "manual_sensor_running": is_process_running(manual_sensor_process),
-        "auto_running": is_process_running(auto_process),
+        "manual_dual_camera_running": is_running(manual_camera_process),
+        "sensor_bridge_running": is_running(manual_sensor_process),
+        "auto_front_camera_running": is_running(auto_front_camera_process),
+        "auto_brain_running": is_running(auto_brain_process),
         "logs": {
-            "manual_camera": str(LOG_DIR / "manual_camera.log"),
-            "manual_sensor_bridge": str(LOG_DIR / "manual_sensor_bridge.log"),
+            "manual_dual_camera": str(LOG_DIR / "manual_dual_camera.log"),
+            "sensor_bridge": str(LOG_DIR / "sensor_bridge.log"),
+            "auto_front_camera": str(LOG_DIR / "auto_front_camera.log"),
             "auto_stair_climb": str(LOG_DIR / "auto_stair_climb.log"),
         },
     })
@@ -330,20 +391,17 @@ def status():
 
 @app.route("/mode/manual", methods=["GET", "POST"])
 def api_manual():
-    result = start_manual_mode()
-    return jsonify(result)
+    return jsonify(switch_to_manual())
 
 
 @app.route("/mode/auto", methods=["GET", "POST"])
 def api_auto():
-    result = start_auto_mode()
-    return jsonify(result)
+    return jsonify(switch_to_auto())
 
 
 @app.route("/mode/stop", methods=["GET", "POST"])
 def api_stop():
-    result = stop_auto_only()
-    return jsonify(result)
+    return jsonify(stop_auto_and_return_manual())
 
 
 @app.route("/robot/stop", methods=["GET", "POST"])
@@ -352,49 +410,97 @@ def api_robot_stop():
 
     return jsonify({
         "ok": True,
-        "message": "STOP sent to robot.",
+        "message": "Emergency STOP sent.",
     })
 
 
 # ============================================================
-# STARTUP / SHUTDOWN
+# MONITOR LOOP
+# ============================================================
+
+def monitor_loop():
+    while True:
+        time.sleep(4)
+
+        with process_lock:
+            # Sensor bridge must always be running in both modes.
+            ensure_sensor_bridge_running()
+
+            if current_mode == "MANUAL":
+                # Manual needs dual cameras.
+                if not is_running(manual_camera_process):
+                    print("[MONITOR] Manual camera server is down, restarting...")
+                    start_manual_camera_server()
+
+            elif current_mode == "AUTO":
+                # Auto needs front camera only.
+                if not is_running(auto_front_camera_process):
+                    print("[MONITOR] Auto front camera is down, restarting...")
+                    start_auto_front_camera_server()
+
+                if not is_running(auto_brain_process):
+                    print("[MONITOR] Auto brain is not running.")
+                    # Do NOT auto-restart auto brain after failure.
+                    # Better stay safe and return to manual.
+                    safe_stop_robot()
+
+
+# ============================================================
+# SHUTDOWN
 # ============================================================
 
 def shutdown_handler(sig, frame):
     global manual_camera_process
     global manual_sensor_process
-    global auto_process
+    global auto_front_camera_process
+    global auto_brain_process
 
-    print("\n[SHUTDOWN] Stopping all processes...")
+    print("\n[SHUTDOWN] Stopping all Raspberry services...")
 
     safe_stop_robot()
 
     with process_lock:
-        auto_process = stop_process("Auto Stair Climb", auto_process)
-        manual_sensor_process = stop_process("Manual Sensor Bridge", manual_sensor_process)
-        manual_camera_process = stop_process("Manual Camera Server", manual_camera_process)
+        auto_brain_process = stop_process(
+            "Auto Stair Climb Brain",
+            auto_brain_process,
+        )
+
+        auto_front_camera_process = stop_process(
+            "Auto Front Camera Server",
+            auto_front_camera_process,
+        )
+
+        manual_camera_process = stop_process(
+            "Manual Dual Camera Server",
+            manual_camera_process,
+        )
+
+        manual_sensor_process = stop_process(
+            "Sensor Bridge",
+            manual_sensor_process,
+        )
 
     sys.exit(0)
 
 
-def monitor_loop():
-    while True:
-        time.sleep(3)
-
-        if current_mode in ["MANUAL", "AUTO"]:
-            ensure_manual_services_running()
-
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    print("===================================")
+    print("==========================================")
     print("Apex Rover Raspberry Mode Manager")
     print("Default mode: MANUAL")
-    print("===================================")
+    print("Manual: dual cameras + sensors")
+    print("Auto  : front camera + MPU + auto brain")
+    print("API port: 5050")
+    print("==========================================")
 
-    ensure_manual_services_running()
+    # Default boot mode = Manual.
+    switch_to_manual()
 
     threading.Thread(
         target=monitor_loop,
