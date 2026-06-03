@@ -1,0 +1,7 @@
+source_box_1.jpg
+stairs_1.jpg
+destination_box_1.jpg
+object_1.jpg
+object_2.jpg
+object_3.jpg
+robot_basket.jpg
