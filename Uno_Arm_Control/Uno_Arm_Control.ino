@@ -54,8 +54,8 @@
 //   CAM:ANGLE:N
 //
 // Supported ARM commands:
-//   ARM:READY
-//   ARM:HOME
+//   ARM:READY   -> staged: base stepper, shoulder, aux, gripper, wrist, elbow
+//   ARM:HOME    -> staged: base stepper, shoulder, aux, gripper, wrist, elbow
 //   ARM:STOP
 //
 //   ARM:BASE:LEFT
@@ -157,6 +157,21 @@ const unsigned long CAM_SERVO_DETACH_DELAY_MS = 450;
 const unsigned long HOME_DETACH_DELAY_MS = 1200;
 const unsigned long ARM_HOLD_REFRESH_MS = 35;
 
+// ==================================================
+// Staged HOME / READY Motion Settings
+//
+// HOME and READY are NOT applied all at once.
+// Sequence is:
+//   1) Arm base stepper
+//   2) Shoulder
+//   3) Aux
+//   4) Gripper
+//   5) Wrist
+//   6) Elbow
+// ==================================================
+const unsigned long ARM_POSE_SERVO_INTERVAL_MS = 25;
+const int ARM_POSE_SERVO_STEP_DEG = 2;
+
 
 // ==================================================
 // Configurable Motion Settings
@@ -212,28 +227,28 @@ const int GRIPPER_MAX = 180;
 // ==================================================
 // Arm READY Pose
 // ==================================================
-const int READY_SHOULDER = 90;
-const int READY_ELBOW = 30;
-const int READY_WRIST = 90;
-const int READY_AUX = 120;
-const int READY_GRIPPER = 180;
+const int READY_SHOULDER = 60;
+const int READY_ELBOW = 80;
+const int READY_WRIST = 150;
+const int READY_AUX = 170;
+const int READY_GRIPPER = 120;
 
 
 // ==================================================
 // Arm HOME Pose
 // ==================================================
-const int HOME_SHOULDER = 60;
-const int HOME_ELBOW = 10;
-const int HOME_WRIST = 90;
-const int HOME_AUX = 90;
+const int HOME_SHOULDER = 120;
+const int HOME_ELBOW = 90;
+const int HOME_WRIST = 110;
+const int HOME_AUX = 170;
 const int HOME_GRIPPER = 180;
 
 
 // ==================================================
 // Gripper Angles
 // ==================================================
-const int GRIPPER_OPEN_ANGLE = 180;
-const int GRIPPER_CLOSE_ANGLE = 120;
+const int GRIPPER_OPEN_ANGLE = 120;
+const int GRIPPER_CLOSE_ANGLE = 180;
 
 
 // ==================================================
@@ -265,6 +280,18 @@ enum ArmPoseState {
 
 ArmPoseState armPoseState = ARM_POSE_HOME;
 
+enum ArmPoseStage {
+  ARM_STAGE_IDLE,
+  ARM_STAGE_BASE_STEPPER,
+  ARM_STAGE_SHOULDER,
+  ARM_STAGE_AUX,
+  ARM_STAGE_GRIPPER,
+  ARM_STAGE_WRIST,
+  ARM_STAGE_ELBOW
+};
+
+ArmPoseStage armPoseStage = ARM_STAGE_IDLE;
+
 
 // ==================================================
 // Camera Servo State
@@ -294,6 +321,18 @@ bool pendingHomeDetach = false;
 
 unsigned long lastArmHoldRefresh = 0;
 unsigned long homeDetachStartMs = 0;
+
+// ==================================================
+// Staged HOME / READY Target State
+// ==================================================
+int targetShoulderAngle = HOME_SHOULDER;
+int targetElbowAngle = HOME_ELBOW;
+int targetWristAngle = HOME_WRIST;
+int targetGripperAngle = HOME_GRIPPER;
+int targetAuxAngle = HOME_AUX;
+long targetArmBasePosition = ARM_BASE_HOME_POSITION;
+
+unsigned long lastPoseServoMoveMs = 0;
 
 
 // ==================================================
@@ -595,7 +634,22 @@ void setArmAngles(int sh, int el, int wr, int gr, int ax) {
   writeArmServos();
 }
 
+void cancelArmPoseSequenceForManualControl() {
+  if (armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY) {
+    armPoseStage = ARM_STAGE_IDLE;
+    armPoseState = ARM_POSE_ACTIVE;
+
+    armBaseStepperDirection = 0;
+    armBaseFiniteStepsRemaining = 0;
+    armBaseTargetMode = false;
+    digitalWrite(ARM_STEP_PIN, LOW);
+    disableDriver(ARM_EN_PIN);
+  }
+}
+
 void markArmActive() {
+  cancelArmPoseSequenceForManualControl();
+
   if (armPoseState == ARM_POSE_HOME) {
     armPoseState = ARM_POSE_ACTIVE;
   }
@@ -629,18 +683,23 @@ void setCameraAngle(int angle) {
 // ==================================================
 // Arm Base Stepper Target Control
 // ==================================================
-void onArmBaseTargetReached() {
-  if (armPoseState == ARM_POSE_MOVING_HOME) {
-    armPoseState = ARM_POSE_HOME;
-    pendingHomeDetach = true;
-    homeDetachStartMs = millis();
-    return;
-  }
+void beginNextPoseStageAfterBase() {
+  armPoseStage = ARM_STAGE_SHOULDER;
+  lastPoseServoMoveMs = 0;
 
-  if (armPoseState == ARM_POSE_MOVING_READY) {
-    armPoseState = ARM_POSE_READY;
-    pendingHomeDetach = false;
-    writeArmServos();
+  attachArmServosIfNeeded();
+
+  if (armPoseState == ARM_POSE_MOVING_HOME) {
+    Serial.println("ACK:ARM:HOME:STAGE:SHOULDER");
+  } else if (armPoseState == ARM_POSE_MOVING_READY) {
+    Serial.println("ACK:ARM:READY:STAGE:SHOULDER");
+  }
+}
+
+void onArmBaseTargetReached() {
+  if ((armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY) &&
+      armPoseStage == ARM_STAGE_BASE_STEPPER) {
+    beginNextPoseStageAfterBase();
     return;
   }
 }
@@ -692,31 +751,191 @@ void setArmBaseTargetDeg(long deg) {
 
 
 // ==================================================
-// Arm Pose Control
+// Arm Pose Control - Staged HOME / READY
 // ==================================================
+void setArmPoseTargets(int sh, int el, int wr, int gr, int ax, long basePosition) {
+  targetShoulderAngle = clampAngle(sh, SHOULDER_MIN, SHOULDER_MAX);
+  targetElbowAngle = clampAngle(el, ELBOW_MIN, ELBOW_MAX);
+  targetWristAngle = clampAngle(wr, WRIST_MIN, WRIST_MAX);
+  targetGripperAngle = clampAngle(gr, GRIPPER_MIN, GRIPPER_MAX);
+  targetAuxAngle = clampAngle(ax, AUX_MIN, AUX_MAX);
+  targetArmBasePosition = basePosition;
+}
+
+void beginArmPoseSequence(ArmPoseState movingState) {
+  stopArmBaseMotion();
+
+  pendingHomeDetach = false;
+  armPoseState = movingState;
+  armPoseStage = ARM_STAGE_BASE_STEPPER;
+  lastPoseServoMoveMs = 0;
+
+  Serial.println(movingState == ARM_POSE_MOVING_HOME ?
+                 "ACK:ARM:HOME:STAGE:BASE_STEPPER" :
+                 "ACK:ARM:READY:STAGE:BASE_STEPPER");
+
+  setArmBaseTargetSteps(targetArmBasePosition);
+}
+
 void requestArmHome() {
   stopCameraMotion();
 
-  pendingHomeDetach = false;
-  armPoseState = ARM_POSE_MOVING_HOME;
+  setArmPoseTargets(HOME_SHOULDER,
+                    HOME_ELBOW,
+                    HOME_WRIST,
+                    HOME_GRIPPER,
+                    HOME_AUX,
+                    ARM_BASE_HOME_POSITION);
 
-  setArmAngles(HOME_SHOULDER, HOME_ELBOW, HOME_WRIST, HOME_GRIPPER, HOME_AUX);
-  setArmBaseTargetSteps(ARM_BASE_HOME_POSITION);
+  beginArmPoseSequence(ARM_POSE_MOVING_HOME);
 }
 
 void requestArmReady() {
-  pendingHomeDetach = false;
-  armPoseState = ARM_POSE_MOVING_READY;
+  setArmPoseTargets(READY_SHOULDER,
+                    READY_ELBOW,
+                    READY_WRIST,
+                    READY_GRIPPER,
+                    READY_AUX,
+                    ARM_BASE_READY_POSITION);
 
-  setArmAngles(READY_SHOULDER, READY_ELBOW, READY_WRIST, READY_GRIPPER, READY_AUX);
-  setArmBaseTargetSteps(ARM_BASE_READY_POSITION);
+  beginArmPoseSequence(ARM_POSE_MOVING_READY);
 }
 
 void stopAllArmMotion() {
   stopArmBaseMotion();
+  armPoseStage = ARM_STAGE_IDLE;
+
+  if (armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY) {
+    armPoseState = ARM_POSE_ACTIVE;
+  }
 
   if (armPoseState != ARM_POSE_HOME) {
     writeArmServos();
+  }
+}
+
+
+// ==================================================
+// Staged HOME / READY Runner
+// ==================================================
+bool moveAngleTowardTarget(int &currentAngle, int targetAngle, int minAngle, int maxAngle) {
+  currentAngle = clampAngle(currentAngle, minAngle, maxAngle);
+  targetAngle = clampAngle(targetAngle, minAngle, maxAngle);
+
+  if (currentAngle == targetAngle) {
+    return true;
+  }
+
+  int diff = targetAngle - currentAngle;
+  int stepSize = ARM_POSE_SERVO_STEP_DEG;
+
+  if (diff > 0) {
+    if (diff < stepSize) stepSize = diff;
+    currentAngle += stepSize;
+  } else {
+    if (-diff < stepSize) stepSize = -diff;
+    currentAngle -= stepSize;
+  }
+
+  return currentAngle == targetAngle;
+}
+
+void printPoseStageAck(const char *stageName) {
+  if (armPoseState == ARM_POSE_MOVING_HOME) {
+    Serial.print("ACK:ARM:HOME:STAGE:");
+    Serial.println(stageName);
+  } else if (armPoseState == ARM_POSE_MOVING_READY) {
+    Serial.print("ACK:ARM:READY:STAGE:");
+    Serial.println(stageName);
+  }
+}
+
+void finishArmPoseSequence() {
+  armPoseStage = ARM_STAGE_IDLE;
+
+  if (armPoseState == ARM_POSE_MOVING_HOME) {
+    armPoseState = ARM_POSE_HOME;
+    pendingHomeDetach = true;
+    homeDetachStartMs = millis();
+    Serial.println("ACK:ARM:HOME:DONE");
+    return;
+  }
+
+  if (armPoseState == ARM_POSE_MOVING_READY) {
+    armPoseState = ARM_POSE_READY;
+    pendingHomeDetach = false;
+    writeArmServos();
+    Serial.println("ACK:ARM:READY:DONE");
+    return;
+  }
+}
+
+void advanceArmPoseStage() {
+  if (armPoseStage == ARM_STAGE_SHOULDER) {
+    armPoseStage = ARM_STAGE_AUX;
+    printPoseStageAck("AUX");
+    return;
+  }
+
+  if (armPoseStage == ARM_STAGE_AUX) {
+    armPoseStage = ARM_STAGE_GRIPPER;
+    printPoseStageAck("GRIPPER");
+    return;
+  }
+
+  if (armPoseStage == ARM_STAGE_GRIPPER) {
+    armPoseStage = ARM_STAGE_WRIST;
+    printPoseStageAck("WRIST");
+    return;
+  }
+
+  if (armPoseStage == ARM_STAGE_WRIST) {
+    armPoseStage = ARM_STAGE_ELBOW;
+    printPoseStageAck("ELBOW");
+    return;
+  }
+
+  if (armPoseStage == ARM_STAGE_ELBOW) {
+    finishArmPoseSequence();
+    return;
+  }
+}
+
+void runArmPoseSequence() {
+  if (!(armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY)) {
+    return;
+  }
+
+  if (armPoseStage == ARM_STAGE_IDLE || armPoseStage == ARM_STAGE_BASE_STEPPER) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastPoseServoMoveMs < ARM_POSE_SERVO_INTERVAL_MS) {
+    return;
+  }
+
+  lastPoseServoMoveMs = now;
+
+  bool stageDone = false;
+
+  if (armPoseStage == ARM_STAGE_SHOULDER) {
+    stageDone = moveAngleTowardTarget(shoulderAngle, targetShoulderAngle, SHOULDER_MIN, SHOULDER_MAX);
+  } else if (armPoseStage == ARM_STAGE_AUX) {
+    stageDone = moveAngleTowardTarget(auxAngle, targetAuxAngle, AUX_MIN, AUX_MAX);
+  } else if (armPoseStage == ARM_STAGE_GRIPPER) {
+    stageDone = moveAngleTowardTarget(gripperAngle, targetGripperAngle, GRIPPER_MIN, GRIPPER_MAX);
+  } else if (armPoseStage == ARM_STAGE_WRIST) {
+    stageDone = moveAngleTowardTarget(wristAngle, targetWristAngle, WRIST_MIN, WRIST_MAX);
+  } else if (armPoseStage == ARM_STAGE_ELBOW) {
+    stageDone = moveAngleTowardTarget(elbowAngle, targetElbowAngle, ELBOW_MIN, ELBOW_MAX);
+  }
+
+  writeArmServos();
+
+  if (stageDone) {
+    advanceArmPoseStage();
   }
 }
 
@@ -1364,6 +1583,7 @@ void loop() {
 
   runCameraStepper();
   runArmBaseStepper();
+  runArmPoseSequence();
 
   refreshArmHold();
   handleHomeDetach();
