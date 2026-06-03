@@ -54,8 +54,11 @@
 //   CAM:ANGLE:N
 //
 // Supported ARM commands:
-//   ARM:READY   -> staged: base stepper, shoulder, aux, gripper, wrist, elbow
+//   ARM:READY   -> staged: shoulder, aux, gripper, wrist, elbow, base stepper LAST
 //   ARM:HOME    -> staged: base stepper, shoulder, aux, gripper, wrist, elbow
+//   ARM:DROP    -> staged: base stepper to 180 deg drop position, shoulder, aux, wrist, elbow, gripper open
+//   Ready       -> alias for ARM:READY
+//   Drop        -> alias for ARM:DROP
 //   ARM:STOP
 //
 //   ARM:BASE:LEFT
@@ -161,13 +164,29 @@ const unsigned long ARM_HOLD_REFRESH_MS = 35;
 // Staged HOME / READY Motion Settings
 //
 // HOME and READY are NOT applied all at once.
-// Sequence is:
+// HOME sequence is:
 //   1) Arm base stepper
 //   2) Shoulder
 //   3) Aux
 //   4) Gripper
 //   5) Wrist
 //   6) Elbow
+//
+// READY sequence is different by request:
+//   1) Shoulder
+//   2) Aux
+//   3) Gripper
+//   4) Wrist
+//   5) Elbow
+//   6) Arm base stepper LAST
+//
+// DROP sequence:
+//   1) Arm base stepper to 180 degrees
+//   2) Shoulder
+//   3) Aux
+//   4) Wrist
+//   5) Elbow
+//   6) Gripper opens LAST
 // ==================================================
 const unsigned long ARM_POSE_SERVO_INTERVAL_MS = 25;
 const int ARM_POSE_SERVO_STEP_DEG = 2;
@@ -245,6 +264,20 @@ const int HOME_GRIPPER = 180;
 
 
 // ==================================================
+// Arm DROP Pose
+//
+// Change these values after testing on the real robot.
+// Base drop is 180 degrees by your request.
+// Gripper target is open so the object falls in the robot basket.
+// ==================================================
+const int DROP_SHOULDER = 95;
+const int DROP_ELBOW = 75;
+const int DROP_WRIST = 120;
+const int DROP_AUX = 150;
+const int DROP_GRIPPER = 120;
+
+
+// ==================================================
 // Gripper Angles
 // ==================================================
 const int GRIPPER_OPEN_ANGLE = 120;
@@ -259,10 +292,12 @@ const long ARM_BASE_STEPS_PER_DEG = 10;
 const long ARM_BASE_ZERO_DEG = 0;
 const long ARM_BASE_HOME_DEG = 150;
 const long ARM_BASE_READY_DEG = 0;
+const long ARM_BASE_DROP_DEG = 180;
 
 const long ARM_BASE_ZERO_POSITION = ARM_BASE_ZERO_DEG * ARM_BASE_STEPS_PER_DEG;
 const long ARM_BASE_HOME_POSITION = ARM_BASE_HOME_DEG * ARM_BASE_STEPS_PER_DEG;
 const long ARM_BASE_READY_POSITION = ARM_BASE_READY_DEG * ARM_BASE_STEPS_PER_DEG;
+const long ARM_BASE_DROP_POSITION = ARM_BASE_DROP_DEG * ARM_BASE_STEPS_PER_DEG;
 
 
 // ==================================================
@@ -273,9 +308,11 @@ String systemMode = "MANUAL";
 enum ArmPoseState {
   ARM_POSE_HOME,
   ARM_POSE_READY,
+  ARM_POSE_DROP,
   ARM_POSE_ACTIVE,
   ARM_POSE_MOVING_HOME,
-  ARM_POSE_MOVING_READY
+  ARM_POSE_MOVING_READY,
+  ARM_POSE_MOVING_DROP
 };
 
 ArmPoseState armPoseState = ARM_POSE_HOME;
@@ -371,6 +408,12 @@ byte espCmdIndex = 0;
 char usbCmdBuffer[80];
 byte usbCmdIndex = 0;
 
+// If ESP32/mobile sends commands without a newline, the old code would wait forever.
+// This timeout lets the UNO execute a buffered command after the bytes stop arriving.
+unsigned long espLastCmdByteMs = 0;
+unsigned long usbLastCmdByteMs = 0;
+const unsigned long SERIAL_COMMAND_TIMEOUT_MS = 60;
+
 
 // ==================================================
 // Basic Helpers
@@ -446,6 +489,34 @@ bool startsWithCmd(const char *cmd, const char *prefix) {
   return strncmp(cmd, prefix, strlen(prefix)) == 0;
 }
 
+void normalizeCommand(char *cmd) {
+  // Trim leading spaces
+  int start = 0;
+  while (cmd[start] == ' ' || cmd[start] == '\t') start++;
+
+  if (start > 0) {
+    int i = 0;
+    while (cmd[start] != '\0') {
+      cmd[i++] = cmd[start++];
+    }
+    cmd[i] = '\0';
+  }
+
+  // Trim trailing spaces
+  int len = strlen(cmd);
+  while (len > 0 && (cmd[len - 1] == ' ' || cmd[len - 1] == '\t')) {
+    cmd[len - 1] = '\0';
+    len--;
+  }
+
+  // Make command uppercase so Ready/ready/READY all work.
+  for (int i = 0; cmd[i] != '\0'; i++) {
+    if (cmd[i] >= 'a' && cmd[i] <= 'z') {
+      cmd[i] = cmd[i] - 32;
+    }
+  }
+}
+
 void enableDriver(int enPin) {
   digitalWrite(enPin, LOW);
 }
@@ -462,6 +533,11 @@ void sendAck(const char *msg) {
   Serial.print("ACK:");
   Serial.println(msg);
 }
+
+// Forward declarations. These keep the file safe even if compiled as .cpp.
+void finishArmPoseSequence();
+void requestArmReady();
+void requestArmDrop();
 
 
 // ==================================================
@@ -635,7 +711,7 @@ void setArmAngles(int sh, int el, int wr, int gr, int ax) {
 }
 
 void cancelArmPoseSequenceForManualControl() {
-  if (armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY) {
+  if (armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY || armPoseState == ARM_POSE_MOVING_DROP) {
     armPoseStage = ARM_STAGE_IDLE;
     armPoseState = ARM_POSE_ACTIVE;
 
@@ -684,20 +760,31 @@ void setCameraAngle(int angle) {
 // Arm Base Stepper Target Control
 // ==================================================
 void beginNextPoseStageAfterBase() {
-  armPoseStage = ARM_STAGE_SHOULDER;
-  lastPoseServoMoveMs = 0;
-
-  attachArmServosIfNeeded();
+  if (armPoseState == ARM_POSE_MOVING_DROP) {
+    armPoseStage = ARM_STAGE_SHOULDER;
+    lastPoseServoMoveMs = 0;
+    attachArmServosIfNeeded();
+    Serial.println("ACK:ARM:DROP:STAGE:SHOULDER");
+    return;
+  }
 
   if (armPoseState == ARM_POSE_MOVING_HOME) {
+    armPoseStage = ARM_STAGE_SHOULDER;
+    lastPoseServoMoveMs = 0;
+    attachArmServosIfNeeded();
     Serial.println("ACK:ARM:HOME:STAGE:SHOULDER");
-  } else if (armPoseState == ARM_POSE_MOVING_READY) {
-    Serial.println("ACK:ARM:READY:STAGE:SHOULDER");
+    return;
+  }
+
+  // READY has the stepper as the LAST stage.
+  if (armPoseState == ARM_POSE_MOVING_READY) {
+    finishArmPoseSequence();
+    return;
   }
 }
 
 void onArmBaseTargetReached() {
-  if ((armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY) &&
+  if ((armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY || armPoseState == ARM_POSE_MOVING_DROP) &&
       armPoseStage == ARM_STAGE_BASE_STEPPER) {
     beginNextPoseStageAfterBase();
     return;
@@ -767,12 +854,24 @@ void beginArmPoseSequence(ArmPoseState movingState) {
 
   pendingHomeDetach = false;
   armPoseState = movingState;
-  armPoseStage = ARM_STAGE_BASE_STEPPER;
   lastPoseServoMoveMs = 0;
 
-  Serial.println(movingState == ARM_POSE_MOVING_HOME ?
-                 "ACK:ARM:HOME:STAGE:BASE_STEPPER" :
-                 "ACK:ARM:READY:STAGE:BASE_STEPPER");
+  if (movingState == ARM_POSE_MOVING_READY) {
+    // READY must move all servos first, then the base stepper last.
+    armPoseStage = ARM_STAGE_SHOULDER;
+    attachArmServosIfNeeded();
+    Serial.println("ACK:ARM:READY:STAGE:SHOULDER");
+    return;
+  }
+
+  // HOME and DROP start with base stepper for safe rotation.
+  armPoseStage = ARM_STAGE_BASE_STEPPER;
+
+  if (movingState == ARM_POSE_MOVING_HOME) {
+    Serial.println("ACK:ARM:HOME:STAGE:BASE_STEPPER");
+  } else if (movingState == ARM_POSE_MOVING_DROP) {
+    Serial.println("ACK:ARM:DROP:STAGE:BASE_STEPPER");
+  }
 
   setArmBaseTargetSteps(targetArmBasePosition);
 }
@@ -791,6 +890,8 @@ void requestArmHome() {
 }
 
 void requestArmReady() {
+  stopCameraMotion();
+
   setArmPoseTargets(READY_SHOULDER,
                     READY_ELBOW,
                     READY_WRIST,
@@ -801,11 +902,24 @@ void requestArmReady() {
   beginArmPoseSequence(ARM_POSE_MOVING_READY);
 }
 
+void requestArmDrop() {
+  stopCameraMotion();
+
+  setArmPoseTargets(DROP_SHOULDER,
+                    DROP_ELBOW,
+                    DROP_WRIST,
+                    DROP_GRIPPER,
+                    DROP_AUX,
+                    ARM_BASE_DROP_POSITION);
+
+  beginArmPoseSequence(ARM_POSE_MOVING_DROP);
+}
+
 void stopAllArmMotion() {
   stopArmBaseMotion();
   armPoseStage = ARM_STAGE_IDLE;
 
-  if (armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY) {
+  if (armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY || armPoseState == ARM_POSE_MOVING_DROP) {
     armPoseState = ARM_POSE_ACTIVE;
   }
 
@@ -847,6 +961,9 @@ void printPoseStageAck(const char *stageName) {
   } else if (armPoseState == ARM_POSE_MOVING_READY) {
     Serial.print("ACK:ARM:READY:STAGE:");
     Serial.println(stageName);
+  } else if (armPoseState == ARM_POSE_MOVING_DROP) {
+    Serial.print("ACK:ARM:DROP:STAGE:");
+    Serial.println(stageName);
   }
 }
 
@@ -868,9 +985,48 @@ void finishArmPoseSequence() {
     Serial.println("ACK:ARM:READY:DONE");
     return;
   }
+
+  if (armPoseState == ARM_POSE_MOVING_DROP) {
+    armPoseState = ARM_POSE_DROP;
+    pendingHomeDetach = false;
+    writeArmServos();
+    Serial.println("ACK:ARM:DROP:DONE");
+    return;
+  }
 }
 
 void advanceArmPoseStage() {
+  if (armPoseState == ARM_POSE_MOVING_DROP) {
+    if (armPoseStage == ARM_STAGE_SHOULDER) {
+      armPoseStage = ARM_STAGE_AUX;
+      printPoseStageAck("AUX");
+      return;
+    }
+
+    if (armPoseStage == ARM_STAGE_AUX) {
+      armPoseStage = ARM_STAGE_WRIST;
+      printPoseStageAck("WRIST");
+      return;
+    }
+
+    if (armPoseStage == ARM_STAGE_WRIST) {
+      armPoseStage = ARM_STAGE_ELBOW;
+      printPoseStageAck("ELBOW");
+      return;
+    }
+
+    if (armPoseStage == ARM_STAGE_ELBOW) {
+      armPoseStage = ARM_STAGE_GRIPPER;
+      printPoseStageAck("GRIPPER_OPEN");
+      return;
+    }
+
+    if (armPoseStage == ARM_STAGE_GRIPPER) {
+      finishArmPoseSequence();
+      return;
+    }
+  }
+
   if (armPoseStage == ARM_STAGE_SHOULDER) {
     armPoseStage = ARM_STAGE_AUX;
     printPoseStageAck("AUX");
@@ -896,13 +1052,22 @@ void advanceArmPoseStage() {
   }
 
   if (armPoseStage == ARM_STAGE_ELBOW) {
+    if (armPoseState == ARM_POSE_MOVING_READY) {
+      armPoseStage = ARM_STAGE_BASE_STEPPER;
+      printPoseStageAck("BASE_STEPPER_LAST");
+      setArmBaseTargetSteps(targetArmBasePosition);
+      return;
+    }
+
     finishArmPoseSequence();
     return;
   }
 }
 
 void runArmPoseSequence() {
-  if (!(armPoseState == ARM_POSE_MOVING_HOME || armPoseState == ARM_POSE_MOVING_READY)) {
+  if (!(armPoseState == ARM_POSE_MOVING_HOME ||
+        armPoseState == ARM_POSE_MOVING_READY ||
+        armPoseState == ARM_POSE_MOVING_DROP)) {
     return;
   }
 
@@ -1141,6 +1306,11 @@ void handleArmCommand(const char *cmd) {
 
   if (equalsCmd(cmd, "ARM:READY")) {
     requestArmReady();
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:DROP")) {
+    requestArmDrop();
     return;
   }
 
@@ -1406,6 +1576,16 @@ void handleSystemCommand(const char *cmd) {
 // Main Command Router
 // ==================================================
 void handleCommand(const char *cmd) {
+  if (equalsCmd(cmd, "READY")) {
+    requestArmReady();
+    return;
+  }
+
+  if (equalsCmd(cmd, "DROP")) {
+    requestArmDrop();
+    return;
+  }
+
   if (startsWithCmd(cmd, "CAM:")) {
     handleCameraCommand(cmd);
     return;
@@ -1423,27 +1603,36 @@ void handleCommand(const char *cmd) {
 // ==================================================
 // Non-Blocking Serial Reader
 // ==================================================
-void readSerialStream(Stream &port, char *buffer, byte &index) {
+void processCommandBuffer(char *buffer, byte &index) {
+  buffer[index] = '\0';
+
+  if (index > 0) {
+    normalizeCommand(buffer);
+
+    if (DEBUG_SERIAL) {
+      Serial.print("[UNO RX] ");
+      Serial.println(buffer);
+    }
+
+    handleCommand(buffer);
+  }
+
+  index = 0;
+}
+
+void readSerialStream(Stream &port, char *buffer, byte &index, unsigned long &lastByteMs) {
   while (port.available() > 0) {
     char c = port.read();
+    lastByteMs = millis();
 
     if (c == '\r') {
       continue;
     }
 
-    if (c == '\n') {
-      buffer[index] = '\0';
-
-      if (index > 0) {
-        if (DEBUG_SERIAL) {
-          Serial.print("[UNO RX] ");
-          Serial.println(buffer);
-        }
-
-        handleCommand(buffer);
-      }
-
-      index = 0;
+    // Accept newline, semicolon, or comma as command separators.
+    // This makes the UNO tolerant if the ESP32/mobile app does not send \n.
+    if (c == '\n' || c == ';' || c == ',') {
+      processCommandBuffer(buffer, index);
       return;
     }
 
@@ -1452,6 +1641,11 @@ void readSerialStream(Stream &port, char *buffer, byte &index) {
     } else {
       index = 0;
     }
+  }
+
+  // Fallback: process a command even if no newline was sent.
+  if (index > 0 && (millis() - lastByteMs >= SERIAL_COMMAND_TIMEOUT_MS)) {
+    processCommandBuffer(buffer, index);
   }
 }
 
@@ -1575,11 +1769,9 @@ void setup() {
 // Main Loop
 // ==================================================
 void loop() {
-  readSerialStream(espSerial, espCmdBuffer, espCmdIndex);
+  readSerialStream(espSerial, espCmdBuffer, espCmdIndex, espLastCmdByteMs);
 
-  if (Serial.available() > 0) {
-    readSerialStream(Serial, usbCmdBuffer, usbCmdIndex);
-  }
+  readSerialStream(Serial, usbCmdBuffer, usbCmdIndex, usbLastCmdByteMs);
 
   runCameraStepper();
   runArmBaseStepper();
