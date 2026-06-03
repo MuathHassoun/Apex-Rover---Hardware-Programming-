@@ -1,5 +1,6 @@
 #include <Servo.h>
 #include <SoftwareSerial.h>
+#include <avr/pgmspace.h>
 
 // ==================================================
 // Arduino UNO - Apex Rover Camera Stand + 6-Axis Arm
@@ -303,7 +304,8 @@ const long ARM_BASE_DROP_POSITION = ARM_BASE_DROP_DEG * ARM_BASE_STEPS_PER_DEG;
 // ==================================================
 // System State
 // ==================================================
-String systemMode = "MANUAL";
+enum SystemMode { MODE_MANUAL, MODE_AUTO };
+SystemMode systemMode = MODE_MANUAL;
 
 enum ArmPoseState {
   ARM_POSE_HOME,
@@ -402,10 +404,11 @@ unsigned long armBaseStepIntervalMicros = 700;
 // ==================================================
 // Non-Blocking Command Buffers
 // ==================================================
-char espCmdBuffer[80];
+const byte CMD_BUFFER_SIZE = 48;
+char espCmdBuffer[CMD_BUFFER_SIZE];
 byte espCmdIndex = 0;
 
-char usbCmdBuffer[80];
+char usbCmdBuffer[CMD_BUFFER_SIZE];
 byte usbCmdIndex = 0;
 
 // If ESP32/mobile sends commands without a newline, the old code would wait forever.
@@ -481,13 +484,17 @@ int parseServoStepOrDefault(const char *cmd) {
   return (int)clampLong(value, MIN_SERVO_STEP, MAX_SERVO_STEP);
 }
 
-bool equalsCmd(const char *cmd, const char *target) {
-  return strcmp(cmd, target) == 0;
+bool equalsCmdFlash(const char *cmd, PGM_P target) {
+  return strcmp_P(cmd, target) == 0;
 }
 
-bool startsWithCmd(const char *cmd, const char *prefix) {
-  return strncmp(cmd, prefix, strlen(prefix)) == 0;
+bool startsWithCmdFlash(const char *cmd, PGM_P prefix) {
+  return strncmp_P(cmd, prefix, strlen_P(prefix)) == 0;
 }
+
+// Keep all command comparison text in Flash instead of UNO SRAM.
+#define equalsCmd(cmd, literal) equalsCmdFlash((cmd), PSTR(literal))
+#define startsWithCmd(cmd, literal) startsWithCmdFlash((cmd), PSTR(literal))
 
 void normalizeCommand(char *cmd) {
   // Trim leading spaces
@@ -530,7 +537,7 @@ long degToArmBaseSteps(long deg) {
 }
 
 void sendAck(const char *msg) {
-  Serial.print("ACK:");
+  Serial.print(F("ACK:"));
   Serial.println(msg);
 }
 
@@ -549,7 +556,7 @@ bool handleConfigCommand(const char *cmd) {
     long value = parseLastLong(cmd);
     configuredStepperSteps = clampLong(value, MIN_STEPPER_STEPS, MAX_STEPPER_STEPS);
 
-    Serial.print("ACK:CONFIG:STEPPER_STEPS:");
+    Serial.print(F("ACK:CONFIG:STEPPER_STEPS:"));
     Serial.println(configuredStepperSteps);
     return true;
   }
@@ -559,7 +566,7 @@ bool handleConfigCommand(const char *cmd) {
     long value = parseLastLong(cmd);
     configuredServoStep = (int)clampLong(value, MIN_SERVO_STEP, MAX_SERVO_STEP);
 
-    Serial.print("ACK:CONFIG:SERVO_STEP:");
+    Serial.print(F("ACK:CONFIG:SERVO_STEP:"));
     Serial.println(configuredServoStep);
     return true;
   }
@@ -569,15 +576,15 @@ bool handleConfigCommand(const char *cmd) {
     configuredStepperSteps = DEFAULT_STEPPER_STEPS;
     configuredServoStep = DEFAULT_SERVO_STEP;
 
-    Serial.println("ACK:CONFIG:RESET");
+    Serial.println(F("ACK:CONFIG:RESET"));
     return true;
   }
 
   if (equalsCmd(cmd, "ARM:CONFIG:STATUS") ||
       equalsCmd(cmd, "CAM:CONFIG:STATUS")) {
-    Serial.print("CONFIG:STEPPER_STEPS=");
+    Serial.print(F("CONFIG:STEPPER_STEPS="));
     Serial.print(configuredStepperSteps);
-    Serial.print(";SERVO_STEP=");
+    Serial.print(F(";SERVO_STEP="));
     Serial.println(configuredServoStep);
     return true;
   }
@@ -764,7 +771,7 @@ void beginNextPoseStageAfterBase() {
     armPoseStage = ARM_STAGE_SHOULDER;
     lastPoseServoMoveMs = 0;
     attachArmServosIfNeeded();
-    Serial.println("ACK:ARM:DROP:STAGE:SHOULDER");
+    Serial.println(F("ACK:ARM:DROP:STAGE:SHOULDER"));
     return;
   }
 
@@ -772,7 +779,7 @@ void beginNextPoseStageAfterBase() {
     armPoseStage = ARM_STAGE_SHOULDER;
     lastPoseServoMoveMs = 0;
     attachArmServosIfNeeded();
-    Serial.println("ACK:ARM:HOME:STAGE:SHOULDER");
+    Serial.println(F("ACK:ARM:HOME:STAGE:SHOULDER"));
     return;
   }
 
@@ -860,7 +867,7 @@ void beginArmPoseSequence(ArmPoseState movingState) {
     // READY must move all servos first, then the base stepper last.
     armPoseStage = ARM_STAGE_SHOULDER;
     attachArmServosIfNeeded();
-    Serial.println("ACK:ARM:READY:STAGE:SHOULDER");
+    Serial.println(F("ACK:ARM:READY:STAGE:SHOULDER"));
     return;
   }
 
@@ -868,9 +875,9 @@ void beginArmPoseSequence(ArmPoseState movingState) {
   armPoseStage = ARM_STAGE_BASE_STEPPER;
 
   if (movingState == ARM_POSE_MOVING_HOME) {
-    Serial.println("ACK:ARM:HOME:STAGE:BASE_STEPPER");
+    Serial.println(F("ACK:ARM:HOME:STAGE:BASE_STEPPER"));
   } else if (movingState == ARM_POSE_MOVING_DROP) {
-    Serial.println("ACK:ARM:DROP:STAGE:BASE_STEPPER");
+    Serial.println(F("ACK:ARM:DROP:STAGE:BASE_STEPPER"));
   }
 
   setArmBaseTargetSteps(targetArmBasePosition);
@@ -956,13 +963,13 @@ bool moveAngleTowardTarget(int &currentAngle, int targetAngle, int minAngle, int
 
 void printPoseStageAck(const char *stageName) {
   if (armPoseState == ARM_POSE_MOVING_HOME) {
-    Serial.print("ACK:ARM:HOME:STAGE:");
+    Serial.print(F("ACK:ARM:HOME:STAGE:"));
     Serial.println(stageName);
   } else if (armPoseState == ARM_POSE_MOVING_READY) {
-    Serial.print("ACK:ARM:READY:STAGE:");
+    Serial.print(F("ACK:ARM:READY:STAGE:"));
     Serial.println(stageName);
   } else if (armPoseState == ARM_POSE_MOVING_DROP) {
-    Serial.print("ACK:ARM:DROP:STAGE:");
+    Serial.print(F("ACK:ARM:DROP:STAGE:"));
     Serial.println(stageName);
   }
 }
@@ -974,7 +981,7 @@ void finishArmPoseSequence() {
     armPoseState = ARM_POSE_HOME;
     pendingHomeDetach = true;
     homeDetachStartMs = millis();
-    Serial.println("ACK:ARM:HOME:DONE");
+    Serial.println(F("ACK:ARM:HOME:DONE"));
     return;
   }
 
@@ -982,7 +989,7 @@ void finishArmPoseSequence() {
     armPoseState = ARM_POSE_READY;
     pendingHomeDetach = false;
     writeArmServos();
-    Serial.println("ACK:ARM:READY:DONE");
+    Serial.println(F("ACK:ARM:READY:DONE"));
     return;
   }
 
@@ -990,7 +997,7 @@ void finishArmPoseSequence() {
     armPoseState = ARM_POSE_DROP;
     pendingHomeDetach = false;
     writeArmServos();
-    Serial.println("ACK:ARM:DROP:DONE");
+    Serial.println(F("ACK:ARM:DROP:DONE"));
     return;
   }
 }
@@ -1557,14 +1564,14 @@ void handleSystemCommand(const char *cmd) {
   }
 
   if (equalsCmd(cmd, "SYS:MODE:MANUAL")) {
-    systemMode = "MANUAL";
+    systemMode = MODE_MANUAL;
     stopCameraMotion();
     stopAllArmMotion();
     return;
   }
 
   if (equalsCmd(cmd, "SYS:MODE:AUTO")) {
-    systemMode = "AUTO";
+    systemMode = MODE_AUTO;
     stopCameraMotion();
     stopAllArmMotion();
     return;
@@ -1610,7 +1617,7 @@ void processCommandBuffer(char *buffer, byte &index) {
     normalizeCommand(buffer);
 
     if (DEBUG_SERIAL) {
-      Serial.print("[UNO RX] ");
+      Serial.print(F("[UNO RX] "));
       Serial.println(buffer);
     }
 
@@ -1636,7 +1643,7 @@ void readSerialStream(Stream &port, char *buffer, byte &index, unsigned long &la
       return;
     }
 
-    if (index < 79) {
+    if (index < CMD_BUFFER_SIZE - 1) {
       buffer[index++] = c;
     } else {
       index = 0;
@@ -1756,11 +1763,11 @@ void setup() {
   armBaseStepPosition = ARM_BASE_HOME_POSITION;
   requestArmReady();
 
-  Serial.println("UNO_READY");
-  Serial.println("UNO_ARM_READY_ON_STARTUP");
-  Serial.print("UNO_CONFIG:STEPPER_STEPS=");
+  Serial.println(F("UNO_READY"));
+  Serial.println(F("UNO_ARM_READY_ON_STARTUP"));
+  Serial.print(F("UNO_CONFIG:STEPPER_STEPS="));
   Serial.print(configuredStepperSteps);
-  Serial.print(";SERVO_STEP=");
+  Serial.print(F(";SERVO_STEP="));
   Serial.println(configuredServoStep);
 }
 

@@ -1,0 +1,273 @@
+المرحلة 1: تأكد الشبكة صح
+
+لازم يكونوا على نفس شبكة ESP32:
+
+ESP32 WiFi: Apex_Rover_Net
+ESP32 IP: 192.168.4.1
+Raspberry IP المتوقع: 192.168.4.2
+Mobile متصل بنفس الشبكة
+
+على Raspberry نفذ:
+
+hostname -I
+
+لازم تشوف:
+
+192.168.4.2
+
+أو IP قريب. إذا مش 192.168.4.2، الموبايل ما رح يلاقي /auto_status لأننا حاطينه على:
+
+http://192.168.4.2:5050
+المرحلة 2: اسحب آخر تحديثات Raspberry
+
+على Raspberry:
+
+cd ~/ApexRover_Repo
+git status
+git pull origin main
+
+بعدها ادخل مجلد Raspberry:
+
+cd Raspberry
+ls
+
+لازم تشوف:
+
+main_startup.py
+Manual
+Auto
+المرحلة 3: تأكد ملفات الأوتو والمانيوال موجودة
+
+نفذ:
+
+ls Manual
+ls Auto
+
+المهم يكون عندك تقريبًا:
+
+Manual/apex_rover_manual_servers_startup.py
+Manual/camera_admin_server.py
+Manual/sensor_bridge.py
+Auto/front_camera_server.py
+Auto/auto_stair_climb.py
+
+لو ملف ناقص، ابعثلي ناتج ls Manual و ls Auto.
+
+المرحلة 4: شغّل main_startup يدويًا أول مرة
+
+وقف أي خدمة شغالة قديمة عشان ما يكون port مستخدم:
+
+sudo pkill -f main_startup.py
+sudo pkill -f apex_rover_manual_servers_startup.py
+sudo pkill -f camera_admin_server.py
+sudo pkill -f dual_camera_server.py
+sudo pkill -f front_camera_server.py
+sudo pkill -f auto_stair_climb.py
+
+بعدها شغل:
+
+cd ~/ApexRover_Repo/Raspberry
+python3 main_startup.py
+
+لازم يظهر شيء مثل:
+
+Apex Rover Raspberry Mode Manager
+Default mode: MANUAL
+API port: 5050
+Auto Status: /auto_status
+SWITCH TO MANUAL MODE
+
+اترك هذا التيرمنال مفتوح.
+
+المرحلة 5: اختبر /status و /auto_status من Raspberry نفسه
+
+افتح Terminal ثاني على Raspberry ونفذ:
+
+curl http://127.0.0.1:5050/status
+
+لازم يرجع JSON وفيه:
+
+"ok": true
+"mode": "MANUAL"
+
+بعدها:
+
+curl http://127.0.0.1:5050/auto_status
+
+لازم يرجع JSON فيه:
+
+mode
+stage
+action
+decision
+error
+track
+
+مثال طبيعي:
+
+{
+  "ok": true,
+  "mode": "MANUAL",
+  "stage": "Manual Mode",
+  "action": "Manual mode is active",
+  "decision": "Robot is ready for mobile manual control",
+  "error": "",
+  "track": []
+}
+
+إذا هذا ما اشتغل، المشكلة من main_startup.py أو Flask/port 5050.
+
+المرحلة 6: اختبر من الموبايل أو من جهاز ثاني على نفس الشبكة
+
+من أي جهاز متصل على Apex_Rover_Net افتح المتصفح:
+
+http://192.168.4.2:5050/status
+
+ثم:
+
+http://192.168.4.2:5050/auto_status
+
+إذا يفتحوا في المتصفح، إذن الموبايل رح يقرأهم.
+
+إذا من Raspberry يشتغل لكن من الموبايل لا، المشكلة شبكة/IP/firewall.
+
+المرحلة 7: اختبر صفحة Auto Status في الموبايل
+
+افتح التطبيق:
+
+Control Screen
+→ Auto Status Track
+
+المفروض تشوف:
+
+ONLINE
+Mode
+Last Update
+Current Robot Decision
+Automation Track
+Current Stage bottom bar
+
+إذا ظهر OFFLINE، جرب من متصفح الموبايل:
+
+http://192.168.4.2:5050/auto_status
+
+لو المتصفح ما فتح، المشكلة مش من التطبيق، المشكلة اتصال موبايل ↔ Raspberry.
+
+المرحلة 8: اختبر التحويل إلى AUTO من Raspberry
+
+من Terminal ثاني:
+
+curl http://127.0.0.1:5050/mode/auto
+
+بعدها:
+
+curl http://127.0.0.1:5050/auto_status
+
+المفروض يصير:
+
+"mode": "AUTO"
+"stage": "Auto Running"
+
+وفي التراك تظهر رسائل مثل:
+
+Switching to AUTO mode
+Starting sensor bridge
+Starting front camera server
+Starting auto brain
+
+وفي تطبيق الموبايل صفحة Auto Status المفروض تتحدث تلقائيًا.
+
+المرحلة 9: اختبر الرجوع إلى Manual
+
+نفذ:
+
+curl http://127.0.0.1:5050/mode/manual
+
+ثم:
+
+curl http://127.0.0.1:5050/status
+curl http://127.0.0.1:5050/auto_status
+
+لازم يرجع:
+
+mode: MANUAL
+Manual camera admin running
+Sensor bridge running
+المرحلة 10: اختبر الكاميرات من صفحة Auto Status
+
+في صفحة Auto Status في الموبايل:
+
+Robot Camera
+Arm Camera
+
+Robot Camera غالبًا يطلب:
+
+http://192.168.4.2:5000/front_snapshot
+
+Arm Camera يطلب:
+
+http://192.168.4.2:5000/arm_snapshot
+
+جرب من المتصفح:
+
+http://192.168.4.2:5000/front_snapshot
+http://192.168.4.2:5000/arm_snapshot
+
+ملاحظة مهمة: إذا أنت في AUTO وكان شغال فقط Auto/front_camera_server.py، ممكن arm_snapshot ما يشتغل في الأوتو وهذا طبيعي حسب طريقة تشغيل الكاميرات. إذا بدك في صفحة Auto Status تشوف كاميرتين في الأوتو، لازم يكون في Raspberry سيرفر يقدر يعطي الصورتين أو camera admin يسمح بالتبديل. حاليًا أهم شيء /auto_status يشتغل.
+
+لو صار خطأ، كيف نعرف من وين؟
+إذا /auto_status لا يعمل على Raspberry
+
+نفذ:
+
+sudo lsof -i :5050
+
+أو:
+
+ps aux | grep main_startup
+
+المشكلة تكون main_startup.py مش شغال أو port 5050 مستخدم.
+
+إذا /auto_status يعمل على Raspberry لكن لا يعمل على الموبايل
+
+نفذ على Raspberry:
+
+hostname -I
+
+وتأكد IP هو 192.168.4.2.
+
+إذا التحويل AUTO يقول Failed في الموبايل لكن فعليًا يتحول
+
+هذه غالبًا timeout من الموبايل لأن التحويل يأخذ وقت. نخلي timeout أكبر لاحقًا إذا تكررت.
+
+إذا الكاميرا لا تظهر
+
+افحص port 5000:
+
+curl http://127.0.0.1:5000/front_snapshot --output test.jpg
+ls -lh test.jpg
+
+إذا الصورة حجمها أكبر من صفر، الكاميرا شغالة.
+
+أهم أوامر التجربة المختصرة
+cd ~/ApexRover_Repo
+git pull origin main
+
+cd Raspberry
+sudo pkill -f main_startup.py
+sudo pkill -f apex_rover_manual_servers_startup.py
+sudo pkill -f camera_admin_server.py
+sudo pkill -f front_camera_server.py
+sudo pkill -f auto_stair_climb.py
+
+python3 main_startup.py
+
+وفي Terminal ثاني:
+
+curl http://127.0.0.1:5050/status
+curl http://127.0.0.1:5050/auto_status
+curl http://127.0.0.1:5050/mode/auto
+curl http://127.0.0.1:5050/auto_status
+curl http://127.0.0.1:5050/mode/manual
+
+ابدأ من المرحلة 1، وأول نتيجة مش طبيعية ابعثلي النص كامل.
