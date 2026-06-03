@@ -19,10 +19,8 @@ AUTO:
   - Starts Auto/front_camera_server.py
   - Starts Auto/auto_stair_climb.py
 
-Important:
-  ESP32 stays the main command gateway.
-  Raspberry sends commands to ESP32 in Auto mode.
-  Mobile sends commands to ESP32 in Manual mode.
+New:
+  - Adds /auto_status for the mobile Auto Status Track screen.
 """
 
 import sys
@@ -30,7 +28,9 @@ import time
 import signal
 import subprocess
 import threading
+import json
 from pathlib import Path
+from datetime import datetime
 
 from flask import Flask, jsonify
 
@@ -49,9 +49,6 @@ BASE_DIR = Path(__file__).resolve().parent
 MANUAL_DIR = BASE_DIR / "Manual"
 AUTO_DIR = BASE_DIR / "Auto"
 
-# IMPORTANT:
-# Your manual startup file name is:
-#   apex_rover_manual_servers_startup.py
 MANUAL_STARTUP_FILE = MANUAL_DIR / "apex_rover_manual_servers_startup.py"
 MANUAL_SENSOR_BRIDGE_FILE = MANUAL_DIR / "sensor_bridge.py"
 
@@ -60,6 +57,8 @@ AUTO_BRAIN_FILE = AUTO_DIR / "auto_stair_climb.py"
 
 LOG_DIR = Path("/tmp/apex_rover_logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+AUTO_STATUS_FILE = Path("/tmp/apex_auto_status.json")
 
 
 # ============================================================
@@ -87,6 +86,156 @@ auto_front_camera_process = None
 auto_brain_process = None
 
 process_lock = threading.Lock()
+auto_status_lock = threading.Lock()
+
+
+# ============================================================
+# AUTO STATUS TRACK
+# ============================================================
+
+auto_status_state = {
+    "ok": True,
+    "mode": "MANUAL",
+    "stage": "Manual Mode",
+    "action": "Manual mode is active",
+    "decision": "Waiting for auto mode",
+    "error": "",
+    "time": "",
+    "track": [],
+}
+
+
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def push_auto_track(track_type, stage, message, important=False):
+    """
+    Adds one message to the auto status track.
+    This is used by main_startup.py itself.
+    Later auto_stair_climb.py can also write /tmp/apex_auto_status.json.
+    """
+    global auto_status_state
+
+    with auto_status_lock:
+        item = {
+            "type": track_type,
+            "stage": stage,
+            "message": message,
+            "time": now_text(),
+            "important": important,
+        }
+
+        auto_status_state["track"].append(item)
+
+        # Keep last 80 messages only, to avoid very large JSON.
+        if len(auto_status_state["track"]) > 80:
+            auto_status_state["track"] = auto_status_state["track"][-80:]
+
+        auto_status_state["time"] = item["time"]
+
+
+def set_auto_status(stage=None, action=None, decision=None, error=None, mode=None):
+    global auto_status_state
+
+    with auto_status_lock:
+        if mode is not None:
+            auto_status_state["mode"] = mode
+
+        if stage is not None:
+            auto_status_state["stage"] = stage
+
+        if action is not None:
+            auto_status_state["action"] = action
+
+        if decision is not None:
+            auto_status_state["decision"] = decision
+
+        if error is not None:
+            auto_status_state["error"] = error
+
+        auto_status_state["ok"] = True
+        auto_status_state["time"] = now_text()
+
+
+def write_auto_status_file():
+    """
+    Writes current status to /tmp/apex_auto_status.json.
+    Not required for the mobile page, but useful for Auto brain integration later.
+    """
+    try:
+        with auto_status_lock:
+            data = dict(auto_status_state)
+
+        AUTO_STATUS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[AUTO_STATUS WARN] Could not write status file: {e}", flush=True)
+
+
+def read_external_auto_status():
+    """
+    If Auto/auto_stair_climb.py writes /tmp/apex_auto_status.json,
+    we prefer its detailed state. If not available, we use the internal fallback.
+    """
+    try:
+        if not AUTO_STATUS_FILE.exists():
+            return None
+
+        text = AUTO_STATUS_FILE.read_text(encoding="utf-8").strip()
+
+        if not text:
+            return None
+
+        data = json.loads(text)
+
+        if isinstance(data, dict):
+            return data
+
+    except Exception as e:
+        print(f"[AUTO_STATUS WARN] Could not read external status: {e}", flush=True)
+
+    return None
+
+
+def auto_status_snapshot():
+    external = read_external_auto_status()
+
+    if external is not None:
+        external.setdefault("ok", True)
+        external.setdefault("mode", current_mode)
+        external.setdefault("stage", "AUTO")
+        external.setdefault("action", "")
+        external.setdefault("decision", "")
+        external.setdefault("error", "")
+        external.setdefault("track", [])
+        external.setdefault("time", now_text())
+
+        external["auto_front_camera_running"] = is_running(auto_front_camera_process)
+        external["auto_brain_running"] = is_running(auto_brain_process)
+        external["sensor_bridge_running"] = (
+            is_running(manual_startup_process) or
+            is_running(manual_sensor_process)
+        )
+
+        return external
+
+    with auto_status_lock:
+        data = dict(auto_status_state)
+        data["track"] = list(auto_status_state.get("track", []))
+
+    data["ok"] = True
+    data["mode"] = current_mode
+    data["auto_front_camera_running"] = is_running(auto_front_camera_process)
+    data["auto_brain_running"] = is_running(auto_brain_process)
+    data["sensor_bridge_running"] = (
+        is_running(manual_startup_process) or
+        is_running(manual_sensor_process)
+    )
+
+    return data
 
 
 # ============================================================
@@ -100,6 +249,21 @@ def is_running(process):
 def start_process(name, file_path, log_name):
     if not file_path.exists():
         print(f"[ERROR] {name} file not found: {file_path}", flush=True)
+
+        set_auto_status(
+            action=f"Failed to start {name}",
+            decision="File missing",
+            error=f"{file_path} not found",
+        )
+
+        push_auto_track(
+            "error",
+            "Process Start",
+            f"{name} file not found: {file_path}",
+            important=True,
+        )
+
+        write_auto_status_file()
         return None
 
     log_path = LOG_DIR / log_name
@@ -108,6 +272,15 @@ def start_process(name, file_path, log_name):
     print(f"[START] {name}", flush=True)
     print(f"[FILE]  {file_path}", flush=True)
     print(f"[LOG]   {log_path}", flush=True)
+
+    push_auto_track(
+        "action",
+        "Service Start",
+        f"Starting {name}",
+        important=False,
+    )
+
+    write_auto_status_file()
 
     return subprocess.Popen(
         [sys.executable, "-u", str(file_path)],
@@ -127,6 +300,13 @@ def stop_process(name, process, timeout=5):
 
     print(f"[STOP] {name}", flush=True)
 
+    push_auto_track(
+        "action",
+        "Service Stop",
+        f"Stopping {name}",
+        important=False,
+    )
+
     try:
         process.terminate()
 
@@ -135,16 +315,47 @@ def stop_process(name, process, timeout=5):
         while time.time() < end_time:
             if process.poll() is not None:
                 print(f"[OK] {name} stopped", flush=True)
+
+                push_auto_track(
+                    "info",
+                    "Service Stop",
+                    f"{name} stopped",
+                    important=False,
+                )
+
+                write_auto_status_file()
                 return None
 
             time.sleep(0.1)
 
         print(f"[WARN] {name} did not stop, killing...", flush=True)
+
+        push_auto_track(
+            "warning",
+            "Service Stop",
+            f"{name} did not stop normally, killing process",
+            important=True,
+        )
+
         process.kill()
+        write_auto_status_file()
         return None
 
     except Exception as e:
         print(f"[ERROR] stopping {name}: {e}", flush=True)
+
+        set_auto_status(
+            error=f"Error stopping {name}: {e}",
+        )
+
+        push_auto_track(
+            "error",
+            "Service Stop",
+            f"Error stopping {name}: {e}",
+            important=True,
+        )
+
+        write_auto_status_file()
         return None
 
 
@@ -155,6 +366,15 @@ def stop_process(name, process, timeout=5):
 def send_esp32_command(command):
     if websocket is None:
         print("[WARN] websocket-client not installed", flush=True)
+
+        push_auto_track(
+            "warning",
+            "ESP32 Command",
+            f"websocket-client not installed, command not sent: {command}",
+            important=True,
+        )
+
+        write_auto_status_file()
         return False
 
     try:
@@ -163,11 +383,33 @@ def send_esp32_command(command):
         ws.close()
 
         print(f"[ESP32 CMD] {command}", flush=True)
+
+        push_auto_track(
+            "action",
+            "ESP32 Command",
+            f"Sent command to ESP32: {command}",
+            important=False,
+        )
+
         time.sleep(0.05)
+        write_auto_status_file()
         return True
 
     except Exception as e:
         print(f"[ESP32 ERROR] {command}: {e}", flush=True)
+
+        set_auto_status(
+            error=f"ESP32 command failed: {command} | {e}",
+        )
+
+        push_auto_track(
+            "error",
+            "ESP32 Command",
+            f"Failed to send command to ESP32: {command} | {e}",
+            important=True,
+        )
+
+        write_auto_status_file()
         return False
 
 
@@ -180,6 +422,11 @@ def safe_stop_robot():
         "CAM:STOP",
     ]
 
+    set_auto_status(
+        action="Sending safety stop commands",
+        decision="Stop robot before mode switching",
+    )
+
     for cmd in commands:
         send_esp32_command(cmd)
 
@@ -189,14 +436,6 @@ def safe_stop_robot():
 # ============================================================
 
 def start_manual_startup():
-    """
-    Manual mode uses:
-      Manual/apex_rover_manual_servers_startup.py
-
-    That file should start:
-      - camera_admin_server.py on port 5000
-      - sensor_bridge.py
-    """
     global manual_startup_process
 
     if not is_running(manual_startup_process):
@@ -210,10 +449,6 @@ def start_manual_startup():
 
 
 def start_manual_sensor_bridge_only():
-    """
-    Auto mode still needs sensor_bridge, but not the manual camera admin.
-    So in Auto we run sensor_bridge.py alone.
-    """
     global manual_sensor_process
 
     if not is_running(manual_sensor_process):
@@ -268,6 +503,21 @@ def switch_to_manual():
     print("==========================================", flush=True)
 
     with process_lock:
+        set_auto_status(
+            mode="MANUAL",
+            stage="Switching to Manual",
+            action="Stopping auto services",
+            decision="Manual mode selected",
+            error="",
+        )
+
+        push_auto_track(
+            "decision",
+            "Mode Switching",
+            "Switching to MANUAL mode",
+            important=True,
+        )
+
         auto_brain_process = stop_process(
             "Auto Stair Climb Brain",
             auto_brain_process,
@@ -275,17 +525,21 @@ def switch_to_manual():
 
         safe_stop_robot()
 
-        # Stop Auto front camera because Manual camera admin uses port 5000.
         auto_front_camera_process = stop_process(
             "Auto Front Camera Server",
             auto_front_camera_process,
         )
 
-        # Stop sensor_bridge-only if it was started for Auto.
-        # Manual startup will start its own sensor_bridge.py.
         manual_sensor_process = stop_process(
             "Sensor Bridge Only",
             manual_sensor_process,
+        )
+
+        set_auto_status(
+            stage="Manual Mode",
+            action="Starting manual camera admin and sensor bridge",
+            decision="Manual services will run",
+            error="",
         )
 
         start_manual_startup()
@@ -293,6 +547,23 @@ def switch_to_manual():
         send_esp32_command("SYS:MODE:MANUAL")
 
         current_mode = "MANUAL"
+
+        set_auto_status(
+            mode="MANUAL",
+            stage="Manual Mode",
+            action="Manual mode is active",
+            decision="Robot is ready for mobile manual control",
+            error="",
+        )
+
+        push_auto_track(
+            "info",
+            "Manual Mode",
+            "Manual mode active: camera admin + sensors",
+            important=True,
+        )
+
+        write_auto_status_file()
 
     return {
         "ok": True,
@@ -313,30 +584,78 @@ def switch_to_auto():
     print("==========================================", flush=True)
 
     with process_lock:
+        set_auto_status(
+            mode="AUTO",
+            stage="Auto Startup",
+            action="Preparing robot for autonomous mode",
+            decision="Auto mode selected",
+            error="",
+        )
+
+        push_auto_track(
+            "decision",
+            "Auto Startup",
+            "Switching to AUTO mode",
+            important=True,
+        )
+
         safe_stop_robot()
 
-        # Stop Manual startup.
-        # This stops camera_admin_server.py and its sensor_bridge.py child.
         manual_startup_process = stop_process(
             "Manual Services Startup Manager",
             manual_startup_process,
         )
 
-        # Give port 5000 and Mega serial time to release.
         time.sleep(2)
 
-        # Auto needs sensor data, but not manual cameras.
+        set_auto_status(
+            stage="Auto Startup",
+            action="Starting sensor bridge for auto mode",
+            decision="Sensors are required for auto decisions",
+            error="",
+        )
+
         start_manual_sensor_bridge_only()
 
-        # Auto uses front camera only.
+        set_auto_status(
+            stage="Auto Startup",
+            action="Starting front camera server",
+            decision="Auto uses robot front camera first",
+            error="",
+        )
+
         start_auto_front_camera_server()
 
         send_esp32_command("SYS:MODE:AUTO")
         send_esp32_command("SPEED:55")
 
+        set_auto_status(
+            stage="Auto Startup",
+            action="Starting auto brain",
+            decision="Auto brain will begin decision tracking",
+            error="",
+        )
+
         start_auto_brain()
 
         current_mode = "AUTO"
+
+        set_auto_status(
+            mode="AUTO",
+            stage="Auto Running",
+            action="Auto brain is running",
+            decision="Robot is ready to execute autonomous sequence",
+            error="",
+        )
+
+        push_auto_track(
+            "info",
+            "Auto Running",
+            "Auto mode active: front camera + sensor bridge + auto brain",
+            important=True,
+        )
+
+        write_auto_status_file()
 
     return {
         "ok": True,
@@ -356,6 +675,20 @@ def stop_auto_and_return_manual():
     print("==========================================", flush=True)
 
     with process_lock:
+        set_auto_status(
+            stage="Stopping Auto",
+            action="Stopping auto and restoring manual mode",
+            decision="Return to manual mode",
+            error="",
+        )
+
+        push_auto_track(
+            "decision",
+            "Stopping Auto",
+            "Stop auto and return to manual mode",
+            important=True,
+        )
+
         auto_brain_process = stop_process(
             "Auto Stair Climb Brain",
             auto_brain_process,
@@ -379,6 +712,23 @@ def stop_auto_and_return_manual():
 
         current_mode = "MANUAL"
 
+        set_auto_status(
+            mode="MANUAL",
+            stage="Manual Mode",
+            action="Manual mode restored",
+            decision="Robot is ready for manual control",
+            error="",
+        )
+
+        push_auto_track(
+            "info",
+            "Manual Mode",
+            "Auto stopped. Manual camera admin restored.",
+            important=True,
+        )
+
+        write_auto_status_file()
+
     return {
         "ok": True,
         "mode": current_mode,
@@ -397,6 +747,7 @@ def home():
         "mode": current_mode,
         "endpoints": [
             "/status",
+            "/auto_status",
             "/mode/manual",
             "/mode/auto",
             "/mode/stop",
@@ -414,15 +765,11 @@ def status():
         "ok": True,
         "mode": current_mode,
 
-        # Keep these names because the mobile app already expects them.
-        # In the new manual system this means:
-        # manual camera admin service is running, not two cameras opened together.
         "manual_dual_camera_running": manual_running,
         "sensor_bridge_running": sensor_bridge_running,
         "auto_front_camera_running": is_running(auto_front_camera_process),
         "auto_brain_running": is_running(auto_brain_process),
 
-        # Extra detailed status
         "manual_camera_admin_running": manual_running,
         "manual_startup_running": manual_running,
         "sensor_bridge_only_running": is_running(manual_sensor_process),
@@ -436,6 +783,11 @@ def status():
             "auto_stair_climb": str(LOG_DIR / "auto_stair_climb.log"),
         },
     })
+
+
+@app.route("/auto_status")
+def auto_status():
+    return jsonify(auto_status_snapshot())
 
 
 @app.route("/mode/manual", methods=["GET", "POST"])
@@ -456,6 +808,20 @@ def api_stop():
 @app.route("/robot/stop", methods=["GET", "POST"])
 def api_robot_stop():
     safe_stop_robot()
+
+    set_auto_status(
+        action="Emergency stop sent",
+        decision="Stop all robot movement immediately",
+    )
+
+    push_auto_track(
+        "warning",
+        "Emergency Stop",
+        "Emergency STOP sent to robot",
+        important=True,
+    )
+
+    write_auto_status_file()
 
     return jsonify({
         "ok": True,
@@ -481,10 +847,16 @@ def monitor_loop():
             if current_mode == "MANUAL":
                 if not is_running(manual_startup_process):
                     print("[MONITOR] Manual startup is down, restarting...", flush=True)
+
+                    push_auto_track(
+                        "warning",
+                        "Monitor",
+                        "Manual startup is down, restarting",
+                        important=True,
+                    )
+
                     start_manual_startup()
 
-                # In Manual, do not run sensor_bridge_only.
-                # Manual startup runs sensor_bridge.py.
                 if is_running(manual_sensor_process):
                     manual_sensor_process = stop_process(
                         "Sensor Bridge Only",
@@ -492,7 +864,6 @@ def monitor_loop():
                     )
 
             elif current_mode == "AUTO":
-                # In Auto, manual startup must be off to avoid camera/port conflicts.
                 if is_running(manual_startup_process):
                     manual_startup_process = stop_process(
                         "Manual Services Startup Manager",
@@ -501,15 +872,60 @@ def monitor_loop():
 
                 if not is_running(manual_sensor_process):
                     print("[MONITOR] Sensor bridge only is down, restarting...", flush=True)
+
+                    set_auto_status(
+                        stage="Auto Recovery",
+                        action="Restarting sensor bridge",
+                        decision="Sensor bridge must stay alive during auto",
+                    )
+
+                    push_auto_track(
+                        "warning",
+                        "Auto Recovery",
+                        "Sensor bridge only is down, restarting",
+                        important=True,
+                    )
+
                     start_manual_sensor_bridge_only()
 
                 if not is_running(auto_front_camera_process):
                     print("[MONITOR] Auto front camera is down, restarting...", flush=True)
+
+                    set_auto_status(
+                        stage="Auto Recovery",
+                        action="Restarting auto front camera server",
+                        decision="Robot camera must stay alive during auto",
+                    )
+
+                    push_auto_track(
+                        "warning",
+                        "Auto Recovery",
+                        "Auto front camera is down, restarting",
+                        important=True,
+                    )
+
                     start_auto_front_camera_server()
 
                 if not is_running(auto_brain_process):
                     print("[MONITOR] Auto brain is not running. Sending safety stop.", flush=True)
+
+                    set_auto_status(
+                        stage="Auto Error",
+                        action="Auto brain stopped",
+                        decision="Safety stop required",
+                        error="Auto brain is not running",
+                    )
+
+                    push_auto_track(
+                        "error",
+                        "Auto Error",
+                        "Auto brain is not running. Safety stop sent.",
+                        important=True,
+                    )
+
                     safe_stop_robot()
+
+                write_auto_status_file()
 
 
 # ============================================================
@@ -523,6 +939,19 @@ def shutdown_handler(sig, frame):
     global auto_brain_process
 
     print("\n[SHUTDOWN] Stopping all Raspberry services...", flush=True)
+
+    set_auto_status(
+        stage="Shutdown",
+        action="Stopping all Raspberry services",
+        decision="Shutdown signal received",
+    )
+
+    push_auto_track(
+        "warning",
+        "Shutdown",
+        "Stopping all Raspberry services",
+        important=True,
+    )
 
     safe_stop_robot()
 
@@ -547,6 +976,7 @@ def shutdown_handler(sig, frame):
             manual_startup_process,
         )
 
+    write_auto_status_file()
     sys.exit(0)
 
 
@@ -564,7 +994,23 @@ def main():
     print("Manual: Manual/apex_rover_manual_servers_startup.py", flush=True)
     print("Auto  : Sensor bridge only + front camera + auto brain", flush=True)
     print("API port: 5050", flush=True)
+    print("Auto Status: /auto_status", flush=True)
     print("==========================================", flush=True)
+
+    set_auto_status(
+        mode="MANUAL",
+        stage="Startup",
+        action="Starting Raspberry mode manager",
+        decision="Default mode is MANUAL",
+        error="",
+    )
+
+    push_auto_track(
+        "info",
+        "Startup",
+        "Raspberry mode manager started",
+        important=True,
+    )
 
     switch_to_manual()
 
