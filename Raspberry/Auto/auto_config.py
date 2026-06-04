@@ -28,7 +28,13 @@ SRC_DIR = RASPBERRY_DIR / "src"
 
 STATUS_FILE = "/tmp/apex_auto_status.json"
 EVENTS_FILE = "/tmp/apex_auto_status_events.jsonl"
+
 LAST_SENSOR_FILE = "/tmp/apex_last_sensor.json"
+
+# NEW: written by Manual/sensor_bridge.py when Mega prints ACK / ERR lines.
+LAST_MEGA_ACK_FILE = "/tmp/apex_last_mega_ack.json"
+LAST_MEGA_ACK_TEXT_FILE = "/tmp/apex_last_mega_ack.txt"
+LAST_MEGA_LINE_FILE = "/tmp/apex_last_mega_line.json"
 
 # ============================================================
 # ESP32 bridge
@@ -36,6 +42,17 @@ LAST_SENSOR_FILE = "/tmp/apex_last_sensor.json"
 ESP32_IP = "192.168.4.1"
 ESP32_HTTP_COMMAND_URL = f"http://{ESP32_IP}/command"
 ESP32_COMMAND_TIMEOUT = 0.8
+
+# ============================================================
+# LEGO block / orchestrator timing
+# ============================================================
+MEGA_BLOCK_TIMEOUT_SEC = 90.0
+MEGA_BLOCK_POLL_SEC = 0.15
+
+UNO_POSE_WAIT_SEC = 3.0
+UNO_SHORT_WAIT_SEC = 1.0
+
+AUTO_STEP_SETTLE_SEC = 0.35
 
 # ============================================================
 # Camera devices / server
@@ -60,7 +77,7 @@ LOCAL_AUTO_STATUS_URL = f"http://127.0.0.1:{CAMERA_SERVER_PORT}/auto_status"
 # Movement tuning
 # ============================================================
 NORMAL_SPEED = 55
-CLIMB_SPEED = 60
+CLIMB_SPEED = 30
 ARM_OPERATION_SPEED = 35
 
 # Small timed movements. Mega constrains PULSE duration between 50 and 1500 ms.
@@ -130,6 +147,16 @@ MAX_CLIMB_STEPS = 80
 MAX_DELIVERY_STEPS = 28
 
 # ============================================================
+# LEGO block default parameters
+# These are used by Raspberry Orchestrator to ask Mega to run blocks.
+# Tune later from mobile Test screen.
+# ============================================================
+BLOCK_TURN_DEGREE = 90
+BLOCK_GO_APPROACH_AMOUNT = 20
+BLOCK_GO_SMALL_AMOUNT = 8
+BLOCK_JACK_AMOUNT = 4
+
+# ============================================================
 # Template matching / vision
 # ============================================================
 TEMPLATE_MIN_SCORE = 0.48
@@ -146,13 +173,20 @@ TEMPLATE_KEYWORDS = {
 }
 
 # ============================================================
-# Arm calibrated poses
+# UNO arm state commands
+# These are the new preferred commands.
+# Raspberry should use these instead of sending many servo angles.
 # ============================================================
-# These poses are intentionally easy to tune. The code performs the logic,
-# but real arm angles must be calibrated on your robot.
-# Units:
-#   base_deg: degrees used by ARM:BASE:GOTO_DEG:N
-#   shoulder/elbow/wrist/gripper/aux: servo angles
+UNO_ARM_HOME_CMD = "ARM:HOME"
+UNO_ARM_READY_CMD = "ARM:READY"
+UNO_ARM_TAKE_OUT_CMD = "ARM:TAKE_OUT"
+UNO_ARM_DROP_IN_CMD = "ARM:DROP_IN"
+UNO_ARM_DROP_OUT_CMD = "ARM:DROP_OUT"
+
+# ============================================================
+# Legacy calibrated poses
+# Kept for compatibility/fallback.
+# The new orchestrator should prefer UNO states above.
 # ============================================================
 ARM_POSE_READY = {
     "base_deg": 0,
@@ -181,7 +215,6 @@ ARM_POSE_SOURCE_LIFT = {
     "gripper": 120,
 }
 
-# Robot basket is behind the arm/camera, upper rear body.
 ARM_POSE_ROBOT_BASKET_DROP = {
     "base_deg": 120,
     "shoulder": 110,

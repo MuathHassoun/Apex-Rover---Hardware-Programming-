@@ -1,8 +1,9 @@
+
 #!/usr/bin/env python3
 """
-sensor_bridge.py - Apex Rover Manual Sensor Bridge
+sensor_bridge.py - Apex Rover Sensor Bridge
 
-This file runs in MANUAL mode and also stays running in AUTO mode.
+Runs in MANUAL mode and also stays running in AUTO mode.
 
 Responsibilities:
   1. Read SENSOR lines from Arduino Mega over USB Serial.
@@ -12,8 +13,10 @@ Responsibilities:
        ALERT -> BALANCE
   3. Save latest sensor data to:
        /tmp/apex_last_sensor.json
-     so Auto brain can read MPU safely without opening Serial again.
   4. Forward sensor data to ESP32 so the mobile app can display it.
+  5. NEW:
+       Read ACK / ERROR lines from Mega blocks and save them to:
+       /tmp/apex_last_mega_ack.json
 
 Important:
   Only this file opens the Mega USB Serial.
@@ -22,6 +25,7 @@ Important:
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -37,8 +41,6 @@ import serial
 
 BASE_DIR = Path(__file__).resolve().parent
 PARENT_DIR = BASE_DIR.parent
-
-import sys
 sys.path.insert(0, str(PARENT_DIR))
 
 
@@ -75,8 +77,17 @@ except Exception:
 ESP32_SENSOR_UPDATE_URL = f"http://{ESP32_IP}/sensor_update"
 ESP32_SENSOR_POST_URL = f"http://{ESP32_IP}/sensor"
 
+# NEW endpoint. If ESP32 has it, ACK will be forwarded.
+# If ESP32 does not have it yet, this bridge will still work locally.
+ESP32_BRIDGE_EVENT_URL = f"http://{ESP32_IP}/bridge_event"
+
 LAST_SENSOR_FILE = "/tmp/apex_last_sensor.json"
 LAST_SENSOR_TEXT_FILE = "/tmp/apex_last_sensor.txt"
+
+# NEW: Mega ACK files used by Raspberry auto orchestrator.
+LAST_MEGA_ACK_FILE = "/tmp/apex_last_mega_ack.json"
+LAST_MEGA_ACK_TEXT_FILE = "/tmp/apex_last_mega_ack.txt"
+LAST_MEGA_LINE_FILE = "/tmp/apex_last_mega_line.json"
 
 FORWARD_TIMEOUT = 0.4
 
@@ -172,7 +183,7 @@ def parse_sensor_line(line):
         return sensor
 
     except Exception as e:
-        print(f"[PARSE ERROR] {e} | line={line}")
+        print(f"[PARSE ERROR] {e} | line={line}", flush=True)
         return None
 
 
@@ -196,20 +207,98 @@ def build_mobile_sensor_message(sensor):
 # LOCAL SAVE FOR AUTO MODE
 # ============================================================
 
+def atomic_write_json(path, data):
+    temp_file = path + ".tmp"
+
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+    os.replace(temp_file, path)
+
+
 def save_latest_sensor(sensor):
     try:
-        temp_file = LAST_SENSOR_FILE + ".tmp"
-
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(sensor, f)
-
-        os.replace(temp_file, LAST_SENSOR_FILE)
+        atomic_write_json(LAST_SENSOR_FILE, sensor)
 
         with open(LAST_SENSOR_TEXT_FILE, "w", encoding="utf-8") as f:
             f.write(build_mobile_sensor_message(sensor) + "\n")
 
     except Exception as e:
-        print(f"[SAVE ERROR] {e}")
+        print(f"[SAVE SENSOR ERROR] {e}", flush=True)
+
+
+# ============================================================
+# NEW: MEGA ACK / ERROR PARSING
+# ============================================================
+
+def parse_mega_ack_line(line):
+    """
+    Supported examples:
+      ACK:MEGA:START:UP_STAIRS
+      ACK:MEGA:STEP:UP_STAIRS:ALIGN
+      ACK:MEGA:DONE:UP_STAIRS
+      ACK:MEGA:DONE:TURN
+      ERR:MEGA:UP_STAIRS:TILT_DANGER
+      ERROR:MEGA:...
+    """
+
+    text = line.strip()
+    upper = text.upper()
+
+    is_ack = upper.startswith("ACK:")
+    is_error = upper.startswith("ERR:") or upper.startswith("ERROR:")
+
+    if not is_ack and not is_error:
+        return None
+
+    parts = text.split(":")
+    parts_upper = [p.upper() for p in parts]
+
+    source = parts[1] if len(parts) > 1 else "MEGA"
+    event = parts[2] if len(parts) > 2 else ("ERROR" if is_error else "ACK")
+    name = parts[3] if len(parts) > 3 else ""
+
+    done = "DONE" in parts_upper
+    started = "START" in parts_upper
+    step = "STEP" in parts_upper
+
+    ack = {
+        "ok": not is_error,
+        "type": "error" if is_error else "ack",
+        "source": source,
+        "event": event,
+        "name": name,
+        "done": done,
+        "started": started,
+        "step": step,
+        "line": text,
+        "parts": parts,
+        "timestamp": time.time(),
+    }
+
+    return ack
+
+
+def save_latest_mega_line(line):
+    try:
+        data = {
+            "line": line.strip(),
+            "timestamp": time.time(),
+        }
+        atomic_write_json(LAST_MEGA_LINE_FILE, data)
+    except Exception as e:
+        print(f"[SAVE MEGA LINE ERROR] {e}", flush=True)
+
+
+def save_latest_mega_ack(ack):
+    try:
+        atomic_write_json(LAST_MEGA_ACK_FILE, ack)
+
+        with open(LAST_MEGA_ACK_TEXT_FILE, "w", encoding="utf-8") as f:
+            f.write(ack.get("line", "") + "\n")
+
+    except Exception as e:
+        print(f"[SAVE MEGA ACK ERROR] {e}", flush=True)
 
 
 # ============================================================
@@ -244,10 +333,10 @@ def forward_to_esp32(sensor):
         if r.status_code == 200:
             return True
 
-        print(f"[ESP32 WARN] /sensor_update HTTP {r.status_code}")
+        print(f"[ESP32 WARN] /sensor_update HTTP {r.status_code}", flush=True)
 
     except Exception as e:
-        print(f"[ESP32 WARN] /sensor_update failed: {e}")
+        print(f"[ESP32 WARN] /sensor_update failed: {e}", flush=True)
 
     # Fallback POST endpoint
     try:
@@ -260,12 +349,73 @@ def forward_to_esp32(sensor):
         if r.status_code == 200:
             return True
 
-        print(f"[ESP32 WARN] /sensor HTTP {r.status_code}")
+        print(f"[ESP32 WARN] /sensor HTTP {r.status_code}", flush=True)
 
     except Exception as e:
-        print(f"[ESP32 ERROR] /sensor failed: {e}")
+        print(f"[ESP32 ERROR] /sensor failed: {e}", flush=True)
 
     return False
+
+
+def forward_ack_to_esp32(ack):
+    """
+    Forwards Mega ACK to ESP32 if /bridge_event exists.
+    If it fails, we do not stop anything because the local ACK file is enough
+    for Raspberry auto logic.
+    """
+
+    try:
+        r = requests.get(
+            ESP32_BRIDGE_EVENT_URL,
+            params={
+                "type": ack.get("type", "ack"),
+                "source": ack.get("source", "MEGA"),
+                "event": ack.get("event", ""),
+                "name": ack.get("name", ""),
+                "done": "1" if ack.get("done") else "0",
+                "ok": "1" if ack.get("ok") else "0",
+                "line": ack.get("line", ""),
+            },
+            timeout=FORWARD_TIMEOUT,
+        )
+
+        if r.status_code == 200:
+            return True
+
+        print(f"[ESP32 WARN] /bridge_event HTTP {r.status_code}", flush=True)
+
+    except Exception as e:
+        print(f"[ESP32 WARN] /bridge_event failed: {e}", flush=True)
+
+    return False
+
+
+# ============================================================
+# NON-SENSOR LINE HANDLER
+# ============================================================
+
+def handle_non_sensor_line(line):
+    text = line.strip()
+
+    if not text:
+        return
+
+    save_latest_mega_line(text)
+
+    ack = parse_mega_ack_line(text)
+
+    if ack is not None:
+        save_latest_mega_ack(ack)
+        forward_ack_to_esp32(ack)
+
+        if ack.get("ok"):
+            print(f"[MEGA ACK] {text}", flush=True)
+        else:
+            print(f"[MEGA ERROR] {text}", flush=True)
+
+        return
+
+    print(f"[MEGA] {text}", flush=True)
 
 
 # ============================================================
@@ -273,7 +423,7 @@ def forward_to_esp32(sensor):
 # ============================================================
 
 def open_mega_serial():
-    print(f"[SERIAL] Opening Mega on {MEGA_PORT} @ {BAUD_RATE}")
+    print(f"[SERIAL] Opening Mega on {MEGA_PORT} @ {BAUD_RATE}", flush=True)
 
     ser = serial.Serial(
         port=MEGA_PORT,
@@ -290,19 +440,20 @@ def open_mega_serial():
     except Exception:
         pass
 
-    print("[SERIAL] Mega connected")
+    print("[SERIAL] Mega connected", flush=True)
     return ser
 
 
 def main():
-    print("==========================================")
-    print("Apex Rover Sensor Bridge")
-    print("Mode: Manual services / Auto support")
-    print("Reads Mega Serial once and shares MPU data")
-    print(f"Mega port: {MEGA_PORT}")
-    print(f"ESP32: {ESP32_IP}")
-    print(f"Latest sensor JSON: {LAST_SENSOR_FILE}")
-    print("==========================================")
+    print("==========================================", flush=True)
+    print("Apex Rover Sensor Bridge", flush=True)
+    print("Mode: Manual services / Auto support", flush=True)
+    print("Reads Mega Serial once and shares MPU + ACK data", flush=True)
+    print(f"Mega port: {MEGA_PORT}", flush=True)
+    print(f"ESP32: {ESP32_IP}", flush=True)
+    print(f"Latest sensor JSON: {LAST_SENSOR_FILE}", flush=True)
+    print(f"Latest Mega ACK JSON: {LAST_MEGA_ACK_FILE}", flush=True)
+    print("==========================================", flush=True)
 
     while True:
         ser = None
@@ -324,7 +475,7 @@ def main():
                 sensor = parse_sensor_line(line)
 
                 if sensor is None:
-                    print(f"[MEGA] {line}")
+                    handle_non_sensor_line(line)
                     continue
 
                 save_latest_sensor(sensor)
@@ -336,16 +487,17 @@ def main():
                     f"roll={sensor['roll']:.2f} "
                     f"front={sensor['front']:.2f} "
                     f"rear={sensor['rear']:.2f} "
-                    f"balance={sensor['balance']}"
+                    f"balance={sensor['balance']}",
+                    flush=True,
                 )
 
         except KeyboardInterrupt:
-            print("\n[INFO] Sensor bridge stopped by user")
+            print("\n[INFO] Sensor bridge stopped by user", flush=True)
             break
 
         except Exception as e:
-            print(f"[ERROR] Sensor bridge error: {e}")
-            print("[INFO] Reconnecting in 2 seconds...")
+            print(f"[ERROR] Sensor bridge error: {e}", flush=True)
+            print("[INFO] Reconnecting in 2 seconds...", flush=True)
 
             try:
                 if ser is not None and ser.is_open:

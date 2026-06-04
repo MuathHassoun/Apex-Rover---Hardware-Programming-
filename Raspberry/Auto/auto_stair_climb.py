@@ -1,755 +1,860 @@
+
 #!/usr/bin/env python3
 """
-auto_stair_climb.py - Apex Rover automatic scenario
+auto_stair_climb.py - Apex Rover AUTO Orchestrator
 
-Scenario:
-  1) Search for the nearest valid source box.
-  2) Approach it with robot left side close to the box because the arm is on the left.
-  3) Use arm camera to move 3 objects one by one from source box to robot rear basket.
-  4) Move arm HOME before climbing.
-  5) Search for stairs and align robot body center, compensating for right-mounted front camera.
-  6) Climb using vision + MPU feedback. Ultrasonic is only safety gating.
-  7) At top, search destination box and move objects from robot basket to destination box.
-  8) Track everything in /tmp/apex_auto_status.json and /auto_status.
+NEW ARCHITECTURE:
+  Raspberry Pi is the orchestrator only.
+  Mega executes heavy movement LEGO blocks.
+  UNO executes saved arm poses.
 
-Important architecture rule:
-  This file does NOT open Mega serial directly.
-  It reads sensors from /tmp/apex_last_sensor.json written by Manual/sensor_bridge.py.
-  Commands go Raspberry -> ESP32 HTTP /command -> Mega/UNO.
+Command path:
+  Raspberry -> ESP32 HTTP /command -> ESP32 routes to Mega or UNO
+
+Mega blocks:
+  AUTO:UP_STAIRS
+  AUTO:DOWN_STAIRS
+  BLOCK:TURN:LEFT:90
+  BLOCK:TURN:RIGHT:90
+  BLOCK:GO:FORWARD:20
+  BLOCK:GO:BACKWARD:20
+  BLOCK:JACK:REAR:EXTEND:4
+  BLOCK:JACK:REAR:RETRACT:4
+
+UNO arm poses:
+  ARM:READY
+  ARM:TAKE_OUT
+  ARM:DROP_IN
+  ARM:DROP_OUT
+  ARM:HOME
+
+Mega ACK path:
+  Mega USB Serial -> Manual/sensor_bridge.py -> /tmp/apex_last_mega_ack.json
+
+This file does NOT open Mega serial directly.
 """
 
-import math
 import signal
 import sys
 import time
-from pathlib import Path
+from typing import Optional, Dict, Any
 
-# Allow importing from Auto and Raspberry root.
-AUTO_DIR = Path(__file__).resolve().parent
-RASPBERRY_DIR = AUTO_DIR.parent
-sys.path.insert(0, str(AUTO_DIR))
-sys.path.insert(0, str(RASPBERRY_DIR))
-
-from auto_config import *  # noqa: F401,F403
-from auto_io import RoverIO
 from auto_status import AutoStatus
-from auto_vision import TemplateLibrary, VisionBrain
+from auto_io import RoverIO
+from auto_vision import VisionBrain
+
+from auto_config import (
+    ALIGN_TOLERANCE_PX,
+    AUTO_STEP_SETTLE_SEC,
+    BLOCK_GO_APPROACH_AMOUNT,
+    BLOCK_GO_SMALL_AMOUNT,
+    BLOCK_TURN_DEGREE,
+    BOX_APPROACH_TARGET_X_RATIO,
+    BOX_CLOSE_BBOX_HEIGHT_RATIO,
+    CLIMB_SPEED,
+    DESTINATION_BOX_CLOSE_BBOX_HEIGHT_RATIO,
+    FINE_ALIGN_TOLERANCE_PX,
+    FRAME_WIDTH,
+    MAX_APPROACH_STEPS,
+    MAX_DELIVERY_STEPS,
+    MAX_OBJECTS_TO_TRANSFER,
+    MAX_SEARCH_SWEEPS,
+    MEGA_BLOCK_TIMEOUT_SEC,
+    NORMAL_SPEED,
+    STAIR_NEAR_BBOX_HEIGHT_RATIO,
+    STAIR_TARGET_X_RATIO,
+)
 
 
-class AutoScenario:
+class ApexAutoOrchestrator:
     def __init__(self):
         self.status = AutoStatus()
         self.io = RoverIO(self.status)
-        self.vision = VisionBrain(self.status, TemplateLibrary())
-        self.running = True
+        self.vision = VisionBrain(self.status)
+
+        self.stop_requested = False
         self.objects_loaded = 0
         self.objects_delivered = 0
-        self.last_progress_signature = None
-        self.no_progress_count = 0
 
     # ============================================================
-    # Lifecycle
+    # Global stop / safety
     # ============================================================
-    def stop_requested(self, signum=None, frame=None):
-        self.running = False
+
+    def request_stop(self, reason="Stop requested"):
+        self.stop_requested = True
         self.status.event(
-            phase="SHUTDOWN",
-            doing="Shutdown signal received",
-            decision="safe stop all actuators",
-            signal=signum,
+            phase="STOP_REQUESTED",
+            doing="Stopping auto scenario",
+            decision=reason,
         )
         self.io.stop_all()
 
-    def run(self):
+    def should_continue(self):
+        if self.stop_requested:
+            self.status.fail(
+                "STOP_REQUESTED",
+                "Scenario stopped by stop request",
+            )
+            return False
+
+        if not self.io.safety_ok():
+            return False
+
+        return True
+
+    # ============================================================
+    # Setup
+    # ============================================================
+
+    def setup_auto(self):
         self.status.set_running(True)
+
         self.status.event(
-            phase="START",
-            doing="Starting automatic pickup, climb, and delivery scenario",
-            decision="initialize robot mode, speed, camera, arm",
+            phase="SETUP",
+            doing="Switching robot to AUTO mode",
+            decision="send SYS:MODE:AUTO",
         )
 
-        try:
-            self.initialize_robot()
-
-            source_found = self.search_and_approach_box(source=True)
-            if not source_found:
-                self.safe_finish("NO_SOURCE_BOX", "No valid source box found")
-                return
-
-            self.transfer_source_box_to_robot_basket()
-
-            self.status.event(
-                phase="ARM_HOME_BEFORE_CLIMB",
-                doing="Moving arm to HOME before stair climbing",
-                decision="avoid shaking/interference during climb",
-            )
-            self.arm_home()
-
-            stairs_found = self.search_align_and_climb_stairs()
-            if not stairs_found:
-                self.safe_finish("NO_STAIRS", "No stairs found or climb failed")
-                return
-
-            destination_found = self.search_and_approach_box(source=False)
-            if not destination_found:
-                self.safe_finish("NO_DESTINATION_BOX", "No destination box found on top area")
-                return
-
-            self.transfer_robot_basket_to_destination_box()
-
-            self.safe_finish("DONE", "Scenario completed successfully")
-
-        except KeyboardInterrupt:
-            self.stop_requested(signal.SIGINT, None)
-        except Exception as e:
-            self.status.fail("AUTO_EXCEPTION", f"Unhandled auto error: {e}")
-            self.io.stop_all()
-        finally:
-            self.status.set_running(False)
-            self.status.write()
-
-    def initialize_robot(self):
         self.io.command("SYS:MODE:AUTO")
         self.io.command(f"SPEED:{NORMAL_SPEED}")
-        self.io.command("MODE:NORMAL")
-        self.io.command("CAM:CENTER")
-        self.io.command("ARM:HOME")
-        self.io.command("JACK:ALL:STOP")
-        self.io.wait(1.0)
 
-    def safe_finish(self, phase, message):
-        self.status.event(phase=phase, doing=message, decision="STOP and keep auto status available")
+        if not self.io.arm_ready():
+            return False
+
+        self.status.event(
+            phase="SETUP",
+            doing="Auto setup complete",
+            decision="ready",
+        )
+
+        return True
+
+    def finish_auto(self, success=True):
+        self.status.event(
+            phase="FINISH",
+            doing="Finishing auto scenario",
+            decision="success" if success else "failed",
+            objects_loaded=self.objects_loaded,
+            objects_delivered=self.objects_delivered,
+        )
+
+        self.io.arm_home()
         self.io.stop_all()
         self.status.set_running(False)
 
     # ============================================================
-    # Search helpers
+    # Vision helpers
     # ============================================================
-    def scan_for_detection(self, category, camera="front", phase="SCAN", accept_fn=None):
-        """
-        Search by using front/arm camera and moving camera stand horizontally.
-        The camera stepper is returned close to center at the end of each sweep.
-        """
-        scan_moves = [
-            ("CAM:CENTER", "center"),
-            ("CAM:STEP_LEFT:350", "left small"),
-            ("CAM:STEP_LEFT:350", "left wide"),
-            ("CAM:STEP_RIGHT:700", "right wide"),
-            ("CAM:STEP_RIGHT:350", "right extra"),
-            ("CAM:STEP_LEFT:350", "return center-ish"),
-        ]
 
-        best = None
-        for sweep in range(MAX_SEARCH_SWEEPS):
-            if not self.running or not self.io.safety_ok():
-                return None
+    def detect_once(self, category: str, camera: str = "front") -> Dict[str, Any]:
+        frame = self.io.snapshot(camera)
+
+        if frame is None:
             self.status.event(
-                phase=phase,
-                doing=f"Searching for {category}",
-                decision=f"camera scan sweep {sweep + 1}/{MAX_SEARCH_SWEEPS}",
+                phase="VISION",
+                doing=f"Taking {camera} snapshot",
+                decision="snapshot failed",
+                category=category,
             )
+            return {
+                "found": False,
+                "category": category,
+                "reason": "snapshot failed",
+                "frame_w": FRAME_WIDTH,
+                "frame_h": 480,
+            }
 
-            for cmd, label in scan_moves:
-                self.io.command(cmd)
-                self.io.wait(0.35)
-                frame = self.io.snapshot(camera)
-                det = self.vision.detect(frame, category)
-                det["scan_label"] = label
-                det["scan_sweep"] = sweep + 1
-                self.status.set_detection(det)
-
-                if best is None or det.get("score", 0) > best.get("score", 0):
-                    best = det
-
-                if det.get("found"):
-                    if accept_fn is None or accept_fn(det, frame):
-                        self.status.event(
-                            phase=phase,
-                            doing=f"Found {category}",
-                            decision="accept detection and continue",
-                            detection=det,
-                        )
-                        return det
-                    self.status.event(
-                        phase=phase,
-                        doing=f"Rejected {category} detection",
-                        decision="detection does not pass geometry/safety constraints",
-                        detection=det,
-                    )
-
-            # If not found, rotate the whole robot a little and try again.
-            self.status.event(
-                phase=phase,
-                doing=f"{category} not found in camera sweep",
-                decision="turn robot a little and rescan",
-                best_detection=best,
-            )
-            self.io.pulse("LEFT", PULSE_TURN_MS)
-            self.io.wait(0.3)
+        detection = self.vision.detect(frame, category)
 
         self.status.event(
-            phase=phase,
-            doing=f"Finished search without valid {category}",
-            decision="not found",
-            best_detection=best,
+            phase="VISION",
+            doing=f"Detecting {category}",
+            decision="found" if detection.get("found") else "not found",
+            detection=detection,
         )
-        return None
 
-    # ============================================================
-    # Source/destination boxes
-    # ============================================================
-    def search_and_approach_box(self, source=True):
-        category = "source_box" if source else "destination_box"
-        phase = "SEARCH_SOURCE_BOX" if source else "SEARCH_DESTINATION_BOX"
-        close_ratio = BOX_CLOSE_BBOX_HEIGHT_RATIO if source else DESTINATION_BOX_CLOSE_BBOX_HEIGHT_RATIO
+        return detection
 
-        def accept_box(det, frame):
-            if frame is None:
-                return False
-            return self.vision.is_box_height_allowed(det, frame.shape)
+    def detection_height_ratio(self, detection: Dict[str, Any]) -> float:
+        if not detection or not detection.get("found"):
+            return 0.0
 
-        det = self.scan_for_detection(category, camera="front", phase=phase, accept_fn=accept_box)
-        if det is None:
+        bbox = detection.get("bbox")
+
+        if not bbox or len(bbox) < 4:
+            return 0.0
+
+        frame_h = float(detection.get("frame_h") or 480)
+        bbox_h = float(bbox[3])
+
+        if frame_h <= 0:
+            return 0.0
+
+        return bbox_h / frame_h
+
+    def is_close_enough(self, category: str, detection: Dict[str, Any]) -> bool:
+        ratio = self.detection_height_ratio(detection)
+
+        if category == "stairs":
+            needed = STAIR_NEAR_BBOX_HEIGHT_RATIO
+        elif category == "destination_box":
+            needed = DESTINATION_BOX_CLOSE_BBOX_HEIGHT_RATIO
+        else:
+            needed = BOX_CLOSE_BBOX_HEIGHT_RATIO
+
+        close = ratio >= needed
+
+        self.status.event(
+            phase="VISION_DISTANCE",
+            doing=f"Checking if {category} is close enough",
+            decision="close" if close else "not close yet",
+            category=category,
+            height_ratio=round(ratio, 3),
+            needed_ratio=needed,
+        )
+
+        return close
+
+    def align_to_detection(
+        self,
+        detection: Dict[str, Any],
+        target_x_ratio: float,
+        fine: bool = False,
+    ) -> bool:
+        """
+        Returns True when aligned.
+        If not aligned, sends a small Mega turn block and returns False.
+        """
+
+        if not detection or not detection.get("found"):
             return False
 
+        cx = detection.get("cx")
+        frame_w = detection.get("frame_w") or FRAME_WIDTH
+
+        if cx is None:
+            return False
+
+        target_x = frame_w * target_x_ratio
+        error_px = float(cx) - float(target_x)
+
+        tolerance = FINE_ALIGN_TOLERANCE_PX if fine else ALIGN_TOLERANCE_PX
+
+        if abs(error_px) <= tolerance:
+            self.status.event(
+                phase="ALIGN",
+                doing="Target aligned",
+                decision="no turn needed",
+                error_px=round(error_px, 1),
+                tolerance=tolerance,
+            )
+            return True
+
+        direction = "RIGHT" if error_px > 0 else "LEFT"
+
+        degree = 6 if abs(error_px) < 120 else 12
+
         self.status.event(
-            phase="APPROACH_SOURCE_BOX" if source else "APPROACH_DESTINATION_BOX",
-            doing="Approaching box with robot left side close to target",
-            decision="align target to left-side arm approach point",
-            detection=det,
+            phase="ALIGN",
+            doing="Aligning robot with detected target",
+            decision=f"turn {direction} {degree} degrees",
+            error_px=round(error_px, 1),
+            tolerance=tolerance,
         )
 
-        return self.approach_detection(
-            category=category,
-            target_x_ratio=BOX_APPROACH_TARGET_X_RATIO,
-            close_height_ratio=close_ratio,
-            phase="APPROACH_SOURCE_BOX" if source else "APPROACH_DESTINATION_BOX",
-            camera="front",
-            max_steps=MAX_APPROACH_STEPS if source else MAX_DELIVERY_STEPS,
-            require_box_height_rule=True,
-        )
+        return self.io.block_turn(
+            direction,
+            degree,
+            timeout_sec=35,
+        ) and False
 
-    def approach_detection(
+    def scan_for_target(
         self,
-        category,
-        target_x_ratio,
-        close_height_ratio,
-        phase,
-        camera="front",
-        max_steps=MAX_APPROACH_STEPS,
-        require_box_height_rule=False,
-    ):
+        category: str,
+        camera: str = "front",
+        scan_direction: str = "LEFT",
+        required: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Try to find a target with camera.
+        If not found, rotate slightly using Mega block and try again.
+        """
+
+        self.status.event(
+            phase="SCAN",
+            doing=f"Scanning for {category}",
+            decision="start scan",
+            category=category,
+        )
+
+        for sweep in range(MAX_SEARCH_SWEEPS):
+            if not self.should_continue():
+                return None
+
+            detection = self.detect_once(category, camera=camera)
+
+            if detection.get("found"):
+                self.status.event(
+                    phase="SCAN",
+                    doing=f"{category} found",
+                    decision="target found",
+                    category=category,
+                    sweep=sweep + 1,
+                    detection=detection,
+                )
+                return detection
+
+            self.status.event(
+                phase="SCAN",
+                doing=f"{category} not found",
+                decision=f"small scan turn {scan_direction}",
+                category=category,
+                sweep=sweep + 1,
+            )
+
+            self.io.block_turn(
+                scan_direction,
+                12,
+                timeout_sec=35,
+            )
+
+        if required:
+            self.status.fail(
+                "SCAN_FAILED",
+                f"Could not find required target: {category}",
+                category=category,
+            )
+
+        return None
+
+    def approach_target(
+        self,
+        category: str,
+        target_x_ratio: float,
+        close_category: Optional[str] = None,
+        max_steps: int = MAX_APPROACH_STEPS,
+        go_amount: int = BLOCK_GO_SMALL_AMOUNT,
+    ) -> bool:
+        """
+        Repeatedly:
+          1. take snapshot
+          2. detect target
+          3. align
+          4. go forward a little
+          5. stop when visually close
+        """
+
+        if close_category is None:
+            close_category = category
+
+        self.status.event(
+            phase="APPROACH",
+            doing=f"Approaching {category}",
+            decision="start visual approach",
+            category=category,
+            max_steps=max_steps,
+        )
+
         for step in range(max_steps):
-            if not self.running or not self.io.safety_ok():
+            if not self.should_continue():
                 return False
 
-            frame = self.io.snapshot(camera)
-            det = self.vision.detect(frame, category)
-            self.status.set_detection(det)
+            detection = self.detect_once(category, camera="front")
 
-            if not det.get("found"):
+            if not detection.get("found"):
                 self.status.event(
-                    phase=phase,
-                    doing="Target temporarily lost while approaching",
-                    decision="stop, rescan small left/right",
-                    step=step,
+                    phase="APPROACH",
+                    doing=f"{category} lost during approach",
+                    decision="scan small left",
+                    category=category,
+                    step=step + 1,
                 )
-                self.io.command("STOP")
-                self.io.pulse("LEFT", PULSE_TURN_SMALL_MS)
-                self.io.wait(0.25)
+
+                self.io.block_turn("LEFT", 8, timeout_sec=30)
                 continue
 
-            if require_box_height_rule and not self.vision.is_box_height_allowed(det, frame.shape):
-                self.status.fail(phase, "Box detected but rejected because it is above allowed robot horizontal level", detection=det)
-                self.io.stop_all()
-                return False
-
-            frame_w = det.get("frame_w") or FRAME_WIDTH
-            bbox = det.get("bbox") or [0, 0, 0, 0]
-            bbox_h_ratio = bbox[3] / max(1, det.get("frame_h") or FRAME_HEIGHT)
-            target_x = int(frame_w * target_x_ratio)
-            error_x = int(det["cx"] - target_x)
-
-            self.status.event(
-                phase=phase,
-                doing="Approaching visual target",
-                decision="align then forward" if abs(error_x) > ALIGN_TOLERANCE_PX else "forward pulse",
-                step=step,
-                error_x=error_x,
-                target_x=target_x,
-                bbox_h_ratio=bbox_h_ratio,
-                detection=det,
-            )
-
-            if bbox_h_ratio >= close_height_ratio:
-                self.io.command("STOP")
+            if self.is_close_enough(close_category, detection):
                 self.status.event(
-                    phase=phase,
-                    doing="Reached target close zone",
-                    decision="stop approach and start next phase",
-                    bbox_h_ratio=bbox_h_ratio,
+                    phase="APPROACH",
+                    doing=f"Reached {category}",
+                    decision="target close enough",
+                    category=category,
+                    step=step + 1,
                 )
                 return True
 
-            if abs(error_x) > ALIGN_TOLERANCE_PX:
-                direction = "RIGHT" if error_x > 0 else "LEFT"
-                self.io.pulse(direction, PULSE_TURN_SMALL_MS)
-            else:
-                sensor = self.io.read_sensor()
-                front = float(sensor.get("front", -1)) if sensor else -1
-                if 0 < front < FRONT_ULTRASONIC_CAUTION_CM:
-                    self.io.pulse("FORWARD", PULSE_FORWARD_SLOW_MS)
-                else:
-                    self.io.pulse("FORWARD", PULSE_FORWARD_MS)
-            self.io.wait(0.25)
-
-        self.status.fail(phase, "Approach step limit reached without close detection")
-        self.io.stop_all()
-        return False
-
-    # ============================================================
-    # Arm control
-    # ============================================================
-    def arm_home(self):
-        self.io.command("ARM:HOME")
-        self.io.wait(1.6)
-
-    def arm_ready(self):
-        self.io.command("ARM:READY")
-        self.io.wait(1.2)
-        self.apply_arm_pose(ARM_POSE_READY, "ARM_READY_FINE")
-
-    def apply_arm_pose(self, pose, label="ARM_POSE"):
-        self.status.event(phase=label, doing="Applying calibrated arm pose", decision="send servo/base angle commands", pose=pose)
-        if "base_deg" in pose:
-            self.io.command(f"ARM:BASE:GOTO_DEG:{int(pose['base_deg'])}")
-            self.io.wait(ARM_BASE_SETTLE_SEC)
-        if "shoulder" in pose:
-            self.io.command(f"ARM:SHOULDER:ANGLE:{int(pose['shoulder'])}")
-        if "elbow" in pose:
-            self.io.command(f"ARM:ELBOW:ANGLE:{int(pose['elbow'])}")
-        if "wrist" in pose:
-            self.io.command(f"ARM:WRIST:ANGLE:{int(pose['wrist'])}")
-        if "aux" in pose:
-            self.io.command(f"ARM:AUX:ANGLE:{int(pose['aux'])}")
-        if "gripper" in pose:
-            self.io.command(f"ARM:GRIPPER:ANGLE:{int(pose['gripper'])}")
-        self.io.wait(ARM_SERVO_SETTLE_SEC)
-
-    def visual_arm_align_to_object(self, phase):
-        """
-        Uses arm camera only to fine-align base toward detected object.
-        This is intentionally simple because actual pickup depends on your calibrated pose.
-        """
-        for attempt in range(7):
-            frame = self.io.snapshot("arm")
-            det = self.vision.detect(frame, "object")
-            self.status.event(
-                phase=phase,
-                doing="Arm camera checking object alignment",
-                decision="fine align arm base" if det.get("found") else "object not visible",
-                attempt=attempt + 1,
-                detection=det,
+            aligned = self.align_to_detection(
+                detection,
+                target_x_ratio=target_x_ratio,
+                fine=True,
             )
-            if not det.get("found"):
-                # Small base search motion.
-                self.io.command("ARM:BASE:STEP_LEFT:80" if attempt % 2 == 0 else "ARM:BASE:STEP_RIGHT:160")
-                self.io.wait(0.35)
+
+            if not aligned:
+                time.sleep(AUTO_STEP_SETTLE_SEC)
                 continue
 
-            frame_w = det.get("frame_w") or FRAME_WIDTH
-            error_x = int(det["cx"] - frame_w / 2)
-            if abs(error_x) <= FINE_ALIGN_TOLERANCE_PX:
-                return True
-            if error_x > 0:
-                self.io.command("ARM:BASE:STEP_RIGHT:70")
-            else:
-                self.io.command("ARM:BASE:STEP_LEFT:70")
-            self.io.wait(0.35)
+            self.status.event(
+                phase="APPROACH",
+                doing=f"Moving forward toward {category}",
+                decision=f"BLOCK:GO:FORWARD:{go_amount}",
+                category=category,
+                step=step + 1,
+            )
+
+            if not self.io.block_go(
+                "FORWARD",
+                go_amount,
+                timeout_sec=45,
+            ):
+                return False
+
+            time.sleep(AUTO_STEP_SETTLE_SEC)
+
+        self.status.fail(
+            "APPROACH_FAILED",
+            f"Could not approach target: {category}",
+            category=category,
+            max_steps=max_steps,
+        )
         return False
 
-    def grab_from_source_and_drop_to_robot_basket(self, index):
-        phase = f"PICK_OBJECT_{index}_FROM_SOURCE"
-        self.status.event(phase=phase, doing="Picking one object from source box", decision="use arm camera then calibrated pick pose")
+    # ============================================================
+    # Arm transfer helpers
+    # ============================================================
 
-        self.arm_ready()
-        self.apply_arm_pose(ARM_POSE_SOURCE_PICK_CENTER, phase + "_PRE_PICK")
-        self.visual_arm_align_to_object(phase)
+    def transfer_source_objects_to_robot_basket(self):
+        """
+        For each object:
+          ARM:READY
+          ARM:TAKE_OUT
+          ARM:DROP_IN
+          ARM:READY
+        """
 
-        # Open -> descend pose -> close -> lift.
-        self.io.command("ARM:GRIPPER:OPEN")
-        self.io.wait(GRIPPER_SETTLE_SEC)
-        self.apply_arm_pose(ARM_POSE_SOURCE_PICK_CENTER, phase + "_PICK")
-        self.io.command("ARM:GRIPPER:CLOSE")
-        self.io.wait(GRIPPER_SETTLE_SEC)
-        self.apply_arm_pose(ARM_POSE_SOURCE_LIFT, phase + "_LIFT")
-
-        # Drop in robot rear basket.
-        drop_phase = f"DROP_OBJECT_{index}_TO_ROBOT_BASKET"
-        self.apply_arm_pose(ARM_POSE_ROBOT_BASKET_DROP, drop_phase)
-        self.io.command("ARM:GRIPPER:OPEN")
-        self.io.wait(GRIPPER_SETTLE_SEC)
-        self.objects_loaded += 1
-        self.status.set_counts(loaded=self.objects_loaded)
-        self.status.event(phase=drop_phase, doing="Dropped object into robot basket", decision="continue if more objects exist")
-        self.arm_ready()
-        return True
-
-    def grab_from_robot_basket_and_drop_to_destination(self, index):
-        phase = f"PICK_OBJECT_{index}_FROM_ROBOT_BASKET"
-        self.status.event(phase=phase, doing="Picking one object from robot rear basket", decision="use calibrated rear basket pickup pose")
-
-        self.arm_ready()
-        self.apply_arm_pose(ARM_POSE_ROBOT_BASKET_PICK, phase + "_PICK")
-        self.io.command("ARM:GRIPPER:CLOSE")
-        self.io.wait(GRIPPER_SETTLE_SEC)
-        self.apply_arm_pose(ARM_POSE_SOURCE_LIFT, phase + "_LIFT")
-
-        drop_phase = f"DROP_OBJECT_{index}_TO_DESTINATION_BOX"
-        # Optional arm-camera check for destination/object area before drop.
-        self.visual_arm_align_to_object(drop_phase)
-        self.apply_arm_pose(ARM_POSE_DESTINATION_DROP, drop_phase)
-        self.io.command("ARM:GRIPPER:OPEN")
-        self.io.wait(GRIPPER_SETTLE_SEC)
-        self.objects_delivered += 1
-        self.status.set_counts(delivered=self.objects_delivered)
-        self.status.event(phase=drop_phase, doing="Dropped object into destination box", decision="continue delivery")
-        self.arm_ready()
-        return True
-
-    def transfer_source_box_to_robot_basket(self):
         self.status.event(
             phase="TRANSFER_TO_ROBOT_BASKET",
-            doing="Moving objects one by one from source box to robot basket",
-            decision="use front camera context then arm camera for manipulation",
+            doing="Starting object transfer from source box to robot basket",
+            decision="use UNO arm states",
+            objects_to_transfer=MAX_OBJECTS_TO_TRANSFER,
         )
-        self.io.command("SPEED:%d" % ARM_OPERATION_SPEED)
-        self.io.command("CAM:CENTER")
-        self.arm_ready()
 
-        for i in range(1, MAX_OBJECTS_TO_TRANSFER + 1):
-            if not self.running or not self.io.safety_ok():
+        for index in range(MAX_OBJECTS_TO_TRANSFER):
+            if not self.should_continue():
                 return False
 
-            frame = self.io.snapshot("arm")
-            det = self.vision.detect(frame, "object")
+            item_no = index + 1
+
             self.status.event(
-                phase="CHECK_SOURCE_OBJECTS",
-                doing="Checking if another object remains in source box",
-                decision="pick next object" if det.get("found") else "no object visible",
-                object_index=i,
-                detection=det,
+                phase="TRANSFER_TO_ROBOT_BASKET",
+                doing=f"Transferring object {item_no} to robot basket",
+                decision="ARM:READY -> ARM:TAKE_OUT -> ARM:DROP_IN -> ARM:READY",
+                object_index=item_no,
             )
 
-            if not det.get("found") and i > 1:
-                break
-            # If first object is not visually clear, still try because object templates may not be ready.
-            self.grab_from_source_and_drop_to_robot_basket(i)
+            if not self.io.arm_ready():
+                return False
 
-        self.arm_home()
-        self.io.command(f"SPEED:{NORMAL_SPEED}")
+            if not self.io.arm_take_out():
+                return False
+
+            if not self.io.arm_drop_in():
+                return False
+
+            if not self.io.arm_ready():
+                return False
+
+            self.objects_loaded += 1
+            self.status.set_counts(loaded=self.objects_loaded)
+
+        self.status.event(
+            phase="TRANSFER_TO_ROBOT_BASKET",
+            doing="All objects loaded into robot basket",
+            decision="done",
+            objects_loaded=self.objects_loaded,
+        )
+
         return True
 
     def transfer_robot_basket_to_destination_box(self):
-        self.status.event(
-            phase="TRANSFER_TO_DESTINATION_BOX",
-            doing="Moving objects from robot basket to destination box",
-            decision="deliver exactly the number of loaded objects",
-            objects_loaded=self.objects_loaded,
-        )
-        self.io.command("SPEED:%d" % ARM_OPERATION_SPEED)
-        self.arm_ready()
+        """
+        For each object:
+          ARM:READY
+          ARM:TAKE_OUT
+          ARM:DROP_OUT
+          ARM:READY
+        """
 
-        count = max(0, self.objects_loaded)
-        if count == 0:
-            count = MAX_OBJECTS_TO_TRANSFER
+        self.status.event(
+            phase="TRANSFER_TO_DESTINATION",
+            doing="Starting object transfer from robot basket to destination box",
+            decision="use UNO arm states",
+            objects_to_transfer=self.objects_loaded,
+        )
+
+        count = self.objects_loaded
+
+        if count <= 0:
             self.status.event(
-                phase="TRANSFER_TO_DESTINATION_BOX",
-                doing="Loaded count is zero, using fallback count",
-                decision=f"fallback deliver {count} objects",
+                phase="TRANSFER_TO_DESTINATION",
+                doing="No loaded objects recorded",
+                decision="skip delivery",
+            )
+            return True
+
+        for index in range(count):
+            if not self.should_continue():
+                return False
+
+            item_no = index + 1
+
+            self.status.event(
+                phase="TRANSFER_TO_DESTINATION",
+                doing=f"Delivering object {item_no} to destination box",
+                decision="ARM:READY -> ARM:TAKE_OUT -> ARM:DROP_OUT -> ARM:READY",
+                object_index=item_no,
             )
 
-        for i in range(1, count + 1):
-            if not self.running or not self.io.safety_ok():
+            if not self.io.arm_ready():
                 return False
-            self.grab_from_robot_basket_and_drop_to_destination(i)
 
-        self.arm_home()
-        self.io.command(f"SPEED:{NORMAL_SPEED}")
+            if not self.io.arm_take_out():
+                return False
+
+            if not self.io.arm_drop_out():
+                return False
+
+            if not self.io.arm_ready():
+                return False
+
+            self.objects_delivered += 1
+            self.status.set_counts(
+                loaded=self.objects_loaded,
+                delivered=self.objects_delivered,
+            )
+
+        self.status.event(
+            phase="TRANSFER_TO_DESTINATION",
+            doing="All objects delivered to destination box",
+            decision="done",
+            objects_delivered=self.objects_delivered,
+        )
+
         return True
 
     # ============================================================
-    # Stairs
+    # Scenario parts
     # ============================================================
-    def search_align_and_climb_stairs(self):
+
+    def part_pickup(self):
+        """
+        Part 1:
+          - Turn left 90 degrees
+          - Find source box
+          - Approach it
+          - Transfer objects to robot basket
+          - Turn right 90 degrees
+        """
+
         self.status.event(
-            phase="SEARCH_STAIRS",
-            doing="Searching for stairs similar to src stair templates",
-            decision="camera/robot scan with right-camera offset compensation",
+            phase="PART_1_PICKUP",
+            doing="Starting pickup part",
+            decision="turn left to source box",
         )
-        self.io.command("CAM:CENTER")
-        self.io.command("CAM:ANGLE:105")  # look slightly down toward floor/stairs; tune if needed
-        self.io.wait(0.6)
 
-        det = self.scan_for_detection("stairs", camera="front", phase="SEARCH_STAIRS")
-        if det is None:
+        if not self.io.block_turn("LEFT", BLOCK_TURN_DEGREE, timeout_sec=60):
             return False
 
-        aligned = self.align_to_stairs()
-        if not aligned:
+        source_detection = self.scan_for_target(
+            "source_box",
+            camera="front",
+            scan_direction="LEFT",
+            required=True,
+        )
+
+        if source_detection is None:
             return False
 
-        return self.climb_stairs()
+        if not self.approach_target(
+            category="source_box",
+            target_x_ratio=BOX_APPROACH_TARGET_X_RATIO,
+            close_category="source_box",
+            max_steps=MAX_APPROACH_STEPS,
+            go_amount=BLOCK_GO_APPROACH_AMOUNT,
+        ):
+            return False
 
-    def align_to_stairs(self):
+        if not self.transfer_source_objects_to_robot_basket():
+            return False
+
         self.status.event(
-            phase="ALIGN_STAIRS",
-            doing="Aligning robot body center with stairs center",
-            decision="target x is left of frame center because camera is mounted on robot right side",
+            phase="PART_1_PICKUP",
+            doing="Returning robot direction after pickup",
+            decision="turn right 90 degrees",
+        )
+
+        if not self.io.block_turn("RIGHT", BLOCK_TURN_DEGREE, timeout_sec=60):
+            return False
+
+        return True
+
+    def part_climb_stairs(self):
+        """
+        Part 2:
+          - Find stairs
+          - Approach stairs
+          - Ask Mega to run full AUTO:UP_STAIRS scenario
+          - After reaching flat top, go forward a little
+        """
+
+        self.status.event(
+            phase="PART_2_CLIMB",
+            doing="Starting stairs climb part",
+            decision="find stairs",
+        )
+
+        stairs_detection = self.scan_for_target(
+            "stairs",
+            camera="front",
+            scan_direction="LEFT",
+            required=True,
+        )
+
+        if stairs_detection is None:
+            return False
+
+        if not self.approach_target(
+            category="stairs",
             target_x_ratio=STAIR_TARGET_X_RATIO,
-        )
+            close_category="stairs",
+            max_steps=MAX_APPROACH_STEPS,
+            go_amount=BLOCK_GO_APPROACH_AMOUNT,
+        ):
+            return False
 
-        for step in range(18):
-            if not self.running or not self.io.safety_ok():
-                return False
-            frame = self.io.snapshot("front")
-            det = self.vision.detect(frame, "stairs")
-            if not det.get("found"):
-                self.status.event(phase="ALIGN_STAIRS", doing="Stairs lost during alignment", decision="small scan turn", step=step)
-                self.io.pulse("LEFT", PULSE_TURN_SMALL_MS)
-                self.io.wait(0.25)
-                continue
-
-            target_x = int((det.get("frame_w") or FRAME_WIDTH) * STAIR_TARGET_X_RATIO)
-            error_x = int(det["cx"] - target_x)
-            self.status.event(
-                phase="ALIGN_STAIRS",
-                doing="Checking stair center alignment",
-                decision="aligned" if abs(error_x) <= FINE_ALIGN_TOLERANCE_PX else "turn to align",
-                error_x=error_x,
-                target_x=target_x,
-                detection=det,
-            )
-
-            if abs(error_x) <= FINE_ALIGN_TOLERANCE_PX:
-                self.io.command("STOP")
-                return True
-
-            self.io.pulse("RIGHT" if error_x > 0 else "LEFT", PULSE_TURN_SMALL_MS)
-            self.io.wait(0.25)
-
-        self.status.fail("ALIGN_STAIRS", "Could not align stairs within step limit")
-        self.io.stop_all()
-        return False
-
-    def climb_stairs(self):
         self.status.event(
-            phase="CLIMB_STAIRS",
-            doing="Starting stair climb",
-            decision="use vision + MPU progress; ultrasonic only safety gate",
+            phase="PART_2_CLIMB",
+            doing="Starting Mega stair climbing block",
+            decision="AUTO:UP_STAIRS",
         )
-        self.io.command("MODE:CLIMB")
-        self.io.command(f"SPEED:{CLIMB_SPEED}")
-        self.io.command("CAM:ANGLE:115")  # look downward during climb
-        self.io.wait(0.5)
 
-        base_sensor = self.io.read_sensor() or {}
-        base_pitch = float(base_sensor.get("pitch", 0.0))
-        self.no_progress_count = 0
-        last_pitch = base_pitch
-        last_area = 0.0
-        flat_count = 0
+        self.io.command(f"SPEED:{int(CLIMB_SPEED)}")
 
-        for step in range(MAX_CLIMB_STEPS):
-            if not self.running or not self.io.safety_ok():
-                return False
+        if not self.io.auto_up_stairs(timeout_sec=max(180, MEGA_BLOCK_TIMEOUT_SEC)):
+            return False
 
-            frame = self.io.snapshot("front")
-            det = self.vision.detect(frame, "stairs")
-            sensor = self.io.read_sensor() or {}
-            pitch = float(sensor.get("pitch", 0.0))
-            roll = float(sensor.get("roll", 0.0))
-            front = float(sensor.get("front", -1))
-            area = float(det.get("area_ratio", 0.0)) if det else 0.0
-
-            # Progress is not a fixed distance. It uses pitch/vision changes.
-            pitch_change = abs(pitch - last_pitch)
-            area_change = abs(area - last_area)
-            progress = pitch_change > 0.7 or area_change > 0.012
-
-            if progress:
-                self.no_progress_count = 0
-            else:
-                self.no_progress_count += 1
-
-            last_pitch = pitch
-            last_area = area
-
-            self.status.event(
-                phase="CLIMB_STAIRS",
-                doing="Climbing and monitoring progress",
-                decision="forward" if self.no_progress_count < NO_PROGRESS_LIMIT else "rear jack assist needed",
-                step=step,
-                pitch=pitch,
-                roll=roll,
-                front_ultrasonic=front,
-                progress=progress,
-                no_progress_count=self.no_progress_count,
-                detection=det,
-            )
-
-            if abs(roll) > ROLL_SAFE_FOR_CLIMB_DEG:
-                self.status.fail("CLIMB_STAIRS", "Roll too high while climbing", sensor=sensor)
-                self.io.stop_all()
-                return False
-
-            # Top flat area detection: pitch is stable/low and destination box may appear.
-            if step > 8 and abs(pitch) <= PITCH_FLAT_TOP_DEG:
-                flat_count += 1
-                dest_frame = self.io.snapshot("front")
-                dest = self.vision.detect(dest_frame, "destination_box")
-                self.status.event(
-                    phase="DETECT_TOP_AREA",
-                    doing="Checking if robot reached flat top area",
-                    decision="top likely reached" if flat_count >= 4 or dest.get("found") else "continue climb",
-                    flat_count=flat_count,
-                    destination_detection=dest,
-                )
-                if flat_count >= 4 or dest.get("found"):
-                    self.io.command("STOP")
-                    self.retract_rear_jack_until_safe()
-                    self.io.command("MODE:NORMAL")
-                    self.io.command(f"SPEED:{NORMAL_SPEED}")
-                    self.status.event(phase="TOP_REACHED", doing="Reached flat top area", decision="continue to destination box search")
-                    return True
-            else:
-                flat_count = 0
-
-            if self.no_progress_count >= NO_PROGRESS_LIMIT:
-                ok = self.rear_jack_assist()
-                if not ok:
-                    return False
-                self.no_progress_count = 0
-            else:
-                # If front ultrasonic is close, use slow pulse but don't let it dominate decisions.
-                if 0 < front < FRONT_ULTRASONIC_CAUTION_CM:
-                    self.io.pulse("FORWARD", PULSE_FORWARD_SLOW_MS)
-                else:
-                    self.io.pulse("FORWARD", PULSE_FORWARD_MS)
-                self.io.wait(0.25)
-
-        self.status.fail("CLIMB_STAIRS", "Climb step limit reached before top detection")
-        self.io.stop_all()
-        return False
-
-    def rear_jack_assist(self):
         self.status.event(
-            phase="REAR_JACK_ASSIST",
-            doing="Using rear jack because forward progress is weak/stuck",
-            decision="extend until MPU indicates robot is affected, then stop",
+            phase="PART_2_CLIMB",
+            doing="Robot reached upper flat area",
+            decision="move forward slightly",
         )
-        self.io.command("STOP")
-        before = self.io.read_sensor() or {}
-        base_pitch = float(before.get("pitch", 0.0))
-        base_roll = float(before.get("roll", 0.0))
 
-        self.io.command("JACK:REAR:EXTEND")
-        start = time.time()
-        affected = False
-        last_sensor = before
+        self.io.command(f"SPEED:{int(NORMAL_SPEED)}")
 
-        while time.time() - start < JACK_MAX_EXTEND_SEC:
-            if not self.running:
-                break
-            last_sensor = self.io.read_sensor() or last_sensor or {}
-            pitch = float(last_sensor.get("pitch", base_pitch))
-            roll = float(last_sensor.get("roll", base_roll))
-            delta = max(abs(pitch - base_pitch), abs(roll - base_roll))
-            self.status.event(
-                phase="REAR_JACK_ASSIST",
-                doing="Extending rear jack and watching MPU effect",
-                decision="MPU affected" if delta >= JACK_EFFECT_DELTA_DEG else "keep extending with safety timeout",
-                delta=delta,
-                sensor=last_sensor,
-            )
-            if delta >= JACK_EFFECT_DELTA_DEG:
-                affected = True
-                break
-            time.sleep(0.2)
+        if not self.io.block_go(
+            "FORWARD",
+            BLOCK_GO_SMALL_AMOUNT,
+            timeout_sec=45,
+        ):
+            return False
 
-        if affected:
-            self.status.event(
-                phase="REAR_JACK_ASSIST",
-                doing="Rear jack affected robot balance",
-                decision=f"continue {JACK_AFTER_EFFECT_SEC}s then stop jack",
-            )
-            self.io.wait(JACK_AFTER_EFFECT_SEC)
-        else:
-            self.status.event(
-                phase="REAR_JACK_ASSIST",
-                doing="Rear jack extension timeout",
-                decision="stop jack for safety",
-                sensor=last_sensor,
-            )
-
-        self.io.command("JACK:REAR:STOP")
-        self.io.wait(0.3)
-
-        # Move forward a little while supported.
-        self.io.pulse("FORWARD", PULSE_FORWARD_SLOW_MS)
-        self.io.wait(0.4)
-
-        # Raise/retract rear jack back until stable/no strong change or timeout.
-        return self.retract_rear_jack_until_safe()
-
-    def retract_rear_jack_until_safe(self):
-        self.status.event(
-            phase="REAR_JACK_RETRACT",
-            doing="Retracting/re-raising rear jack after assist/top detection",
-            decision="retract with MPU safety timeout",
-        )
-        before = self.io.read_sensor() or {}
-        base_pitch = float(before.get("pitch", 0.0))
-        base_roll = float(before.get("roll", 0.0))
-        self.io.command("JACK:REAR:RETRACT")
-        start = time.time()
-        stable_samples = 0
-        last_sensor = before
-
-        while time.time() - start < JACK_MAX_RETRACT_SEC:
-            if not self.running:
-                break
-            last_sensor = self.io.read_sensor() or last_sensor or {}
-            pitch = float(last_sensor.get("pitch", base_pitch))
-            roll = float(last_sensor.get("roll", base_roll))
-            delta = max(abs(pitch - base_pitch), abs(roll - base_roll))
-            if delta < 0.8:
-                stable_samples += 1
-            else:
-                stable_samples = 0
-
-            self.status.event(
-                phase="REAR_JACK_RETRACT",
-                doing="Retracting rear jack and watching MPU stability",
-                decision="stop retract" if stable_samples >= 5 else "continue retract",
-                stable_samples=stable_samples,
-                delta=delta,
-                sensor=last_sensor,
-            )
-            if stable_samples >= 5:
-                break
-            time.sleep(0.2)
-
-        self.io.command("JACK:REAR:STOP")
-        self.io.wait(0.3)
         return True
+
+    def part_delivery(self):
+        """
+        Part 3:
+          - Turn right 90
+          - Find destination box
+          - Approach it
+          - Deliver objects from robot basket to destination box
+          - Turn right 90
+        """
+
+        self.status.event(
+            phase="PART_3_DELIVERY",
+            doing="Starting delivery part",
+            decision="turn right to destination area",
+        )
+
+        if not self.io.block_turn("RIGHT", BLOCK_TURN_DEGREE, timeout_sec=60):
+            return False
+
+        destination_detection = self.scan_for_target(
+            "destination_box",
+            camera="front",
+            scan_direction="LEFT",
+            required=True,
+        )
+
+        if destination_detection is None:
+            return False
+
+        if not self.approach_target(
+            category="destination_box",
+            target_x_ratio=BOX_APPROACH_TARGET_X_RATIO,
+            close_category="destination_box",
+            max_steps=MAX_DELIVERY_STEPS,
+            go_amount=BLOCK_GO_SMALL_AMOUNT,
+        ):
+            return False
+
+        if not self.transfer_robot_basket_to_destination_box():
+            return False
+
+        self.status.event(
+            phase="PART_3_DELIVERY",
+            doing="Final orientation turn",
+            decision="turn right 90 degrees",
+        )
+
+        if not self.io.block_turn("RIGHT", BLOCK_TURN_DEGREE, timeout_sec=60):
+            return False
+
+        return True
+
+    # ============================================================
+    # Full scenario
+    # ============================================================
+
+    def run_full_scenario(self):
+        success = False
+
+        try:
+            self.status.event(
+                phase="AUTO_START",
+                doing="Starting full pickup -> climb -> delivery scenario",
+                decision="orchestrator mode",
+            )
+
+            if not self.setup_auto():
+                return False
+
+            if not self.part_pickup():
+                return False
+
+            if not self.part_climb_stairs():
+                return False
+
+            if not self.part_delivery():
+                return False
+
+            success = True
+
+            self.status.event(
+                phase="AUTO_DONE",
+                doing="Full scenario completed successfully",
+                decision="done",
+                objects_loaded=self.objects_loaded,
+                objects_delivered=self.objects_delivered,
+            )
+
+            return True
+
+        except Exception as e:
+            self.status.fail(
+                "AUTO_EXCEPTION",
+                "Unhandled exception in auto scenario",
+                exception=str(e),
+            )
+            return False
+
+        finally:
+            self.finish_auto(success=success)
+
+    # ============================================================
+    # Test modes
+    # These are useful when running directly from terminal.
+    # ============================================================
+
+    def run_test_mode(self, mode):
+        mode = str(mode).lower().strip()
+
+        self.status.set_running(True)
+
+        try:
+            self.status.event(
+                phase="TEST_MODE",
+                doing=f"Running test mode: {mode}",
+                decision="direct block test",
+            )
+
+            self.io.command("SYS:MODE:AUTO")
+
+            if mode in ["up", "up_stairs", "auto_up", "test_up"]:
+                return self.io.auto_up_stairs(timeout_sec=max(180, MEGA_BLOCK_TIMEOUT_SEC))
+
+            if mode in ["down", "down_stairs", "auto_down", "test_down"]:
+                return self.io.auto_down_stairs(timeout_sec=max(180, MEGA_BLOCK_TIMEOUT_SEC))
+
+            if mode in ["ready", "arm_ready"]:
+                return self.io.arm_ready()
+
+            if mode in ["home", "arm_home"]:
+                return self.io.arm_home()
+
+            if mode in ["take", "take_out", "arm_take_out"]:
+                return self.io.arm_take_out()
+
+            if mode in ["drop_in", "arm_drop_in"]:
+                return self.io.arm_drop_in()
+
+            if mode in ["drop_out", "arm_drop_out"]:
+                return self.io.arm_drop_out()
+
+            if mode == "turn_left":
+                return self.io.block_turn("LEFT", BLOCK_TURN_DEGREE, timeout_sec=60)
+
+            if mode == "turn_right":
+                return self.io.block_turn("RIGHT", BLOCK_TURN_DEGREE, timeout_sec=60)
+
+            if mode == "go_forward":
+                return self.io.block_go("FORWARD", BLOCK_GO_SMALL_AMOUNT, timeout_sec=45)
+
+            if mode == "go_backward":
+                return self.io.block_go("BACKWARD", BLOCK_GO_SMALL_AMOUNT, timeout_sec=45)
+
+            self.status.fail(
+                "TEST_MODE",
+                f"Unknown test mode: {mode}",
+            )
+            return False
+
+        finally:
+            self.status.set_running(False)
+
+
+ACTIVE_SCENARIO: Optional[ApexAutoOrchestrator] = None
+
+
+def handle_signal(signum, frame):
+    global ACTIVE_SCENARIO
+
+    if ACTIVE_SCENARIO is not None:
+        ACTIVE_SCENARIO.request_stop(f"Signal received: {signum}")
+
+    sys.exit(0)
 
 
 def main():
-    scenario = AutoScenario()
-    signal.signal(signal.SIGINT, scenario.stop_requested)
-    signal.signal(signal.SIGTERM, scenario.stop_requested)
-    scenario.run()
+    global ACTIVE_SCENARIO
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    scenario = ApexAutoOrchestrator()
+    ACTIVE_SCENARIO = scenario
+
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+        ok = scenario.run_test_mode(mode)
+    else:
+        ok = scenario.run_full_scenario()
+
+    if ok:
+        print("[AUTO] Completed successfully", flush=True)
+        sys.exit(0)
+
+    print("[AUTO] Failed", flush=True)
+    sys.exit(1)
 
 
 if __name__ == "__main__":
