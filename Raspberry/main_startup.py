@@ -21,6 +21,10 @@ AUTO:
 
 New:
   - Adds /auto_status for the mobile Auto Status Track screen.
+  - Normalizes Auto/auto_status.py format:
+      phase   -> stage
+      doing   -> action
+      history -> track
 """
 
 import sys
@@ -107,6 +111,19 @@ auto_status_state = {
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def timestamp_to_text(value):
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except Exception:
+        pass
+
+    return ""
 
 
 def push_auto_track(track_type, stage, message, important=False):
@@ -200,10 +217,111 @@ def read_external_auto_status():
     return None
 
 
+def normalize_external_auto_status(external):
+    """
+    Convert Auto/auto_status.py format to mobile AutoStatusScreen format.
+
+    Auto brain may write:
+      phase, doing, decision, history
+
+    Mobile expects:
+      stage, action, decision, track
+    """
+
+    if not isinstance(external, dict):
+        return external
+
+    # Basic aliases for mobile screen.
+    if not external.get("stage"):
+        external["stage"] = external.get("phase", "AUTO")
+
+    if not external.get("action"):
+        external["action"] = external.get("doing", "")
+
+    if not external.get("decision"):
+        external["decision"] = external.get("last_decision", "")
+
+    if external.get("error") is None:
+        external["error"] = ""
+
+    if not external.get("time"):
+        updated_at = external.get("updated_at")
+        converted = timestamp_to_text(updated_at)
+        external["time"] = converted if converted else now_text()
+
+    # Convert history -> track.
+    history = external.get("history", [])
+    existing_track = external.get("track", [])
+
+    if (not existing_track) and isinstance(history, list):
+        track = []
+
+        for item in history[-100:]:
+            if not isinstance(item, dict):
+                track.append({
+                    "type": "info",
+                    "stage": str(external.get("stage", "AUTO")),
+                    "message": str(item),
+                    "time": "",
+                    "important": False,
+                })
+                continue
+
+            phase = item.get("phase") or item.get("stage") or external.get("stage", "AUTO")
+            doing = item.get("doing") or item.get("action") or ""
+            decision = item.get("decision") or ""
+            error = item.get("error") or ""
+
+            raw_time = item.get("time", "")
+            time_text = timestamp_to_text(raw_time)
+
+            if error:
+                track_type = "error"
+                message = str(error)
+                important = True
+
+            elif decision and str(decision).upper() not in ["NONE", "NULL", ""]:
+                track_type = "decision"
+
+                if doing and str(doing).strip():
+                    message = f"{doing} | Decision: {decision}"
+                else:
+                    message = str(decision)
+
+                important = True
+
+            elif doing and str(doing).strip():
+                track_type = "action"
+                message = str(doing)
+                important = False
+
+            else:
+                track_type = "info"
+                message = "Auto status update"
+                important = False
+
+            track.append({
+                "type": track_type,
+                "stage": str(phase),
+                "message": message,
+                "time": time_text,
+                "important": important,
+            })
+
+        external["track"] = track
+
+    if "track" not in external:
+        external["track"] = []
+
+    return external
+
+
 def auto_status_snapshot():
     external = read_external_auto_status()
 
     if external is not None:
+        external = normalize_external_auto_status(external)
+
         external.setdefault("ok", True)
         external.setdefault("mode", current_mode)
         external.setdefault("stage", "AUTO")
@@ -213,6 +331,7 @@ def auto_status_snapshot():
         external.setdefault("track", [])
         external.setdefault("time", now_text())
 
+        external["mode_manager_mode"] = current_mode
         external["auto_front_camera_running"] = is_running(auto_front_camera_process)
         external["auto_brain_running"] = is_running(auto_brain_process)
         external["sensor_bridge_running"] = (
