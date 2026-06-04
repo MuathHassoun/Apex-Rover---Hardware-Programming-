@@ -46,7 +46,7 @@ ESP32_COMMAND_TIMEOUT = 0.8
 # ============================================================
 # LEGO block / orchestrator timing
 # ============================================================
-MEGA_BLOCK_TIMEOUT_SEC = 90.0
+MEGA_BLOCK_TIMEOUT_SEC = 240.0
 MEGA_BLOCK_POLL_SEC = 0.15
 
 UNO_POSE_WAIT_SEC = 3.0

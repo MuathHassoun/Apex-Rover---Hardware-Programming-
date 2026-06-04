@@ -534,12 +534,15 @@ def send_esp32_command(command):
 
 def safe_stop_robot():
     commands = [
-        "STOP",
-        "JACK:REAR:STOP",
-        "JACK:FRONT:STOP",
-        "ARM:STOP",
-        "CAM:STOP",
-    ]
+    "BLOCK:STOP",
+    "AUTO:STOP",
+    "STOP",
+    "JACK:ALL:STOP",
+    "JACK:REAR:STOP",
+    "JACK:FRONT:STOP",
+    "ARM:STOP",
+    "CAM:STOP",
+]
 
     set_auto_status(
         action="Sending safety stop commands",
