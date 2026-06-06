@@ -5,51 +5,74 @@
 // =================================================================
 // ESP32 - Apex Rover Central WiFi Bridge
 //
-// Architecture:
-//   Mobile App   ->  WebSocket port 81  ->  ESP32  ->  Mega / UNO
-//   Raspberry Pi ->  HTTP port 80       ->  ESP32  (sensor relay only)
+// Manual path:
+//   Mobile App -> WebSocket 81 -> ESP32 -> Mega / UNO
 //
-// Modes:
-//   MANUAL (default): Mobile app controls the robot.
-//   AUTO  : kept for compatibility but no Raspberry auto-control.
+// Auto path:
+//   Raspberry Auto -> HTTP /command or WebSocket 81 -> ESP32 -> Mega / UNO
 //
-// Command routing:
-//   CAM:* / ARM:*   ->  UNO   (stepper + servo)
-//   Everything else ->  Mega  (motors, jacks)
+// Sensor path:
+//   Mega -> Raspberry sensor_bridge -> ESP32 /sensor_update -> Mobile App
 //
-// Sensor data flow:
-//   Mega  ->  USB Serial  ->  Raspberry Pi
-//   Raspberry Pi  ->  POST /sensor  ->  ESP32
-//   ESP32  ->  WebSocket broadcast  ->  Mobile App
+// Mega ACK path WITHOUT return wire:
+//   Mega USB Serial -> Raspberry sensor_bridge -> ESP32 /bridge_event -> Mobile App
 //
-// Always-allowed commands (any source, any mode):
-//   SYS:MODE:MANUAL / SYS:MODE:AUTO
-//   STOP / ESTOP / CMD:STOP
-//   JACK:*:STOP / JACK:ALL:STOP / JACK:STOP
-//   CAM:STOP / ARM:BASE:STOP
+// Routing:
+//   CAM:* / ARM:* -> UNO
+//   AUTO:* / BLOCK:* / movement / jack / speed -> Mega
 // =================================================================
 
+
+// -----------------------------------------------------------------
+// WiFi Access Point
+// -----------------------------------------------------------------
 const char* WIFI_SSID     = "Apex_Rover_Net";
 const char* WIFI_PASSWORD = "12345678";
 
-// Mega: ESP32 GPIO17 TX -> Mega RX1 pin 19
+
+// -----------------------------------------------------------------
+// Serial pin mapping
+//
+// Mega command direction only:
+//   ESP32 GPIO17 TX -> Mega RX1 Pin 19
+//   ESP32 GND       -> Mega GND
+//
+// IMPORTANT:
+//   Mega TX1 Pin 18 -> ESP32 GPIO16 RX is NOT required now.
+//   ACK comes from Mega USB Serial to Raspberry.
+//
+// UNO command direction:
+//   ESP32 GPIO4 TX  -> UNO D2 SoftwareSerial RX
+//   ESP32 GND       -> UNO GND
+// -----------------------------------------------------------------
 #define MEGA_RX_PIN 16
 #define MEGA_TX_PIN 17
-
-// UNO: ESP32 GPIO4 TX -> UNO D2 SoftwareSerial RX
-#define UNO_RX_PIN  15   // not wired — kept for HardwareSerial init
-#define UNO_TX_PIN   4
+#define UNO_RX_PIN  15
+#define UNO_TX_PIN  4
 
 HardwareSerial MegaSerial(2);
 HardwareSerial UnoSerial(1);
 
-WebSocketsServer webSocket   = WebSocketsServer(81);
-WebServer        httpServer(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+WebServer httpServer(80);
 
+
+// =================================================================
+// State
+// =================================================================
 String currentMode = "MANUAL";
 
-// Last sensor JSON received from Raspberry Pi (broadcast to app on arrival).
-String lastSensorJson = "{}";
+String lastSensorMessage =
+  "SENSOR:PITCH=0;ROLL=0;FRONT=-1;REAR=-1;BALANCE=NO DATA";
+
+unsigned long lastCommandAt = 0;
+String lastCommand = "NONE";
+
+String lastBridgeEvent = "NONE";
+String lastMegaAck = "NONE";
+String lastMegaError = "NONE";
+String lastBridgeSource = "NONE";
+unsigned long lastBridgeEventAt = 0;
 
 
 // =================================================================
@@ -57,215 +80,354 @@ String lastSensorJson = "{}";
 // =================================================================
 void sendToMega(const String& cmd) {
   MegaSerial.println(cmd);
-  Serial.print("[-> MEGA] "); Serial.println(cmd);
+  Serial.print("[-> MEGA] ");
+  Serial.println(cmd);
 }
 
 void sendToUno(const String& cmd) {
   UnoSerial.println(cmd);
-  Serial.print("[-> UNO] "); Serial.println(cmd);
+  Serial.print("[-> UNO] ");
+  Serial.println(cmd);
 }
 
 
 // =================================================================
-// Command helpers
+// Helpers
 // =================================================================
-bool isAlwaysAllowed(const String& cmd) {
-  return cmd == "SYS:MODE:MANUAL" ||
-         cmd == "SYS:MODE:AUTO"   ||
-         cmd == "STOP"            ||
-         cmd == "ESTOP"           ||
-         cmd == "CMD:STOP"        ||
-         cmd == "JACK:FRONT:STOP" ||
-         cmd == "JACK:REAR:STOP"  ||
-         cmd == "JACK:ALL:STOP"   ||
-         cmd == "JACK:STOP"       ||
-         cmd == "CAM:STOP"        ||
-         cmd == "ARM:BASE:STOP";
-}
-
-void routeCommand(const String& cmd) {
-  if (cmd.length() == 0) return;
-
-  if (cmd == "SYS:MODE:MANUAL") { currentMode = "MANUAL"; sendToMega(cmd); sendToUno(cmd); return; }
-  if (cmd == "SYS:MODE:AUTO")   { currentMode = "AUTO";   sendToMega(cmd); sendToUno(cmd); return; }
-
-  if (cmd.startsWith("CAM:") || cmd.startsWith("ARM:")) { sendToUno(cmd);  return; }
-  sendToMega(cmd);
-}
-
-String urlDecode(String s) {
-  s.replace("%3A", ":"); s.replace("%3a", ":");
-  s.replace("%2F", "/"); s.replace("%2f", "/");
-  s.replace("%20", " "); s.replace("+",   " ");
+String jsonEscape(String s) {
+  s.replace("\\", "\\\\");
+  s.replace("\"", "\\\"");
+  s.replace("\n", "\\n");
+  s.replace("\r", "");
   return s;
 }
 
+String urlDecode(String s) {
+  s.replace("%3A", ":");
+  s.replace("%3a", ":");
 
-// =================================================================
-// HTTP handlers — Raspberry Pi interface
-// =================================================================
+  s.replace("%3B", ";");
+  s.replace("%3b", ";");
 
-// GET /
-void handleRoot() {
-  httpServer.send(200, "text/plain", "Apex Rover ESP32 | mode=" + currentMode);
+  s.replace("%3D", "=");
+  s.replace("%3d", "=");
+
+  s.replace("%2F", "/");
+  s.replace("%2f", "/");
+
+  s.replace("%20", " ");
+  s.replace("+", " ");
+
+  s.replace("%25", "%");
+
+  return s;
 }
 
-// GET /get_status
+void broadcastStatusEvent(const String& eventName) {
+  String msg = "{";
+  msg += "\"event\":\"" + eventName + "\",";
+  msg += "\"mode\":\"" + currentMode + "\",";
+  msg += "\"last_command\":\"" + jsonEscape(lastCommand) + "\"";
+  msg += "}";
+
+  webSocket.broadcastTXT(msg);
+}
+
+void broadcastBridgeLine(const String& source, const String& line) {
+  // Send raw line first.
+  // This makes it easy for the mobile app to show ACK text directly.
+  webSocket.broadcastTXT(line);
+
+  // Also send JSON event for future Test screen.
+  String json = "{";
+  json += "\"event\":\"bridge_event\",";
+  json += "\"source\":\"" + jsonEscape(source) + "\",";
+  json += "\"mode\":\"" + currentMode + "\",";
+  json += "\"line\":\"" + jsonEscape(line) + "\",";
+  json += "\"last_command\":\"" + jsonEscape(lastCommand) + "\"";
+  json += "}";
+
+  webSocket.broadcastTXT(json);
+}
+
+
+// =================================================================
+// Command routing
+// =================================================================
+void routeCommand(String cmd) {
+  cmd.trim();
+
+  if (cmd.length() == 0) {
+    return;
+  }
+
+  lastCommand = cmd;
+  lastCommandAt = millis();
+
+  // System mode commands go to both Mega and UNO.
+  if (cmd == "SYS:MODE:MANUAL") {
+    currentMode = "MANUAL";
+    sendToMega(cmd);
+    sendToUno(cmd);
+
+    Serial.println("[MODE] MANUAL");
+    broadcastStatusEvent("mode_changed");
+    return;
+  }
+
+  if (cmd == "SYS:MODE:AUTO") {
+    currentMode = "AUTO";
+    sendToMega(cmd);
+    sendToUno(cmd);
+
+    Serial.println("[MODE] AUTO");
+    broadcastStatusEvent("mode_changed");
+    return;
+  }
+
+  // Camera stand and arm go to UNO.
+  if (cmd.startsWith("CAM:") || cmd.startsWith("ARM:")) {
+    sendToUno(cmd);
+    return;
+  }
+
+  // Mega LEGO blocks and auto blocks.
+  if (cmd.startsWith("AUTO:") || cmd.startsWith("BLOCK:")) {
+    sendToMega(cmd);
+    return;
+  }
+
+  // Motors, speed, jacks, PULSE, status go to Mega.
+  sendToMega(cmd);
+}
+
+
+// =================================================================
+// HTTP handlers
+// =================================================================
+void handleRoot() {
+  String text = "";
+
+  text += "Apex Rover ESP32 Bridge Running\n";
+  text += "Mode: " + currentMode + "\n";
+  text += "WebSocket: ws://192.168.4.1:81\n";
+  text += "HTTP: http://192.168.4.1\n";
+  text += "\nEndpoints:\n";
+  text += "/get_status\n";
+  text += "/sensor_update?pitch=2.4&roll=-1.1&front=35.6&rear=18.2&balance=STABLE\n";
+  text += "/bridge_event?source=MEGA&line=ACK:MEGA:DONE:UP_STAIRS\n";
+  text += "/command?cmd=STOP\n";
+  text += "/command?cmd=SYS:MODE:AUTO\n";
+  text += "/command?cmd=PULSE:FORWARD:560\n";
+  text += "/command?cmd=BLOCK:TURN:LEFT:90\n";
+  text += "/command?cmd=BLOCK:GO:FORWARD:20\n";
+  text += "/command?cmd=BLOCK:JACK:REAR:EXTEND:4\n";
+  text += "/command?cmd=AUTO:UP_STAIRS\n";
+  text += "/command?cmd=AUTO:DOWN_STAIRS\n";
+
+  httpServer.send(200, "text/plain", text);
+}
+
 void handleGetStatus() {
-  String json = "{\"ok\":true,\"mode\":\"" + currentMode + "\"}";
+  String json = "{";
+
+  json += "\"ok\":true,";
+  json += "\"mode\":\"" + currentMode + "\",";
+  json += "\"manual_only\":false,";
+
+  json += "\"last_command\":\"" + jsonEscape(lastCommand) + "\",";
+  json += "\"last_command_ms_ago\":" + String(millis() - lastCommandAt) + ",";
+
+  json += "\"last_sensor\":\"" + jsonEscape(lastSensorMessage) + "\",";
+
+  json += "\"last_bridge_source\":\"" + jsonEscape(lastBridgeSource) + "\",";
+  json += "\"last_bridge_event\":\"" + jsonEscape(lastBridgeEvent) + "\",";
+  json += "\"last_bridge_event_ms_ago\":" + String(millis() - lastBridgeEventAt) + ",";
+
+  json += "\"last_mega_ack\":\"" + jsonEscape(lastMegaAck) + "\",";
+  json += "\"last_mega_error\":\"" + jsonEscape(lastMegaError) + "\"";
+
+  json += "}";
+
   httpServer.send(200, "application/json", json);
 }
 
-// POST /command?cmd=...
-// Mobile app commands forwarded by the Pi are NOT expected here anymore.
-// This endpoint is kept for emergencies / mode switches from the Pi.
+void handleSensorUpdate() {
+  String pitch = httpServer.hasArg("pitch") ? httpServer.arg("pitch") : "0";
+  String roll = httpServer.hasArg("roll") ? httpServer.arg("roll") : "0";
+  String front = httpServer.hasArg("front") ? httpServer.arg("front") : "-1";
+  String rear = httpServer.hasArg("rear") ? httpServer.arg("rear") : "-1";
+  String balance = httpServer.hasArg("balance") ? httpServer.arg("balance") : "NO DATA";
+
+  balance.toUpperCase();
+
+  String sensorMessage = "SENSOR:";
+  sensorMessage += "PITCH=" + pitch;
+  sensorMessage += ";ROLL=" + roll;
+  sensorMessage += ";FRONT=" + front;
+  sensorMessage += ";REAR=" + rear;
+  sensorMessage += ";BALANCE=" + balance;
+
+  lastSensorMessage = sensorMessage;
+
+  webSocket.broadcastTXT(sensorMessage);
+
+  Serial.print("[SENSOR -> APP] ");
+  Serial.println(sensorMessage);
+
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"broadcast\":\"" + jsonEscape(sensorMessage) + "\"";
+  json += "}";
+
+  httpServer.send(200, "application/json", json);
+}
+
+// Called by Raspberry sensor_bridge.py when it reads ACK/ERR from Mega USB Serial.
+//
+// Example:
+//   /bridge_event?source=MEGA&line=ACK:MEGA:DONE:UP_STAIRS
+void handleBridgeEvent() {
+  String source = httpServer.hasArg("source") ? httpServer.arg("source") : "UNKNOWN";
+  String line = httpServer.hasArg("line") ? httpServer.arg("line") : "";
+
+  source = urlDecode(source);
+  line = urlDecode(line);
+
+  source.trim();
+  line.trim();
+
+  if (line.length() == 0) {
+    httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"empty line\"}");
+    return;
+  }
+
+  lastBridgeSource = source;
+  lastBridgeEvent = line;
+  lastBridgeEventAt = millis();
+
+  if (source == "MEGA" && line.startsWith("ACK:")) {
+    lastMegaAck = line;
+  }
+
+  if (source == "MEGA" && (line.startsWith("ERR:") || line.startsWith("ERROR:"))) {
+    lastMegaError = line;
+  }
+
+  Serial.print("[BRIDGE EVENT ");
+  Serial.print(source);
+  Serial.print("] ");
+  Serial.println(line);
+
+  broadcastBridgeLine(source, line);
+
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"source\":\"" + jsonEscape(source) + "\",";
+  json += "\"line\":\"" + jsonEscape(line) + "\"";
+  json += "}";
+
+  httpServer.send(200, "application/json", json);
+}
+
+// Optional HTTP command endpoint.
+// Useful for Raspberry tests.
+//
+// Important:
+//   This endpoint sends the command immediately.
+//   Long blocks like AUTO:UP_STAIRS finish later.
+//   Their ACK is received by Raspberry through USB Serial,
+//   then Raspberry sends it back here using /bridge_event.
 void handleCommandHttp() {
   if (!httpServer.hasArg("cmd")) {
-    httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"missing cmd\"}");
+    httpServer.send(
+      400,
+      "application/json",
+      "{\"ok\":false,\"error\":\"missing cmd parameter\"}"
+    );
     return;
   }
 
   String command = urlDecode(httpServer.arg("cmd"));
   command.trim();
 
-  Serial.print("[HTTP from Pi] "); Serial.println(command);
-
-  if (isAlwaysAllowed(command)) {
-    routeCommand(command);
-    httpServer.send(200, "application/json", "{\"ok\":true}");
+  if (command.length() == 0) {
+    httpServer.send(
+      400,
+      "application/json",
+      "{\"ok\":false,\"error\":\"empty command\"}"
+    );
     return;
   }
 
-  // All other Pi commands are blocked — manual mode is the only mode.
-  httpServer.send(403, "application/json",
-    "{\"ok\":false,\"error\":\"only always-allowed commands accepted from Pi\"}");
-}
+  Serial.print("[HTTP CMD] ");
+  Serial.println(command);
 
-// POST /sensor
-// Raspberry Pi forwards sensor data received from the Mega.
-// ESP32 broadcasts it to all connected WebSocket clients (mobile app).
-//
-// Expected body param: data=SENSOR:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20;ALERT=NONE
-void handleSensorHttp() {
-  if (!httpServer.hasArg("data")) {
-    httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"missing data\"}");
-    return;
-  }
+  routeCommand(command);
 
-  String raw = urlDecode(httpServer.arg("data"));
-  raw.trim();
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"mode\":\"" + currentMode + "\",";
+  json += "\"command\":\"" + jsonEscape(command) + "\",";
+  json += "\"note\":\"command_sent_ack_returns_via_raspberry_sensor_bridge\"";
+  json += "}";
 
-  Serial.print("[SENSOR from Pi] "); Serial.println(raw);
-
-  // Build a JSON object from the raw SENSOR: line for the mobile app.
-  lastSensorJson = buildSensorJson(raw);
-
-  // Broadcast to all connected WebSocket clients.
-  webSocket.broadcastTXT(lastSensorJson);
-
-  httpServer.send(200, "application/json", "{\"ok\":true}");
-}
-
-// GET /get_last_sensor
-// Mobile app can poll this if WebSocket is not available.
-void handleGetLastSensor() {
-  httpServer.send(200, "application/json", lastSensorJson);
+  httpServer.send(200, "application/json", json);
 }
 
 
 // =================================================================
-// Sensor JSON builder
-// Converts: SENSOR:PITCH=2.30;ROLL=-1.10;UF=8.50;UR=9.20;ALERT=NONE
-// Into:     {"type":"sensor","pitch":2.30,"roll":-1.10,"uf":8.50,"ur":9.20,"alert":"NONE"}
+// WebSocket handler
 // =================================================================
-String buildSensorJson(const String& raw) {
-  // Strip the "SENSOR:" prefix if present.
-  String s = raw;
-  if (s.startsWith("SENSOR:")) s = s.substring(7);
+void webSocketEvent(uint8_t clientId, WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      IPAddress ip = webSocket.remoteIP(clientId);
 
-  String pitch = "0", roll = "0", uf = "-1", ur = "-1", alert = "NONE";
+      Serial.print("[WS] Connected client=");
+      Serial.print(clientId);
+      Serial.print(" IP=");
+      Serial.println(ip);
 
-  // Parse key=value pairs separated by ';'
-  int start = 0;
-  while (start < (int)s.length()) {
-    int end = s.indexOf(';', start);
-    if (end < 0) end = s.length();
+      String msg = "{";
+      msg += "\"event\":\"connected\",";
+      msg += "\"mode\":\"" + currentMode + "\",";
+      msg += "\"manual_only\":false";
+      msg += "}";
 
-    String pair = s.substring(start, end);
-    int eq = pair.indexOf('=');
-    if (eq > 0) {
-      String key = pair.substring(0, eq);
-      String val = pair.substring(eq + 1);
-      key.toUpperCase();
-      if      (key == "PITCH") pitch = val;
-      else if (key == "ROLL")  roll  = val;
-      else if (key == "UF")    uf    = val;
-      else if (key == "UR")    ur    = val;
-      else if (key == "ALERT") alert = val;
+      webSocket.sendTXT(clientId, msg);
+      webSocket.sendTXT(clientId, lastSensorMessage);
+
+      if (lastBridgeEvent != "NONE") {
+        webSocket.sendTXT(clientId, lastBridgeEvent);
+      }
+
+      break;
     }
 
-    start = end + 1;
-  }
-
-  String json = "{\"type\":\"sensor\"";
-  json += ",\"pitch\":"  + pitch;
-  json += ",\"roll\":"   + roll;
-  json += ",\"uf\":"     + uf;
-  json += ",\"ur\":"     + ur;
-  json += ",\"alert\":\"" + alert + "\"}";
-  return json;
-}
-
-
-// =================================================================
-// WebSocket handler — Mobile App
-// =================================================================
-void webSocketEvent(uint8_t clientId, WStype_t type,
-                    uint8_t* payload, size_t length) {
-  switch (type) {
-
-    case WStype_CONNECTED:
-      Serial.print("[WS] App connected, client="); Serial.println(clientId);
-      // Send current mode and last known sensor data on connect.
-      webSocket.sendTXT(clientId,
-        "{\"event\":\"connected\",\"mode\":\"" + currentMode + "\"}");
-      if (lastSensorJson != "{}") {
-        webSocket.sendTXT(clientId, lastSensorJson);
-      }
-      break;
-
     case WStype_DISCONNECTED:
-      Serial.print("[WS] App disconnected, client="); Serial.println(clientId);
-      // Safety stop when the controlling app disconnects in MANUAL mode.
-      if (currentMode == "MANUAL") {
-        routeCommand("STOP");
-        routeCommand("JACK:ALL:STOP");
-        routeCommand("CAM:STOP");
-      }
+      Serial.print("[WS] Disconnected client=");
+      Serial.println(clientId);
+
+      // Safety stop on disconnect.
+      routeCommand("STOP");
+      routeCommand("JACK:ALL:STOP");
+      routeCommand("CAM:STOP");
+      routeCommand("ARM:BASE:STOP");
+      routeCommand("ARM:STOP");
       break;
 
     case WStype_TEXT: {
       String command = String((char*)payload);
       command.trim();
-      if (command.length() == 0) return;
 
-      Serial.print("[WS from App] "); Serial.println(command);
-
-      // Always-allowed commands bypass mode check.
-      if (isAlwaysAllowed(command)) {
-        routeCommand(command);
+      if (command.length() == 0) {
         return;
       }
 
-      // In AUTO mode only always-allowed commands are accepted from the app.
-      // (AUTO mode is reserved for future use; manual is the only active mode.)
-      if (currentMode == "AUTO") {
-        webSocket.sendTXT(clientId,
-          "{\"ok\":false,\"error\":\"system is AUTO; command blocked\"}");
-        return;
-      }
+      Serial.print("[WS CMD] ");
+      Serial.println(command);
 
-      // MANUAL mode: route command normally.
       routeCommand(command);
       break;
     }
@@ -277,39 +439,53 @@ void webSocketEvent(uint8_t clientId, WStype_t type,
 
 
 // =================================================================
-// Setup & Loop
+// Setup
 // =================================================================
 void setup() {
   Serial.begin(115200);
 
   MegaSerial.begin(9600, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
-  UnoSerial.begin(9600,  SERIAL_8N1, UNO_RX_PIN,  UNO_TX_PIN);
+  UnoSerial.begin(9600, SERIAL_8N1, UNO_RX_PIN, UNO_TX_PIN);
 
   WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
 
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
 
-  httpServer.on("/",                handleRoot);
-  httpServer.on("/get_status",      handleGetStatus);
-  httpServer.on("/command",         handleCommandHttp);
-  httpServer.on("/sensor",          handleSensorHttp);       // NEW: receive from Pi
-  httpServer.on("/get_last_sensor", handleGetLastSensor);    // NEW: poll from app
+  httpServer.on("/", handleRoot);
+  httpServer.on("/get_status", handleGetStatus);
+  httpServer.on("/sensor_update", handleSensorUpdate);
+  httpServer.on("/bridge_event", handleBridgeEvent);
+  httpServer.on("/command", handleCommandHttp);
   httpServer.begin();
 
-  // Boot in MANUAL mode.
+  currentMode = "MANUAL";
   routeCommand("SYS:MODE:MANUAL");
 
   Serial.println("=========================================");
   Serial.println("ESP32 Apex Rover Bridge Ready");
-  Serial.print("SSID  : "); Serial.println(WIFI_SSID);
-  Serial.print("AP IP : "); Serial.println(WiFi.softAPIP());
-  Serial.println("WS    : ws://192.168.4.1:81");
-  Serial.println("HTTP  : http://192.168.4.1");
-  Serial.println("NEW   : POST /sensor  -> broadcast to app");
+  Serial.println("Mode     : MANUAL + AUTO ROUTING ENABLED");
+  Serial.println("ACK path : Mega USB -> Raspberry sensor_bridge -> /bridge_event");
+  Serial.print("SSID     : ");
+  Serial.println(WIFI_SSID);
+  Serial.print("Password : ");
+  Serial.println(WIFI_PASSWORD);
+  Serial.print("AP IP    : ");
+  Serial.println(WiFi.softAPIP());
+  Serial.println("WebSocket: ws://192.168.4.1:81");
+  Serial.println("HTTP     : http://192.168.4.1");
+  Serial.println("Sensor   : http://192.168.4.1/sensor_update");
+  Serial.println("Bridge   : http://192.168.4.1/bridge_event");
+  Serial.println("Command  : http://192.168.4.1/command?cmd=STOP");
+  Serial.println("Blocks   : http://192.168.4.1/command?cmd=BLOCK:TURN:LEFT:90");
+  Serial.println("Auto     : http://192.168.4.1/command?cmd=AUTO:UP_STAIRS");
   Serial.println("=========================================");
 }
 
+
+// =================================================================
+// Loop
+// =================================================================
 void loop() {
   webSocket.loop();
   httpServer.handleClient();

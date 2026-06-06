@@ -1,12 +1,13 @@
+
 #include <Servo.h>
 #include <SoftwareSerial.h>
 #include <avr/pgmspace.h>
 
 // ==================================================
-// Arduino UNO - Apex Rover 6-Axis Arm Controller
+// Arduino UNO - Apex Rover Camera Stand + 6-Axis Arm
 //
-// Camera stand logic has been moved to the ESP32.
-// This sketch handles ARM commands only.
+// IMPORTANT:
+// Camera stand pins are kept the same because it was working.
 //
 // Command path:
 //   Mobile App -> WebSocket -> ESP32 -> UNO D2
@@ -14,6 +15,12 @@
 // ESP32:
 //   ESP32 GPIO4 TX -> UNO D2 SoftwareSerial RX
 //   Common GND between ESP32, UNO, drivers, servo power
+//
+// Camera Stand:
+//   Camera A4988 EN       -> UNO A1
+//   Camera A4988 STEP     -> UNO D12
+//   Camera A4988 DIR      -> UNO A2
+//   Camera Servo Signal   -> UNO A0
 //
 // Arm Base Stepper:
 //   Arm A4988 EN          -> UNO D4
@@ -30,19 +37,43 @@
 // Config commands from mobile:
 //   ARM:CONFIG:STEPPER_STEPS:N
 //   ARM:CONFIG:SERVO_STEP:N
+//   CAM:CONFIG:STEPPER_STEPS:N
+//   CAM:CONFIG:SERVO_STEP:N
 //
-// ARM pose commands:
+// Existing CAM commands kept:
+//   CAM:LEFT
+//   CAM:RIGHT
+//   CAM:STOP
+//   CAM:STEP_LEFT
+//   CAM:STEP_RIGHT
+//   CAM:STEP_LEFT:N
+//   CAM:STEP_RIGHT:N
+//   CAM:UP
+//   CAM:DOWN
+//   CAM:CENTER
+//   CAM:ZERO
+//   CAM:SPEED:N
+//   CAM:ANGLE:N
+//
+// NEW continuous CAM servo commands:
+//   CAM:SERVO:MOVE_UP
+//   CAM:SERVO:MOVE_DOWN
+//   CAM:SERVO:STOP
+//
+// Existing ARM commands kept:
 //   ARM:READY
 //   ARM:HOME
-//   ARM:DROP      -> alias for ARM:DROP_IN
-//   ARM:TAKE_OUT
-//   ARM:DROP_IN
-//   ARM:DROP_OUT
+//   ARM:DROP      -> alias to ARM:DROP_IN
 //   Ready         -> alias for ARM:READY
 //   Drop          -> alias for ARM:DROP_IN
 //   ARM:STOP
 //
-// ARM base stepper commands:
+// NEW arm pose commands:
+//   ARM:TAKE_OUT
+//   ARM:DROP_IN
+//   ARM:DROP_OUT
+//
+// Existing ARM base stepper commands kept:
 //   ARM:BASE:LEFT
 //   ARM:BASE:RIGHT
 //   ARM:BASE:STOP
@@ -58,19 +89,43 @@
 //   ARM:BASE:GOTO_DEG:N
 //   ARM:BASE:GOTO_STEPS:N
 //
-// ARM servo commands (single-step):
-//   ARM:SHOULDER:UP / DOWN / ANGLE:N
-//   ARM:ELBOW:UP / DOWN / ANGLE:N
-//   ARM:WRIST:UP / DOWN / ANGLE:N
-//   ARM:GRIPPER:OPEN / CLOSE / ANGLE:N
-//   ARM:AUX:UP / DOWN / ANGLE:N
+// Existing ARM servo commands kept:
+//   ARM:SHOULDER:UP
+//   ARM:SHOULDER:DOWN
+//   ARM:SHOULDER:ANGLE:N
+//   ARM:ELBOW:UP
+//   ARM:ELBOW:DOWN
+//   ARM:ELBOW:ANGLE:N
+//   ARM:WRIST:UP
+//   ARM:WRIST:DOWN
+//   ARM:WRIST:ANGLE:N
+//   ARM:GRIPPER:OPEN
+//   ARM:GRIPPER:CLOSE
+//   ARM:GRIPPER:ANGLE:N
+//   ARM:AUX:UP
+//   ARM:AUX:DOWN
+//   ARM:AUX:ANGLE:N
 //
-// ARM servo commands (continuous):
-//   ARM:SHOULDER:MOVE_UP / MOVE_DOWN / STOP
-//   ARM:ELBOW:MOVE_UP / MOVE_DOWN / STOP
-//   ARM:WRIST:MOVE_UP / MOVE_DOWN / STOP
-//   ARM:AUX:MOVE_UP / MOVE_DOWN / STOP
-//   ARM:GRIPPER:MOVE_OPEN / MOVE_CLOSE / STOP
+// NEW continuous ARM servo commands:
+//   ARM:SHOULDER:MOVE_UP
+//   ARM:SHOULDER:MOVE_DOWN
+//   ARM:SHOULDER:STOP
+//
+//   ARM:ELBOW:MOVE_UP
+//   ARM:ELBOW:MOVE_DOWN
+//   ARM:ELBOW:STOP
+//
+//   ARM:WRIST:MOVE_UP
+//   ARM:WRIST:MOVE_DOWN
+//   ARM:WRIST:STOP
+//
+//   ARM:AUX:MOVE_UP
+//   ARM:AUX:MOVE_DOWN
+//   ARM:AUX:STOP
+//
+//   ARM:GRIPPER:MOVE_OPEN
+//   ARM:GRIPPER:MOVE_CLOSE
+//   ARM:GRIPPER:STOP
 //
 // Global commands:
 //   STOP
@@ -84,6 +139,15 @@
 // ESP32 -> UNO Serial
 // ==================================================
 SoftwareSerial espSerial(2, 3);
+
+
+// ==================================================
+// Camera Stand Pins - DO NOT CHANGE
+// ==================================================
+#define CAM_EN_PIN       A1
+#define CAM_STEP_PIN     12
+#define CAM_DIR_PIN      A2
+#define CAM_SERVO_PIN    A0
 
 
 // ==================================================
@@ -107,6 +171,8 @@ SoftwareSerial espSerial(2, 3);
 // ==================================================
 // Servo Objects
 // ==================================================
+Servo cameraServo;
+
 Servo shoulderServo;
 Servo elbowServo;
 Servo wristServo;
@@ -125,6 +191,7 @@ const bool DEBUG_SERIAL = false;
 // ==================================================
 const unsigned int STEP_PULSE_MICROS = 3;
 
+const unsigned long CAM_SERVO_DETACH_DELAY_MS = 450;
 const unsigned long HOME_DETACH_DELAY_MS = 1200;
 const unsigned long ARM_HOLD_REFRESH_MS = 35;
 
@@ -137,7 +204,7 @@ const int ARM_POSE_SERVO_STEP_DEG = 2;
 
 
 // ==================================================
-// Continuous Servo Motion Settings
+// NEW Continuous Servo Motion Settings
 // ==================================================
 const unsigned long CONTINUOUS_SERVO_INTERVAL_MS = 35;
 
@@ -156,6 +223,16 @@ const long MAX_STEPPER_STEPS = 50000;
 
 const int MIN_SERVO_STEP = 1;
 const int MAX_SERVO_STEP = 30;
+
+
+// ==================================================
+// Camera Servo Range
+// ==================================================
+const int CAM_SERVO_MIN = 30;
+const int CAM_SERVO_MAX = 150;
+const int CAM_SERVO_CENTER = 90;
+
+const bool INVERT_CAMERA_VERTICAL = true;
 
 
 // ==================================================
@@ -198,7 +275,10 @@ const int HOME_GRIPPER = 180;
 
 
 // ==================================================
-// Arm TAKE_OUT Pose
+// NEW Arm TAKE_OUT Pose
+//
+// For taking an object from outside/source box.
+// Tune these values on the real robot.
 // ==================================================
 const int TAKE_OUT_SHOULDER = 125;
 const int TAKE_OUT_ELBOW = 70;
@@ -208,7 +288,11 @@ const int TAKE_OUT_GRIPPER = 180;
 
 
 // ==================================================
-// Arm DROP_IN Pose
+// NEW Arm DROP_IN Pose
+//
+// Drop into robot basket.
+// This replaces the old ARM:DROP behavior.
+// Tune these values on the real robot.
 // ==================================================
 const int DROP_IN_SHOULDER = 110;
 const int DROP_IN_ELBOW = 55;
@@ -218,7 +302,10 @@ const int DROP_IN_GRIPPER = 120;
 
 
 // ==================================================
-// Arm DROP_OUT Pose
+// NEW Arm DROP_OUT Pose
+//
+// Drop out to destination box.
+// Tune these values on the real robot.
 // ==================================================
 const int DROP_OUT_SHOULDER = 120;
 const int DROP_OUT_ELBOW = 65;
@@ -239,18 +326,18 @@ const int GRIPPER_CLOSE_ANGLE = 180;
 // ==================================================
 const long ARM_BASE_STEPS_PER_DEG = 10;
 
-const long ARM_BASE_ZERO_DEG   = 0;
-const long ARM_BASE_HOME_DEG   = 150;
-const long ARM_BASE_READY_DEG  = 0;
+const long ARM_BASE_ZERO_DEG = 0;
+const long ARM_BASE_HOME_DEG = 150;
+const long ARM_BASE_READY_DEG = 0;
 const long ARM_BASE_TAKE_OUT_DEG = 0;
-const long ARM_BASE_DROP_IN_DEG  = 120;
+const long ARM_BASE_DROP_IN_DEG = 120;
 const long ARM_BASE_DROP_OUT_DEG = 0;
 
-const long ARM_BASE_ZERO_POSITION     = ARM_BASE_ZERO_DEG   * ARM_BASE_STEPS_PER_DEG;
-const long ARM_BASE_HOME_POSITION     = ARM_BASE_HOME_DEG   * ARM_BASE_STEPS_PER_DEG;
-const long ARM_BASE_READY_POSITION    = ARM_BASE_READY_DEG  * ARM_BASE_STEPS_PER_DEG;
+const long ARM_BASE_ZERO_POSITION = ARM_BASE_ZERO_DEG * ARM_BASE_STEPS_PER_DEG;
+const long ARM_BASE_HOME_POSITION = ARM_BASE_HOME_DEG * ARM_BASE_STEPS_PER_DEG;
+const long ARM_BASE_READY_POSITION = ARM_BASE_READY_DEG * ARM_BASE_STEPS_PER_DEG;
 const long ARM_BASE_TAKE_OUT_POSITION = ARM_BASE_TAKE_OUT_DEG * ARM_BASE_STEPS_PER_DEG;
-const long ARM_BASE_DROP_IN_POSITION  = ARM_BASE_DROP_IN_DEG  * ARM_BASE_STEPS_PER_DEG;
+const long ARM_BASE_DROP_IN_POSITION = ARM_BASE_DROP_IN_DEG * ARM_BASE_STEPS_PER_DEG;
 const long ARM_BASE_DROP_OUT_POSITION = ARM_BASE_DROP_OUT_DEG * ARM_BASE_STEPS_PER_DEG;
 
 
@@ -291,6 +378,15 @@ ArmPoseStage armPoseStage = ARM_STAGE_IDLE;
 
 
 // ==================================================
+// Camera Servo State
+// ==================================================
+int cameraServoAngle = CAM_SERVO_CENTER;
+bool cameraServoAttached = false;
+bool pendingCameraDetach = false;
+unsigned long cameraDetachStartMs = 0;
+
+
+// ==================================================
 // Arm Servo State
 // ==================================================
 int shoulderAngle = HOME_SHOULDER;
@@ -312,18 +408,24 @@ unsigned long homeDetachStartMs = 0;
 
 
 // ==================================================
-// Continuous Servo Directions
+// NEW Continuous Servo Directions
 //
-// Shoulder / Elbow / Wrist / Aux:
-//   -1 = MOVE_UP
-//    0 = stop
-//    1 = MOVE_DOWN
+// Direction meanings:
+//   Shoulder / Elbow / Wrist / Aux:
+//     -1 = MOVE_UP behavior
+//      0 = stop
+//      1 = MOVE_DOWN behavior
 //
-// Gripper:
-//   -1 = open
-//    0 = stop
-//    1 = close
+//   Gripper:
+//     -1 = open
+//      0 = stop
+//      1 = close
+//
+//   Camera servo:
+//     direction already accounts for invert.
 // ==================================================
+int cameraServoMoveDir = 0;
+
 int shoulderMoveDir = 0;
 int elbowMoveDir = 0;
 int wristMoveDir = 0;
@@ -344,6 +446,18 @@ int targetAuxAngle = HOME_AUX;
 long targetArmBasePosition = ARM_BASE_HOME_POSITION;
 
 unsigned long lastPoseServoMoveMs = 0;
+
+
+// ==================================================
+// Camera Stepper State
+// ==================================================
+int cameraStepperDirection = 0;
+
+long cameraFiniteStepsRemaining = 0;
+long cameraStepPosition = 0;
+
+unsigned long cameraLastStepTime = 0;
+unsigned long cameraStepIntervalMicros = 700;
 
 
 // ==================================================
@@ -450,7 +564,7 @@ bool startsWithCmdFlash(const char *cmd, PGM_P prefix) {
   return strncmp_P(cmd, prefix, strlen_P(prefix)) == 0;
 }
 
-#define equalsCmd(cmd, literal)    equalsCmdFlash((cmd), PSTR(literal))
+#define equalsCmd(cmd, literal) equalsCmdFlash((cmd), PSTR(literal))
 #define startsWithCmd(cmd, literal) startsWithCmdFlash((cmd), PSTR(literal))
 
 void normalizeCommand(char *cmd) {
@@ -505,6 +619,8 @@ bool isSpecialGripperLastPose() {
 }
 
 void stopContinuousServoMotion() {
+  cameraServoMoveDir = 0;
+
   shoulderMoveDir = 0;
   elbowMoveDir = 0;
   wristMoveDir = 0;
@@ -528,7 +644,8 @@ void requestArmDropOut();
 // Config Command Handler
 // ==================================================
 bool handleConfigCommand(const char *cmd) {
-  if (startsWithCmd(cmd, "ARM:CONFIG:STEPPER_STEPS:")) {
+  if (startsWithCmd(cmd, "ARM:CONFIG:STEPPER_STEPS:") ||
+      startsWithCmd(cmd, "CAM:CONFIG:STEPPER_STEPS:")) {
     long value = parseLastLong(cmd);
     configuredStepperSteps = clampLong(value, MIN_STEPPER_STEPS, MAX_STEPPER_STEPS);
 
@@ -537,7 +654,8 @@ bool handleConfigCommand(const char *cmd) {
     return true;
   }
 
-  if (startsWithCmd(cmd, "ARM:CONFIG:SERVO_STEP:")) {
+  if (startsWithCmd(cmd, "ARM:CONFIG:SERVO_STEP:") ||
+      startsWithCmd(cmd, "CAM:CONFIG:SERVO_STEP:")) {
     long value = parseLastLong(cmd);
     configuredServoStep = (int)clampLong(value, MIN_SERVO_STEP, MAX_SERVO_STEP);
 
@@ -546,7 +664,8 @@ bool handleConfigCommand(const char *cmd) {
     return true;
   }
 
-  if (equalsCmd(cmd, "ARM:CONFIG:RESET")) {
+  if (equalsCmd(cmd, "ARM:CONFIG:RESET") ||
+      equalsCmd(cmd, "CAM:CONFIG:RESET")) {
     configuredStepperSteps = DEFAULT_STEPPER_STEPS;
     configuredServoStep = DEFAULT_SERVO_STEP;
 
@@ -554,7 +673,8 @@ bool handleConfigCommand(const char *cmd) {
     return true;
   }
 
-  if (equalsCmd(cmd, "ARM:CONFIG:STATUS")) {
+  if (equalsCmd(cmd, "ARM:CONFIG:STATUS") ||
+      equalsCmd(cmd, "CAM:CONFIG:STATUS")) {
     Serial.print(F("CONFIG:STEPPER_STEPS="));
     Serial.print(configuredStepperSteps);
     Serial.print(F(";SERVO_STEP="));
@@ -569,6 +689,27 @@ bool handleConfigCommand(const char *cmd) {
 // ==================================================
 // Servo Attach Helpers
 // ==================================================
+void attachCameraServoIfNeeded() {
+  if (!cameraServoAttached) {
+    cameraServo.attach(CAM_SERVO_PIN);
+    cameraServoAttached = true;
+  }
+}
+
+void detachCameraServo() {
+  if (cameraServoAttached) {
+    cameraServo.detach();
+    cameraServoAttached = false;
+  }
+
+  pendingCameraDetach = false;
+}
+
+void scheduleCameraDetach() {
+  pendingCameraDetach = true;
+  cameraDetachStartMs = millis();
+}
+
 void attachShoulderIfNeeded() {
   if (!shoulderAttached) {
     shoulderServo.attach(SHOULDER_PIN);
@@ -645,10 +786,10 @@ void detachArmServos() {
 // ==================================================
 void writeArmServos() {
   shoulderAngle = clampAngle(shoulderAngle, SHOULDER_MIN, SHOULDER_MAX);
-  elbowAngle    = clampAngle(elbowAngle,    ELBOW_MIN,    ELBOW_MAX);
-  wristAngle    = clampAngle(wristAngle,    WRIST_MIN,    WRIST_MAX);
-  gripperAngle  = clampAngle(gripperAngle,  GRIPPER_MIN,  GRIPPER_MAX);
-  auxAngle      = clampAngle(auxAngle,      AUX_MIN,      AUX_MAX);
+  elbowAngle = clampAngle(elbowAngle, ELBOW_MIN, ELBOW_MAX);
+  wristAngle = clampAngle(wristAngle, WRIST_MIN, WRIST_MAX);
+  gripperAngle = clampAngle(gripperAngle, GRIPPER_MIN, GRIPPER_MAX);
+  auxAngle = clampAngle(auxAngle, AUX_MIN, AUX_MAX);
 
   attachArmServosIfNeeded();
 
@@ -681,6 +822,30 @@ void markArmActive() {
 
   pendingHomeDetach = false;
   attachArmServosIfNeeded();
+}
+
+
+// ==================================================
+// Camera Motion Control
+// ==================================================
+void stopCameraMotion() {
+  cameraStepperDirection = 0;
+  cameraFiniteStepsRemaining = 0;
+  cameraServoMoveDir = 0;
+
+  digitalWrite(CAM_STEP_PIN, LOW);
+  disableDriver(CAM_EN_PIN);
+
+  scheduleCameraDetach();
+}
+
+void setCameraAngle(int angle) {
+  cameraServoAngle = clampAngle(angle, CAM_SERVO_MIN, CAM_SERVO_MAX);
+
+  attachCameraServoIfNeeded();
+  cameraServo.write(cameraServoAngle);
+
+  scheduleCameraDetach();
 }
 
 
@@ -778,10 +943,10 @@ void setArmBaseTargetDeg(long deg) {
 // ==================================================
 void setArmPoseTargets(int sh, int el, int wr, int gr, int ax, long basePosition) {
   targetShoulderAngle = clampAngle(sh, SHOULDER_MIN, SHOULDER_MAX);
-  targetElbowAngle    = clampAngle(el, ELBOW_MIN,    ELBOW_MAX);
-  targetWristAngle    = clampAngle(wr, WRIST_MIN,    WRIST_MAX);
-  targetGripperAngle  = clampAngle(gr, GRIPPER_MIN,  GRIPPER_MAX);
-  targetAuxAngle      = clampAngle(ax, AUX_MIN,      AUX_MAX);
+  targetElbowAngle = clampAngle(el, ELBOW_MIN, ELBOW_MAX);
+  targetWristAngle = clampAngle(wr, WRIST_MIN, WRIST_MAX);
+  targetGripperAngle = clampAngle(gr, GRIPPER_MIN, GRIPPER_MAX);
+  targetAuxAngle = clampAngle(ax, AUX_MIN, AUX_MAX);
   targetArmBasePosition = basePosition;
 }
 
@@ -816,6 +981,8 @@ void beginArmPoseSequence(ArmPoseState movingState) {
 }
 
 void requestArmHome() {
+  stopCameraMotion();
+
   setArmPoseTargets(HOME_SHOULDER,
                     HOME_ELBOW,
                     HOME_WRIST,
@@ -827,6 +994,8 @@ void requestArmHome() {
 }
 
 void requestArmReady() {
+  stopCameraMotion();
+
   setArmPoseTargets(READY_SHOULDER,
                     READY_ELBOW,
                     READY_WRIST,
@@ -838,6 +1007,8 @@ void requestArmReady() {
 }
 
 void requestArmTakeOut() {
+  stopCameraMotion();
+
   setArmPoseTargets(TAKE_OUT_SHOULDER,
                     TAKE_OUT_ELBOW,
                     TAKE_OUT_WRIST,
@@ -849,6 +1020,8 @@ void requestArmTakeOut() {
 }
 
 void requestArmDropIn() {
+  stopCameraMotion();
+
   setArmPoseTargets(DROP_IN_SHOULDER,
                     DROP_IN_ELBOW,
                     DROP_IN_WRIST,
@@ -860,6 +1033,8 @@ void requestArmDropIn() {
 }
 
 void requestArmDropOut() {
+  stopCameraMotion();
+
   setArmPoseTargets(DROP_OUT_SHOULDER,
                     DROP_OUT_ELBOW,
                     DROP_OUT_WRIST,
@@ -891,7 +1066,7 @@ void stopAllArmMotion() {
 // ==================================================
 bool moveAngleTowardTarget(int &currentAngle, int targetAngle, int minAngle, int maxAngle) {
   currentAngle = clampAngle(currentAngle, minAngle, maxAngle);
-  targetAngle  = clampAngle(targetAngle,  minAngle, maxAngle);
+  targetAngle = clampAngle(targetAngle, minAngle, maxAngle);
 
   if (currentAngle == targetAngle) {
     return true;
@@ -1098,6 +1273,22 @@ void handleHomeDetach() {
   }
 }
 
+void handleCameraDetach() {
+  if (!pendingCameraDetach) {
+    return;
+  }
+
+  if (cameraServoMoveDir != 0) {
+    return;
+  }
+
+  if (millis() - cameraDetachStartMs < CAM_SERVO_DETACH_DELAY_MS) {
+    return;
+  }
+
+  detachCameraServo();
+}
+
 
 // ==================================================
 // Arm Servo Setters
@@ -1134,14 +1325,15 @@ void setAuxAngle(int angle) {
 
 
 // ==================================================
-// Continuous Servo Runner
+// NEW Continuous Servo Runner
 // ==================================================
 void runContinuousServos() {
-  if (shoulderMoveDir == 0 &&
-      elbowMoveDir    == 0 &&
-      wristMoveDir    == 0 &&
-      auxMoveDir      == 0 &&
-      gripperMoveDir  == 0) {
+  if (cameraServoMoveDir == 0 &&
+      shoulderMoveDir == 0 &&
+      elbowMoveDir == 0 &&
+      wristMoveDir == 0 &&
+      auxMoveDir == 0 &&
+      gripperMoveDir == 0) {
     return;
   }
 
@@ -1153,36 +1345,193 @@ void runContinuousServos() {
 
   lastContinuousServoMoveMs = now;
 
-  int stepSize = clampAngle(configuredServoStep, MIN_SERVO_STEP, MAX_SERVO_STEP);
+  int stepSize = configuredServoStep;
+  stepSize = clampAngle(stepSize, MIN_SERVO_STEP, MAX_SERVO_STEP);
+
+  if (cameraServoMoveDir != 0) {
+    int nextAngle = cameraServoAngle + (cameraServoMoveDir * stepSize);
+    nextAngle = clampAngle(nextAngle, CAM_SERVO_MIN, CAM_SERVO_MAX);
+
+    setCameraAngle(nextAngle);
+
+    if (nextAngle == CAM_SERVO_MIN || nextAngle == CAM_SERVO_MAX) {
+      cameraServoMoveDir = 0;
+      scheduleCameraDetach();
+    }
+  }
 
   if (shoulderMoveDir != 0) {
-    int nextAngle = clampAngle(shoulderAngle + (shoulderMoveDir * stepSize), SHOULDER_MIN, SHOULDER_MAX);
+    int nextAngle = shoulderAngle + (shoulderMoveDir * stepSize);
+    nextAngle = clampAngle(nextAngle, SHOULDER_MIN, SHOULDER_MAX);
+
     setShoulderAngle(nextAngle);
-    if (nextAngle == SHOULDER_MIN || nextAngle == SHOULDER_MAX) shoulderMoveDir = 0;
+
+    if (nextAngle == SHOULDER_MIN || nextAngle == SHOULDER_MAX) {
+      shoulderMoveDir = 0;
+    }
   }
 
   if (elbowMoveDir != 0) {
-    int nextAngle = clampAngle(elbowAngle + (elbowMoveDir * stepSize), ELBOW_MIN, ELBOW_MAX);
+    int nextAngle = elbowAngle + (elbowMoveDir * stepSize);
+    nextAngle = clampAngle(nextAngle, ELBOW_MIN, ELBOW_MAX);
+
     setElbowAngle(nextAngle);
-    if (nextAngle == ELBOW_MIN || nextAngle == ELBOW_MAX) elbowMoveDir = 0;
+
+    if (nextAngle == ELBOW_MIN || nextAngle == ELBOW_MAX) {
+      elbowMoveDir = 0;
+    }
   }
 
   if (wristMoveDir != 0) {
-    int nextAngle = clampAngle(wristAngle + (wristMoveDir * stepSize), WRIST_MIN, WRIST_MAX);
+    int nextAngle = wristAngle + (wristMoveDir * stepSize);
+    nextAngle = clampAngle(nextAngle, WRIST_MIN, WRIST_MAX);
+
     setWristAngle(nextAngle);
-    if (nextAngle == WRIST_MIN || nextAngle == WRIST_MAX) wristMoveDir = 0;
+
+    if (nextAngle == WRIST_MIN || nextAngle == WRIST_MAX) {
+      wristMoveDir = 0;
+    }
   }
 
   if (auxMoveDir != 0) {
-    int nextAngle = clampAngle(auxAngle + (auxMoveDir * stepSize), AUX_MIN, AUX_MAX);
+    int nextAngle = auxAngle + (auxMoveDir * stepSize);
+    nextAngle = clampAngle(nextAngle, AUX_MIN, AUX_MAX);
+
     setAuxAngle(nextAngle);
-    if (nextAngle == AUX_MIN || nextAngle == AUX_MAX) auxMoveDir = 0;
+
+    if (nextAngle == AUX_MIN || nextAngle == AUX_MAX) {
+      auxMoveDir = 0;
+    }
   }
 
   if (gripperMoveDir != 0) {
-    int nextAngle = clampAngle(gripperAngle + (gripperMoveDir * stepSize), GRIPPER_MIN, GRIPPER_MAX);
+    int nextAngle = gripperAngle + (gripperMoveDir * stepSize);
+    nextAngle = clampAngle(nextAngle, GRIPPER_MIN, GRIPPER_MAX);
+
     setGripperAngle(nextAngle);
-    if (nextAngle == GRIPPER_MIN || nextAngle == GRIPPER_MAX) gripperMoveDir = 0;
+
+    if (nextAngle == GRIPPER_MIN || nextAngle == GRIPPER_MAX) {
+      gripperMoveDir = 0;
+    }
+  }
+}
+
+
+// ==================================================
+// Camera Command Handler
+// ==================================================
+void handleCameraCommand(const char *cmd) {
+  if (handleConfigCommand(cmd)) {
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:STOP")) {
+    stopCameraMotion();
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:SERVO:STOP")) {
+    cameraServoMoveDir = 0;
+    scheduleCameraDetach();
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:SERVO:MOVE_UP")) {
+    cameraServoMoveDir = INVERT_CAMERA_VERTICAL ? -1 : 1;
+    attachCameraServoIfNeeded();
+    pendingCameraDetach = false;
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:SERVO:MOVE_DOWN")) {
+    cameraServoMoveDir = INVERT_CAMERA_VERTICAL ? 1 : -1;
+    attachCameraServoIfNeeded();
+    pendingCameraDetach = false;
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:CENTER")) {
+    stopCameraMotion();
+    setCameraAngle(CAM_SERVO_CENTER);
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:LEFT")) {
+    cameraFiniteStepsRemaining = 0;
+    cameraStepperDirection = -1;
+
+    digitalWrite(CAM_DIR_PIN, LOW);
+    enableDriver(CAM_EN_PIN);
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:RIGHT")) {
+    cameraFiniteStepsRemaining = 0;
+    cameraStepperDirection = 1;
+
+    digitalWrite(CAM_DIR_PIN, HIGH);
+    enableDriver(CAM_EN_PIN);
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:STEP_LEFT") || startsWithCmd(cmd, "CAM:STEP_LEFT:")) {
+    cameraFiniteStepsRemaining = parseStepsOrDefault(cmd);
+    cameraStepperDirection = -1;
+
+    digitalWrite(CAM_DIR_PIN, LOW);
+    enableDriver(CAM_EN_PIN);
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:STEP_RIGHT") || startsWithCmd(cmd, "CAM:STEP_RIGHT:")) {
+    cameraFiniteStepsRemaining = parseStepsOrDefault(cmd);
+    cameraStepperDirection = 1;
+
+    digitalWrite(CAM_DIR_PIN, HIGH);
+    enableDriver(CAM_EN_PIN);
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:UP")) {
+    int delta = INVERT_CAMERA_VERTICAL ? -configuredServoStep : configuredServoStep;
+    setCameraAngle(cameraServoAngle + delta);
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:DOWN")) {
+    int delta = INVERT_CAMERA_VERTICAL ? configuredServoStep : -configuredServoStep;
+    setCameraAngle(cameraServoAngle + delta);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "CAM:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    int delta = INVERT_CAMERA_VERTICAL ? -step : step;
+    setCameraAngle(cameraServoAngle + delta);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "CAM:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    int delta = INVERT_CAMERA_VERTICAL ? step : -step;
+    setCameraAngle(cameraServoAngle + delta);
+    return;
+  }
+
+  if (equalsCmd(cmd, "CAM:ZERO")) {
+    cameraStepPosition = 0;
+    return;
+  }
+
+  if (startsWithCmd(cmd, "CAM:SPEED:")) {
+    long interval = parsePositiveSteps(cmd);
+    cameraStepIntervalMicros = constrain(interval, 300, 5000);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "CAM:ANGLE:")) {
+    setCameraAngle((int)parseLastLong(cmd));
+    return;
   }
 }
 
@@ -1225,15 +1574,13 @@ void handleArmCommand(const char *cmd) {
     return;
   }
 
-  // --------------------------------------------------
-  // Arm base stepper
-  // --------------------------------------------------
-
   if (equalsCmd(cmd, "ARM:BASE:LEFT")) {
     markArmActive();
+
     armBaseTargetMode = false;
     armBaseFiniteStepsRemaining = 0;
     armBaseStepperDirection = -1;
+
     digitalWrite(ARM_DIR_PIN, LOW);
     enableDriver(ARM_EN_PIN);
     return;
@@ -1241,9 +1588,11 @@ void handleArmCommand(const char *cmd) {
 
   if (equalsCmd(cmd, "ARM:BASE:RIGHT")) {
     markArmActive();
+
     armBaseTargetMode = false;
     armBaseFiniteStepsRemaining = 0;
     armBaseStepperDirection = 1;
+
     digitalWrite(ARM_DIR_PIN, HIGH);
     enableDriver(ARM_EN_PIN);
     return;
@@ -1251,18 +1600,22 @@ void handleArmCommand(const char *cmd) {
 
   if (equalsCmd(cmd, "ARM:BASE:STOP")) {
     stopArmBaseMotion();
+
     if (armPoseState != ARM_POSE_HOME) {
       writeArmServos();
     }
+
     return;
   }
 
   if (equalsCmd(cmd, "ARM:BASE:STEP_LEFT") ||
       startsWithCmd(cmd, "ARM:BASE:STEP_LEFT:")) {
     markArmActive();
+
     armBaseTargetMode = false;
     armBaseFiniteStepsRemaining = parseStepsOrDefault(cmd);
     armBaseStepperDirection = -1;
+
     digitalWrite(ARM_DIR_PIN, LOW);
     enableDriver(ARM_EN_PIN);
     return;
@@ -1271,9 +1624,11 @@ void handleArmCommand(const char *cmd) {
   if (equalsCmd(cmd, "ARM:BASE:STEP_RIGHT") ||
       startsWithCmd(cmd, "ARM:BASE:STEP_RIGHT:")) {
     markArmActive();
+
     armBaseTargetMode = false;
     armBaseFiniteStepsRemaining = parseStepsOrDefault(cmd);
     armBaseStepperDirection = 1;
+
     digitalWrite(ARM_DIR_PIN, HIGH);
     enableDriver(ARM_EN_PIN);
     return;
@@ -1319,61 +1674,221 @@ void handleArmCommand(const char *cmd) {
     return;
   }
 
-  // --------------------------------------------------
-  // Continuous servo commands
-  // --------------------------------------------------
+  // ==================================================
+  // NEW Continuous servo commands
+  // ==================================================
 
-  if (equalsCmd(cmd, "ARM:SHOULDER:MOVE_UP")) { markArmActive(); shoulderMoveDir = -1; return; }
-  if (equalsCmd(cmd, "ARM:SHOULDER:MOVE_DOWN")) { markArmActive(); shoulderMoveDir = 1; return; }
-  if (equalsCmd(cmd, "ARM:SHOULDER:STOP")) { shoulderMoveDir = 0; return; }
+  if (equalsCmd(cmd, "ARM:SHOULDER:MOVE_UP")) {
+    markArmActive();
+    shoulderMoveDir = -1;
+    return;
+  }
 
-  if (equalsCmd(cmd, "ARM:ELBOW:MOVE_UP")) { markArmActive(); elbowMoveDir = -1; return; }
-  if (equalsCmd(cmd, "ARM:ELBOW:MOVE_DOWN")) { markArmActive(); elbowMoveDir = 1; return; }
-  if (equalsCmd(cmd, "ARM:ELBOW:STOP")) { elbowMoveDir = 0; return; }
+  if (equalsCmd(cmd, "ARM:SHOULDER:MOVE_DOWN")) {
+    markArmActive();
+    shoulderMoveDir = 1;
+    return;
+  }
 
-  if (equalsCmd(cmd, "ARM:WRIST:MOVE_UP")) { markArmActive(); wristMoveDir = -1; return; }
-  if (equalsCmd(cmd, "ARM:WRIST:MOVE_DOWN")) { markArmActive(); wristMoveDir = 1; return; }
-  if (equalsCmd(cmd, "ARM:WRIST:STOP")) { wristMoveDir = 0; return; }
+  if (equalsCmd(cmd, "ARM:SHOULDER:STOP")) {
+    shoulderMoveDir = 0;
+    return;
+  }
 
-  if (equalsCmd(cmd, "ARM:AUX:MOVE_UP")) { markArmActive(); auxMoveDir = -1; return; }
-  if (equalsCmd(cmd, "ARM:AUX:MOVE_DOWN")) { markArmActive(); auxMoveDir = 1; return; }
-  if (equalsCmd(cmd, "ARM:AUX:STOP")) { auxMoveDir = 0; return; }
+  if (equalsCmd(cmd, "ARM:ELBOW:MOVE_UP")) {
+    markArmActive();
+    elbowMoveDir = -1;
+    return;
+  }
 
-  if (equalsCmd(cmd, "ARM:GRIPPER:MOVE_OPEN")) { markArmActive(); gripperMoveDir = -1; return; }
-  if (equalsCmd(cmd, "ARM:GRIPPER:MOVE_CLOSE")) { markArmActive(); gripperMoveDir = 1; return; }
-  if (equalsCmd(cmd, "ARM:GRIPPER:STOP")) { gripperMoveDir = 0; return; }
+  if (equalsCmd(cmd, "ARM:ELBOW:MOVE_DOWN")) {
+    markArmActive();
+    elbowMoveDir = 1;
+    return;
+  }
 
-  // --------------------------------------------------
-  // Single-step servo commands
-  // --------------------------------------------------
+  if (equalsCmd(cmd, "ARM:ELBOW:STOP")) {
+    elbowMoveDir = 0;
+    return;
+  }
 
-  if (equalsCmd(cmd, "ARM:SHOULDER:UP")) { setShoulderAngle(shoulderAngle - configuredServoStep); return; }
-  if (equalsCmd(cmd, "ARM:SHOULDER:DOWN")) { setShoulderAngle(shoulderAngle + configuredServoStep); return; }
-  if (startsWithCmd(cmd, "ARM:SHOULDER:UP:")) { setShoulderAngle(shoulderAngle - parseServoStepOrDefault(cmd)); return; }
-  if (startsWithCmd(cmd, "ARM:SHOULDER:DOWN:")) { setShoulderAngle(shoulderAngle + parseServoStepOrDefault(cmd)); return; }
-  if (startsWithCmd(cmd, "ARM:SHOULDER:ANGLE:")) { setShoulderAngle((int)parseLastLong(cmd)); return; }
+  if (equalsCmd(cmd, "ARM:WRIST:MOVE_UP")) {
+    markArmActive();
+    wristMoveDir = -1;
+    return;
+  }
 
-  if (equalsCmd(cmd, "ARM:ELBOW:UP")) { setElbowAngle(elbowAngle - configuredServoStep); return; }
-  if (equalsCmd(cmd, "ARM:ELBOW:DOWN")) { setElbowAngle(elbowAngle + configuredServoStep); return; }
-  if (startsWithCmd(cmd, "ARM:ELBOW:UP:")) { setElbowAngle(elbowAngle - parseServoStepOrDefault(cmd)); return; }
-  if (startsWithCmd(cmd, "ARM:ELBOW:DOWN:")) { setElbowAngle(elbowAngle + parseServoStepOrDefault(cmd)); return; }
-  if (startsWithCmd(cmd, "ARM:ELBOW:ANGLE:")) { setElbowAngle((int)parseLastLong(cmd)); return; }
+  if (equalsCmd(cmd, "ARM:WRIST:MOVE_DOWN")) {
+    markArmActive();
+    wristMoveDir = 1;
+    return;
+  }
 
-  if (equalsCmd(cmd, "ARM:WRIST:UP")) { setWristAngle(wristAngle - configuredServoStep); return; }
-  if (equalsCmd(cmd, "ARM:WRIST:DOWN")) { setWristAngle(wristAngle + configuredServoStep); return; }
-  if (startsWithCmd(cmd, "ARM:WRIST:UP:")) { setWristAngle(wristAngle - parseServoStepOrDefault(cmd)); return; }
-  if (startsWithCmd(cmd, "ARM:WRIST:DOWN:")) { setWristAngle(wristAngle + parseServoStepOrDefault(cmd)); return; }
-  if (startsWithCmd(cmd, "ARM:WRIST:ANGLE:")) { setWristAngle((int)parseLastLong(cmd)); return; }
+  if (equalsCmd(cmd, "ARM:WRIST:STOP")) {
+    wristMoveDir = 0;
+    return;
+  }
 
-  if (equalsCmd(cmd, "ARM:GRIPPER:OPEN")) { setGripperAngle(GRIPPER_OPEN_ANGLE); return; }
-  if (equalsCmd(cmd, "ARM:GRIPPER:CLOSE")) { setGripperAngle(GRIPPER_CLOSE_ANGLE); return; }
-  if (startsWithCmd(cmd, "ARM:GRIPPER:ANGLE:")) { setGripperAngle((int)parseLastLong(cmd)); return; }
+  if (equalsCmd(cmd, "ARM:AUX:MOVE_UP")) {
+    markArmActive();
+    auxMoveDir = -1;
+    return;
+  }
 
-  if (equalsCmd(cmd, "ARM:AUX:UP")) { setAuxAngle(auxAngle - configuredServoStep); return; }
-  if (equalsCmd(cmd, "ARM:AUX:DOWN")) { setAuxAngle(auxAngle + configuredServoStep); return; }
-  if (startsWithCmd(cmd, "ARM:AUX:UP:")) { setAuxAngle(auxAngle - parseServoStepOrDefault(cmd)); return; }
-  if (startsWithCmd(cmd, "ARM:AUX:DOWN:")) { setAuxAngle(auxAngle + parseServoStepOrDefault(cmd)); return; }
-  if (startsWithCmd(cmd, "ARM:AUX:ANGLE:")) { setAuxAngle((int)parseLastLong(cmd)); return; }
+  if (equalsCmd(cmd, "ARM:AUX:MOVE_DOWN")) {
+    markArmActive();
+    auxMoveDir = 1;
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:AUX:STOP")) {
+    auxMoveDir = 0;
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:GRIPPER:MOVE_OPEN")) {
+    markArmActive();
+    gripperMoveDir = -1;
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:GRIPPER:MOVE_CLOSE")) {
+    markArmActive();
+    gripperMoveDir = 1;
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:GRIPPER:STOP")) {
+    gripperMoveDir = 0;
+    return;
+  }
+
+  // ==================================================
+  // Existing single-step commands are kept
+  // ==================================================
+
+  if (equalsCmd(cmd, "ARM:SHOULDER:UP")) {
+    setShoulderAngle(shoulderAngle - configuredServoStep);
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:SHOULDER:DOWN")) {
+    setShoulderAngle(shoulderAngle + configuredServoStep);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:SHOULDER:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setShoulderAngle(shoulderAngle - step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:SHOULDER:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setShoulderAngle(shoulderAngle + step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:SHOULDER:ANGLE:")) {
+    setShoulderAngle((int)parseLastLong(cmd));
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:ELBOW:UP")) {
+    setElbowAngle(elbowAngle - configuredServoStep);
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:ELBOW:DOWN")) {
+    setElbowAngle(elbowAngle + configuredServoStep);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:ELBOW:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setElbowAngle(elbowAngle - step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:ELBOW:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setElbowAngle(elbowAngle + step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:ELBOW:ANGLE:")) {
+    setElbowAngle((int)parseLastLong(cmd));
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:WRIST:UP")) {
+    setWristAngle(wristAngle - configuredServoStep);
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:WRIST:DOWN")) {
+    setWristAngle(wristAngle + configuredServoStep);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:WRIST:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setWristAngle(wristAngle - step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:WRIST:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setWristAngle(wristAngle + step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:WRIST:ANGLE:")) {
+    setWristAngle((int)parseLastLong(cmd));
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:GRIPPER:OPEN")) {
+    setGripperAngle(GRIPPER_OPEN_ANGLE);
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:GRIPPER:CLOSE")) {
+    setGripperAngle(GRIPPER_CLOSE_ANGLE);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:GRIPPER:ANGLE:")) {
+    setGripperAngle((int)parseLastLong(cmd));
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:AUX:UP")) {
+    setAuxAngle(auxAngle - configuredServoStep);
+    return;
+  }
+
+  if (equalsCmd(cmd, "ARM:AUX:DOWN")) {
+    setAuxAngle(auxAngle + configuredServoStep);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:AUX:UP:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setAuxAngle(auxAngle - step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:AUX:DOWN:")) {
+    int step = parseServoStepOrDefault(cmd);
+    setAuxAngle(auxAngle + step);
+    return;
+  }
+
+  if (startsWithCmd(cmd, "ARM:AUX:ANGLE:")) {
+    setAuxAngle((int)parseLastLong(cmd));
+    return;
+  }
 }
 
 
@@ -1382,18 +1897,21 @@ void handleArmCommand(const char *cmd) {
 // ==================================================
 void handleSystemCommand(const char *cmd) {
   if (equalsCmd(cmd, "STOP") || equalsCmd(cmd, "ESTOP")) {
+    stopCameraMotion();
     stopAllArmMotion();
     return;
   }
 
   if (equalsCmd(cmd, "SYS:MODE:MANUAL")) {
     systemMode = MODE_MANUAL;
+    stopCameraMotion();
     stopAllArmMotion();
     return;
   }
 
   if (equalsCmd(cmd, "SYS:MODE:AUTO")) {
     systemMode = MODE_AUTO;
+    stopCameraMotion();
     stopAllArmMotion();
     return;
   }
@@ -1411,6 +1929,11 @@ void handleCommand(const char *cmd) {
 
   if (equalsCmd(cmd, "DROP")) {
     requestArmDropIn();
+    return;
+  }
+
+  if (startsWithCmd(cmd, "CAM:")) {
+    handleCameraCommand(cmd);
     return;
   }
 
@@ -1471,6 +1994,38 @@ void readSerialStream(Stream &port, char *buffer, byte &index, unsigned long &la
 
 
 // ==================================================
+// Camera Stepper Runner - Non Blocking
+// ==================================================
+void runCameraStepper() {
+  if (cameraStepperDirection == 0) {
+    return;
+  }
+
+  unsigned long now = micros();
+
+  if (now - cameraLastStepTime < cameraStepIntervalMicros) {
+    return;
+  }
+
+  cameraLastStepTime = now;
+
+  digitalWrite(CAM_STEP_PIN, HIGH);
+  delayMicroseconds(STEP_PULSE_MICROS);
+  digitalWrite(CAM_STEP_PIN, LOW);
+
+  cameraStepPosition += cameraStepperDirection;
+
+  if (cameraFiniteStepsRemaining > 0) {
+    cameraFiniteStepsRemaining--;
+
+    if (cameraFiniteStepsRemaining == 0) {
+      stopCameraMotion();
+    }
+  }
+}
+
+
+// ==================================================
 // Arm Base Stepper Runner - Non Blocking
 // ==================================================
 void runArmBaseStepper() {
@@ -1523,13 +2078,23 @@ void setup() {
   Serial.begin(9600);
   espSerial.begin(9600);
 
+  pinMode(CAM_EN_PIN, OUTPUT);
+  pinMode(CAM_STEP_PIN, OUTPUT);
+  pinMode(CAM_DIR_PIN, OUTPUT);
+
   pinMode(ARM_EN_PIN, OUTPUT);
   pinMode(ARM_STEP_PIN, OUTPUT);
   pinMode(ARM_DIR_PIN, OUTPUT);
 
+  digitalWrite(CAM_STEP_PIN, LOW);
+  digitalWrite(CAM_DIR_PIN, LOW);
+  disableDriver(CAM_EN_PIN);
+
   digitalWrite(ARM_STEP_PIN, LOW);
   digitalWrite(ARM_DIR_PIN, LOW);
   disableDriver(ARM_EN_PIN);
+
+  setCameraAngle(CAM_SERVO_CENTER);
 
   armBaseStepPosition = ARM_BASE_HOME_POSITION;
   requestArmReady();
@@ -1552,6 +2117,7 @@ void loop() {
   readSerialStream(espSerial, espCmdBuffer, espCmdIndex, espLastCmdByteMs);
   readSerialStream(Serial, usbCmdBuffer, usbCmdIndex, usbLastCmdByteMs);
 
+  runCameraStepper();
   runArmBaseStepper();
 
   runArmPoseSequence();
@@ -1559,4 +2125,5 @@ void loop() {
 
   refreshArmHold();
   handleHomeDetach();
+  handleCameraDetach();
 }
