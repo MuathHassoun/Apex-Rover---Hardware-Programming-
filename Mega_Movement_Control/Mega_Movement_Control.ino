@@ -1,55 +1,35 @@
-
 #include <Wire.h>
 #include <math.h>
 
 // ==================================================
 // Arduino Mega - Apex Rover Motors + Jacks + Sensors
 //
-// Manual path:
-//   Mobile App -> ESP32 -> Mega / UNO
-//
-// Auto path:
-//   Raspberry Auto Brain -> ESP32 -> Mega / UNO
-//
 // Mega responsibilities:
-//   1. Receive movement/jack commands from ESP32 on Serial1.
-//   2. Drive motors and front/rear linear actuators.
-//   3. Read MPU6500 fast.
-//   4. Read ultrasonic values for display only.
-//   5. Send SENSOR lines to Raspberry Pi over USB Serial.
-//   6. Execute LEGO-style movement blocks:
-//
-//        AUTO:UP_STAIRS
-//        AUTO:DOWN_STAIRS        placeholder now
-//        BLOCK:TURN:LEFT:90
-//        BLOCK:TURN:RIGHT:90
-//        BLOCK:GO:FORWARD:20
-//        BLOCK:GO:BACKWARD:20
-//        BLOCK:JACK:REAR:EXTEND:4
-//        BLOCK:JACK:REAR:RETRACT:4
-//        BLOCK:JACK:FRONT:EXTEND:4
-//        BLOCK:JACK:FRONT:RETRACT:4
-//        BLOCK:STOP
+// 1. Movement motors
+// 2. Front / rear jacks
+// 3. MPU6500 pitch/roll/yaw
+// 4. Ultrasonic display only
+// 5. SENSOR messages to Raspberry over USB Serial
+// 6. LEGO movement blocks:
+//    AUTO:UP_STAIRS
+//    AUTO:DOWN_STAIRS
+//    BLOCK:TURN:LEFT:90
+//    BLOCK:TURN:RIGHT:90
+//    BLOCK:GO:FORWARD:20
+//    BLOCK:GO:BACKWARD:20
+//    BLOCK:JACK:REAR:EXTEND:4
+//    BLOCK:JACK:REAR:RETRACT:4
+//    BLOCK:JACK:FRONT:EXTEND:4
+//    BLOCK:JACK:FRONT:RETRACT:4
+//    BLOCK:STOP
 //
 // IMPORTANT:
-//   Ultrasonic values are READ and SENT for mobile display.
-//   Ultrasonic values have ZERO effect on AUTO decisions.
-//   - No front obstacle stop.
-//   - No rear obstacle stop.
-//   - GO blocks will NOT stop because of ultrasonic.
-//   - UP_STAIRS will NOT stop because of ultrasonic.
-//   - ALERT is tilt-only.
-//
-// Sensor reporting:
-//   MANUAL mode: 1 report every 5 seconds.
-//   AUTO mode:   2 reports every second.
-//   ALERT:       urgent report for tilt only.
-//
-// Important safety note:
-//   - The GO distance and JACK amount are time-based estimates for now.
-//   - Real cm control requires encoders, jack position sensor, or limit switches.
-//   - TURN uses MPU gyro yaw integration, so robot must be still during startup
-//     for gyro calibration.
+// - Ultrasonic values are sent for display only.
+// - Ultrasonic values do NOT stop auto mode.
+// - Mobile STOP / BLOCK:STOP / AUTO:STOP still works.
+// - UP_STAIRS speed = 40.
+// - Emergency stop is relaxed, not fully removed.
+//   Only very dangerous tilt stops the robot.
 // ==================================================
 
 
@@ -64,7 +44,7 @@
 
 // ==================================================
 // ULTRASONIC PINS
-// Values are used for display only.
+// Display only
 // ==================================================
 #define FRONT_US_TRIG A8
 #define FRONT_US_ECHO A9
@@ -102,8 +82,6 @@ unsigned long lastMPUIntegrationMicros = 0;
 
 // ==================================================
 // JACK PINS (L298N)
-// Rear Jack:  IN1=A0 IN2=A1
-// Front Jack: IN3=A3 IN4=A4
 // ==================================================
 #define REAR_JACK_IN1  A0
 #define REAR_JACK_IN2  A1
@@ -141,71 +119,61 @@ unsigned long lastMPURead        = 0;
 
 // ==================================================
 // TIMED MOVEMENT PULSE SUPPORT
-//
-// Supported commands from ESP32:
-//   PULSE:FORWARD:560
-//   PULSE:BACKWARD:300
-//   PULSE:LEFT:180
-//   PULSE:RIGHT:180
-//
-// Mega automatically stops motors when pulse time ends.
 // ==================================================
 bool timedMoveActive = false;
 unsigned long timedMoveEndAt = 0;
 
 
 // ==================================================
-// ALERT THRESHOLDS
-//
-// Ultrasonic obstacle thresholds are NOT used.
-// Tilt safety remains active.
+// HARD SAFETY THRESHOLDS
+// Relaxed for testing, but not fully removed.
 // ==================================================
-const float PITCH_DANGER_DEG  = 30.0;
-const float ROLL_DANGER_DEG   = 25.0;
+const float PITCH_DANGER_DEG  = 40.0;
+const float ROLL_DANGER_DEG   = 38.0;
 
 
 // ==================================================
 // LEGO BLOCK SETTINGS
 // ==================================================
-
-// BLOCK:GO:FORWARD:20
-// The 20 is an estimated unit, not real cm unless encoders are added.
 const unsigned long GO_MS_PER_UNIT = 80;
 const unsigned long GO_MIN_MS = 150;
 const unsigned long GO_MAX_MS = 9000;
 
-// BLOCK:JACK:REAR:EXTEND:4
-// The 4 is an estimated time unit, not real cm.
 const unsigned long JACK_MS_PER_UNIT = 500;
 const unsigned long JACK_MIN_MS = 200;
 const unsigned long JACK_MAX_MS = 9000;
 
-// TURN uses gyro yaw integration.
 const int TURN_SPEED_PERCENT = 35;
 const float TURN_TOLERANCE_DEG = 4.0;
 const unsigned long TURN_MIN_TIMEOUT_MS = 2500;
 const unsigned long TURN_MS_PER_DEG = 45;
 const unsigned long TURN_MAX_TIMEOUT_MS = 25000;
 
-// UP STAIRS state machine.
-const int UP_STAIRS_SPEED_PERCENT = 30;
-const unsigned long UP_STAIRS_MAX_TOTAL_MS = 120000;
 
-const float UP_PITCH_CLIMB_START_DEG = 7.0;
+// ==================================================
+// UP STAIRS SETTINGS
+// ==================================================
+const int UP_STAIRS_SPEED_PERCENT = 40;
+const unsigned long UP_STAIRS_MAX_TOTAL_MS = 180000;
+
+const float UP_PITCH_CLIMB_START_DEG = 6.0;
 const float UP_PITCH_FLAT_TOP_DEG = 5.0;
-const float UP_ROLL_SAFE_DEG = 18.0;
 
-const unsigned long UP_FLAT_CONFIRM_MS = 1800;
-const unsigned long UP_TOP_FORWARD_MS = 1200;
+// Warning only, not stop
+const float UP_ROLL_SAFE_DEG = 28.0;
 
-const unsigned long UP_NO_PROGRESS_CHECK_MS = 4000;
-const float UP_PROGRESS_DELTA_DEG = 1.2;
+const unsigned long UP_FLAT_CONFIRM_MS = 2500;
+const unsigned long UP_TOP_FORWARD_MS = 1800;
 
-const unsigned long UP_JACK_MAX_EXTEND_MS = 7000;
-const float UP_JACK_EFFECT_DELTA_DEG = 2.0;
-const unsigned long UP_JACK_AFTER_EFFECT_FORWARD_MS = 1200;
-const unsigned long UP_JACK_RETRACT_MS = 2500;
-const int UP_MAX_JACK_USES = 4;
+const unsigned long UP_NO_PROGRESS_CHECK_MS = 3000;
+const float UP_PROGRESS_DELTA_DEG = 0.8;
+
+const unsigned long UP_JACK_MAX_EXTEND_MS = 9000;
+const float UP_JACK_EFFECT_DELTA_DEG = 1.2;
+const unsigned long UP_JACK_AFTER_EFFECT_FORWARD_MS = 1800;
+const unsigned long UP_JACK_RETRACT_MS = 2800;
+
+const int UP_MAX_JACK_USES = 12;
 
 
 // ==================================================
@@ -264,22 +232,21 @@ String blockJackAction = "EXTEND";
 
 // UP STAIRS
 bool upClimbStarted = false;
-unsigned long upFlatStartMs = 0;
 unsigned long upLastProgressCheckMs = 0;
 float upLastProgressPitch = 0.0;
 float upJackStartPitch = 0.0;
 int upJackUseCount = 0;
+int upDetectedStepCount = 0;
+unsigned long upFlatStartMs = 0;
 
 
 // ==================================================
 // SETUP
 // ==================================================
 void setup() {
-  // USB Serial -> Raspberry Pi
   Serial.begin(9600);
   Serial.setTimeout(10);
 
-  // Serial1 <- ESP32
   Serial1.begin(9600);
   Serial1.setTimeout(10);
 
@@ -314,19 +281,16 @@ void setup() {
   Serial.println("MEGA:SENSOR_MODE_DEPENDENT_STREAM_ENABLED");
   Serial.println("MEGA:MANUAL_SENSOR_INTERVAL_5000MS");
   Serial.println("MEGA:AUTO_SENSOR_INTERVAL_500MS");
-  Serial.println("MEGA:ALERT_TILT_ONLY_ENABLED");
   Serial.println("MEGA:ULTRASONIC_DISPLAY_ONLY_ENABLED");
   Serial.println("MEGA:ULTRASONIC_DECISION_DISABLED");
-  Serial.println("MEGA:PULSE_COMMANDS_ENABLED");
-  Serial.println("MEGA:COMMANDS_FROM_ESP32_ONLY");
   Serial.println("MEGA:LEGO_BLOCKS_ENABLED");
-  Serial.println("MEGA:AUTO_UP_STAIRS_ENABLED");
-  Serial.println("MEGA:AUTO_DOWN_STAIRS_PLACEHOLDER_ENABLED");
+  Serial.println("MEGA:AUTO_UP_STAIRS_TEST_SPEED_40_ENABLED");
+  Serial.println("MEGA:HARD_TILT_ONLY_ENABLED");
 
   Serial1.println("MEGA:READY");
   Serial1.println("MEGA:LEGO_BLOCKS_ENABLED");
-  Serial1.println("MEGA:ULTRASONIC_DISPLAY_ONLY_ENABLED");
-  Serial1.println("MEGA:ULTRASONIC_DECISION_DISABLED");
+  Serial1.println("MEGA:AUTO_UP_STAIRS_TEST_SPEED_40_ENABLED");
+  Serial1.println("MEGA:HARD_TILT_ONLY_ENABLED");
 }
 
 
@@ -378,13 +342,11 @@ void handleCommand(String command) {
 
   command.toUpperCase();
 
-  // LEGO BLOCK COMMANDS
   if (command.startsWith("AUTO:") || command.startsWith("BLOCK:")) {
     handleMegaBlockCommand(command);
     return;
   }
 
-  // ---- System mode ----
   if (command == "SYS:MODE:MANUAL") {
     stopActiveBlock("SYS_MODE_MANUAL");
     systemMode = "MANUAL";
@@ -409,7 +371,6 @@ void handleCommand(String command) {
     return;
   }
 
-  // ---- Robot mode ----
   if (command == "MODE:NORMAL") {
     stopActiveBlock("MODE_NORMAL");
     currentMode = "NORMAL";
@@ -432,7 +393,6 @@ void handleCommand(String command) {
     return;
   }
 
-  // ---- Rear jack ----
   if (command == "JACK:REAR:EXTEND") {
     stopActiveBlock("MANUAL_REAR_JACK_EXTEND");
     rearJackExtend();
@@ -453,7 +413,6 @@ void handleCommand(String command) {
     return;
   }
 
-  // ---- Front jack ----
   if (command == "JACK:FRONT:EXTEND") {
     stopActiveBlock("MANUAL_FRONT_JACK_EXTEND");
     frontJackExtend();
@@ -480,14 +439,12 @@ void handleCommand(String command) {
     return;
   }
 
-  // ---- Timed pulse movement ----
   if (command.startsWith("PULSE:")) {
     stopActiveBlock("PULSE_OVERRIDE");
     handlePulseCommand(command);
     return;
   }
 
-  // ---- Normal movement ----
   if (command == "FORWARD") {
     stopActiveBlock("MANUAL_FORWARD");
     timedMoveActive = false;
@@ -534,18 +491,15 @@ void handleCommand(String command) {
     return;
   }
 
-  // ---- Speed ----
   if (command.startsWith("SPEED:")) {
     int spd = command.substring(6).toInt();
     setSpeedPercent(spd, true);
 
     Serial1.print("ACK:SPEED:");
     Serial1.println(motorSpeedPercent);
-
     return;
   }
 
-  // ---- Status ----
   if (command == "STATUS") {
     sendStatusToPI();
     Serial1.println("ACK:STATUS:SENT_TO_PI");
@@ -702,13 +656,10 @@ void restoreSavedSpeed() {
 
 // ==================================================
 // BLOCK SAFETY
-//
-// Only MPU tilt safety remains.
-// Ultrasonic does NOT stop blocks.
 // ==================================================
 bool blockTiltSafetyOK(String blockName) {
   if (fabs(pitch) >= PITCH_DANGER_DEG || fabs(roll) >= ROLL_DANGER_DEG) {
-    blockError(blockName + ":TILT_DANGER", "PITCH=" + String(pitch, 2) + ";ROLL=" + String(roll, 2));
+    blockError(blockName + ":HARD_TILT_DANGER", "PITCH=" + String(pitch, 2) + ";ROLL=" + String(roll, 2));
     return false;
   }
 
@@ -716,26 +667,16 @@ bool blockTiltSafetyOK(String blockName) {
 }
 
 bool frontHardObstacle() {
-  // Ultrasonic is display-only.
   return false;
 }
 
 bool rearHardObstacle() {
-  // Ultrasonic is display-only.
   return false;
 }
 
 
 // ==================================================
 // BLOCK: GO
-//
-// Command:
-//   BLOCK:GO:FORWARD:20
-//   BLOCK:GO:BACKWARD:20
-//
-// Important:
-//   20 is estimated time unit, not true cm yet.
-//   Ultrasonic has ZERO effect here.
 // ==================================================
 void startGoBlock(String command) {
   stopActiveBlock("NEW_GO_BLOCK");
@@ -783,12 +724,6 @@ void startGoBlock(String command) {
 
 // ==================================================
 // BLOCK: TURN
-//
-// Command:
-//   BLOCK:TURN:LEFT:90
-//   BLOCK:TURN:RIGHT:90
-//
-// Uses gyro yaw integration from MPU6500.
 // ==================================================
 void startTurnBlock(String command) {
   stopActiveBlock("NEW_TURN_BLOCK");
@@ -845,15 +780,6 @@ void startTurnBlock(String command) {
 
 // ==================================================
 // BLOCK: JACK
-//
-// Command:
-//   BLOCK:JACK:REAR:EXTEND:4
-//   BLOCK:JACK:REAR:RETRACT:4
-//   BLOCK:JACK:FRONT:EXTEND:4
-//   BLOCK:JACK:FRONT:RETRACT:4
-//
-// Important:
-//   4 is estimated time unit, not true cm yet.
 // ==================================================
 void startJackBlock(String command) {
   stopActiveBlock("NEW_JACK_BLOCK");
@@ -914,11 +840,6 @@ void startJackBlock(String command) {
 
 // ==================================================
 // AUTO BLOCK: UP STAIRS
-//
-// Command:
-//   AUTO:UP_STAIRS
-//
-// Ultrasonic has ZERO effect in this state machine.
 // ==================================================
 void startUpStairsBlock() {
   stopActiveBlock("NEW_UP_STAIRS");
@@ -936,17 +857,18 @@ void startUpStairsBlock() {
   blockStepStartMs = blockStartMs;
 
   upClimbStarted = false;
-  upFlatStartMs = 0;
   upLastProgressCheckMs = blockStartMs;
   upLastProgressPitch = pitch;
   upJackStartPitch = pitch;
   upJackUseCount = 0;
+  upDetectedStepCount = 0;
+  upFlatStartMs = 0;
 
   timedMoveActive = false;
 
   setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
 
-  blockAck("START:UP_STAIRS");
+  blockAck("START:UP_STAIRS:TEST_SPEED_40");
 }
 
 
@@ -1056,21 +978,31 @@ void runJackBlock(unsigned long now) {
 // RUN AUTO BLOCK: UP STAIRS
 // ==================================================
 void runUpStairsBlock(unsigned long now) {
+  // Hard safety only
   if (fabs(roll) >= ROLL_DANGER_DEG || fabs(pitch) >= PITCH_DANGER_DEG) {
-    blockError("UP_STAIRS:TILT_DANGER", "PITCH=" + String(pitch, 2) + ";ROLL=" + String(roll, 2));
+    blockError(
+      "UP_STAIRS:HARD_TILT_DANGER",
+      "PITCH=" + String(pitch, 2) + ";ROLL=" + String(roll, 2)
+    );
     return;
   }
 
+  // Roll warning only
   if (fabs(roll) >= UP_ROLL_SAFE_DEG) {
-    blockError("UP_STAIRS:ROLL_UNSAFE", "ROLL=" + String(roll, 2));
-    return;
+    static unsigned long lastRollWarnMs = 0;
+    if (now - lastRollWarnMs > 1000) {
+      lastRollWarnMs = now;
+      blockAck("WARN:UP_STAIRS:ROLL_HIGH_CONTINUING:ROLL=" + String(roll, 2));
+    }
   }
 
+  // Total timeout
   if (now - blockStartMs >= UP_STAIRS_MAX_TOTAL_MS) {
     blockError("UP_STAIRS:TIMEOUT", "MAX_TOTAL_MS");
     return;
   }
 
+  // Start
   if (blockStep == STEP_UP_INIT) {
     blockAck("STEP:UP_STAIRS:FORWARD_CLIMB_START");
 
@@ -1080,26 +1012,41 @@ void runUpStairsBlock(unsigned long now) {
     blockStep = STEP_UP_FORWARD_CLIMB;
     blockStepStartMs = now;
 
+    upClimbStarted = false;
+    upFlatStartMs = 0;
     upLastProgressCheckMs = now;
     upLastProgressPitch = pitch;
-    upFlatStartMs = 0;
     return;
   }
 
+  // Forward climb
   if (blockStep == STEP_UP_FORWARD_CLIMB) {
+    lastMovement = "FORWARD";
+    moveForward();
+
     if (!upClimbStarted && fabs(pitch) >= UP_PITCH_CLIMB_START_DEG) {
       upClimbStarted = true;
-      upFlatStartMs = 0;
+      upDetectedStepCount++;
 
-      blockAck("STEP:UP_STAIRS:CLIMB_STARTED:PITCH=" + String(pitch, 2));
+      upFlatStartMs = 0;
+      upLastProgressCheckMs = now;
+      upLastProgressPitch = pitch;
+
+      blockAck(
+        "STEP:UP_STAIRS:CLIMB_STARTED:"
+        "STEP_COUNT=" + String(upDetectedStepCount) +
+        ":PITCH=" + String(pitch, 2)
+      );
     }
 
+    // Flat detected after climbing
     if (upClimbStarted) {
       if (fabs(pitch) <= UP_PITCH_FLAT_TOP_DEG) {
         if (upFlatStartMs == 0) {
           upFlatStartMs = now;
+          blockAck("STEP:UP_STAIRS:FLAT_DETECTED_WAIT_CONFIRM");
         } else if (now - upFlatStartMs >= UP_FLAT_CONFIRM_MS) {
-          blockAck("STEP:UP_STAIRS:TOP_FLAT_DETECTED");
+          blockAck("STEP:UP_STAIRS:FLAT_CONFIRMED_FORWARD_EXTRA");
 
           lastMovement = "FORWARD";
           moveForward();
@@ -1113,6 +1060,7 @@ void runUpStairsBlock(unsigned long now) {
       }
     }
 
+    // No progress -> rear jack
     if (upClimbStarted && now - upLastProgressCheckMs >= UP_NO_PROGRESS_CHECK_MS) {
       float deltaPitch = fabs(pitch - upLastProgressPitch);
 
@@ -1121,14 +1069,20 @@ void runUpStairsBlock(unsigned long now) {
 
       if (deltaPitch < UP_PROGRESS_DELTA_DEG && fabs(pitch) >= UP_PITCH_CLIMB_START_DEG) {
         if (upJackUseCount >= UP_MAX_JACK_USES) {
-          blockError("UP_STAIRS:NO_PROGRESS_MAX_JACK", "JACKS=" + String(upJackUseCount));
+          blockAck("WARN:UP_STAIRS:NO_PROGRESS_MAX_JACK_REACHED_CONTINUING");
+          lastMovement = "FORWARD";
+          moveForward();
           return;
         }
 
         upJackUseCount++;
         upJackStartPitch = pitch;
 
-        blockAck("STEP:UP_STAIRS:REAR_JACK_EXTEND:COUNT=" + String(upJackUseCount));
+        blockAck(
+          "STEP:UP_STAIRS:REAR_JACK_EXTEND:"
+          "COUNT=" + String(upJackUseCount) +
+          ":PITCH=" + String(pitch, 2)
+        );
 
         rearJackExtend();
 
@@ -1138,18 +1092,20 @@ void runUpStairsBlock(unsigned long now) {
       }
     }
 
-    lastMovement = "FORWARD";
-    moveForward();
     return;
   }
 
+  // Rear jack extend
   if (blockStep == STEP_UP_REAR_JACK_EXTEND) {
     float jackEffect = fabs(pitch - upJackStartPitch);
 
     if (jackEffect >= UP_JACK_EFFECT_DELTA_DEG) {
       rearJackStop();
 
-      blockAck("STEP:UP_STAIRS:JACK_EFFECT_DETECTED:DELTA=" + String(jackEffect, 2));
+      blockAck(
+        "STEP:UP_STAIRS:JACK_EFFECT_DETECTED:"
+        "DELTA=" + String(jackEffect, 2)
+      );
 
       lastMovement = "FORWARD";
       moveForward();
@@ -1162,7 +1118,7 @@ void runUpStairsBlock(unsigned long now) {
     if (now - blockStepStartMs >= UP_JACK_MAX_EXTEND_MS) {
       rearJackStop();
 
-      blockAck("STEP:UP_STAIRS:JACK_EXTEND_TIMEOUT_CONTINUE");
+      blockAck("STEP:UP_STAIRS:JACK_EXTEND_TIMEOUT_CONTINUE_FORWARD");
 
       lastMovement = "FORWARD";
       moveForward();
@@ -1176,6 +1132,7 @@ void runUpStairsBlock(unsigned long now) {
     return;
   }
 
+  // Forward after jack
   if (blockStep == STEP_UP_AFTER_JACK_FORWARD) {
     lastMovement = "FORWARD";
     moveForward();
@@ -1193,6 +1150,7 @@ void runUpStairsBlock(unsigned long now) {
     return;
   }
 
+  // Retract rear jack
   if (blockStep == STEP_UP_REAR_JACK_RETRACT) {
     if (now - blockStepStartMs >= UP_JACK_RETRACT_MS) {
       rearJackStop();
@@ -1215,12 +1173,22 @@ void runUpStairsBlock(unsigned long now) {
     return;
   }
 
+  // Extra forward after flat
   if (blockStep == STEP_UP_TOP_FORWARD) {
     lastMovement = "FORWARD";
     moveForward();
 
     if (now - blockStepStartMs >= UP_TOP_FORWARD_MS) {
-      finishActiveBlock("UP_STAIRS");
+      blockAck("STEP:UP_STAIRS:EXTRA_FORWARD_DONE_CHECK_NEXT_STEP");
+
+      blockStep = STEP_UP_FORWARD_CLIMB;
+      blockStepStartMs = now;
+
+      upClimbStarted = false;
+      upFlatStartMs = 0;
+      upLastProgressCheckMs = now;
+      upLastProgressPitch = pitch;
+
       return;
     }
 
@@ -1315,9 +1283,6 @@ void updateTimedMovement() {
 
 // ==================================================
 // SENSOR REPORTING
-// Manual: 1 report every 5 seconds
-// Auto:   2 reports every second
-// Alert:  urgent report for tilt only
 // ==================================================
 void updateAndReportSensors() {
   unsigned long now = millis();
@@ -1327,8 +1292,6 @@ void updateAndReportSensors() {
     readMPU();
   }
 
-  // Read ultrasonic only for display/logging.
-  // These values do NOT affect any decision.
   if (now - lastUltrasonicRead >= ULTRASONIC_READ_INTERVAL_MS) {
     lastUltrasonicRead = now;
 
@@ -1363,9 +1326,6 @@ void updateAndReportSensors() {
 
 // ==================================================
 // ALERT DETECTION
-//
-// Ultrasonic alerts removed.
-// Only tilt danger remains.
 // ==================================================
 String detectAlert() {
   if (fabs(pitch) > PITCH_DANGER_DEG) {
@@ -1563,9 +1523,7 @@ void stopAllJacks() {
 
 // ==================================================
 // ULTRASONIC
-//
-// Used for display only.
-// Not used in any AUTO decision.
+// Display only
 // ==================================================
 float readUltrasonicCM(int trigPin, int echoPin) {
   if (!ULTRASONIC_ENABLED) {
@@ -1580,7 +1538,6 @@ float readUltrasonicCM(int trigPin, int echoPin) {
 
   digitalWrite(trigPin, LOW);
 
-  // Shorter timeout so it does not slow the control loop too much.
   long duration = pulseIn(echoPin, HIGH, 12000);
 
   if (duration == 0) {
@@ -1674,7 +1631,6 @@ void readMPU() {
   int16_t rawAy = (Wire.read() << 8) | Wire.read();
   int16_t rawAz = (Wire.read() << 8) | Wire.read();
 
-  // Temperature bytes, not used.
   Wire.read();
   Wire.read();
 
@@ -1703,8 +1659,10 @@ void readMPU() {
   float dt = (nowMicros - lastMPUIntegrationMicros) / 1000000.0;
   lastMPUIntegrationMicros = nowMicros;
 
-  // Ignore tiny noise around zero.
   if (fabs(gyroZ) > 0.45 && dt > 0 && dt < 0.2) {
     yawDeg += gyroZ * dt;
   }
 }
+
+
+
