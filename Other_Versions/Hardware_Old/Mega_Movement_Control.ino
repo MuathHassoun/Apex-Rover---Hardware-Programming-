@@ -25,14 +25,22 @@
 //    BLOCK:STOP
 //
 // NEW UP_STAIRS LOGIC:
-// 3-stair scenario based on the measured real setup.
-// Before first stair, distance is variable, so move forward until MPU
-// detects the tested first-stair pitch angle.
-// IMPORTANT: first stair values are user-tested and must not be changed.
-// Stair 1: trigger at tested angle, rear jack down 14000 ms, forward 3500 ms, jack up.
-// Stair 2: use a higher dedicated MPU angle, rear jack down 12000 ms, forward 2000 ms, jack up.
-// Stair 3: use a higher dedicated MPU angle, rear jack down 20000 ms, forward 3000 ms, jack up.
-// After last stair: forward 2s, turn 90 degrees, stop.
+//
+// First approach:
+//   Forward speed 40 until pitch >= 3.5 deg.
+//
+// Stair cycle:
+//   Rear jack extend fixed 23 seconds.
+//   Forward speed 30 fixed 3 seconds.
+//   Stop motors.
+//   Rear jack retract fixed 23 seconds.
+//   Forward speed 30 waiting for next stair.
+//
+// Top detection:
+//   Top is checked ONLY after a full jack cycle is completed.
+//   It is NOT checked while jack is extending/retracting.
+//   If robot keeps moving forward on flat pitch for enough time,
+//   it considers that it reached the top and stops.
 //
 // STOP / BLOCK:STOP / AUTO:STOP always works.
 // Ultrasonic is display only.
@@ -159,84 +167,51 @@ const unsigned long TURN_MAX_TIMEOUT_MS = 25000;
 
 
 // ==================================================
-// UP STAIRS SETTINGS - 3 STAIRS SCENARIO
+// UP STAIRS SETTINGS - FIXED JACK TIME VERSION
 // ==================================================
-// Stair geometry given by user:
-// - 3 stairs
-// - One tread depth = 18 cm
-// - One riser height = 8 cm
-// - Robot length = 44.5 cm
-// - Robot height = 17 cm
-//
-// Jack timing measured by user:
-// - Full jack down/extend travel is about 20 seconds.
-//
-// Important naming:
-// - rearJackExtend()  = jack goes DOWN / extends
-// - rearJackRetract() = jack goes UP / retracts
 
-const int UP_STAIRS_SPEED_PERCENT = 40;
-const int UP_AFTER_JACK_SPEED_PERCENT = 40;
-const int UP_FINAL_TURN_SPEED_PERCENT = 35;
+// First approach speed only
+const int UP_FIRST_APPROACH_SPEED_PERCENT = 40;
 
-const unsigned long UP_STAIRS_MAX_TOTAL_MS = 180000;
+// After first cycle, waiting/approach speed
+const int UP_WAIT_NEXT_STAIR_SPEED_PERCENT = 30;
 
-// The distance before the first stair is variable.
-// So the robot keeps moving until MPU detects the tested first-stair angle.
-// IMPORTANT: these first-stair values came from real testing and are kept exactly.
-const float UP_FIRST_STAIR_TRIGGER_ABS_DEG = 30.0;
-const float UP_FIRST_STAIR_TRIGGER_DELTA_DEG = 35.0;
+// After jack lift, slow forward speed
+const int UP_AFTER_JACK_SPEED_PERCENT = 30;
 
-// Dedicated MPU triggers for the next stairs.
-// The first stair is already good, so only stair 2 and stair 3 are made higher.
-// Tune only these two pairs if future tests show early/late jack timing.
-const float UP_SECOND_STAIR_TRIGGER_ABS_DEG = 34.0;
-const float UP_SECOND_STAIR_TRIGGER_DELTA_DEG = 38.0;
+// Max full block time
+const unsigned long UP_STAIRS_MAX_TOTAL_MS = 240000;
 
-const float UP_THIRD_STAIR_TRIGGER_ABS_DEG = 38.0;
-const float UP_THIRD_STAIR_TRIGGER_DELTA_DEG = 42.0;
+// Stair detection by MPU pitch
+const float UP_PITCH_CLIMB_START_DEG = 3.5;
 
-// After the first stair support cycle, the robot should keep moving until
-// it becomes stable on stair 1 and stair 2, then do the second jack cycle.
-const float UP_STABLE_PITCH_DEG = 10.0;
-const float UP_STABLE_ROLL_DEG  = 12.0;
-const unsigned long UP_STABLE_HOLD_MS = 700;
-const unsigned long UP_MIN_MOVE_BEFORE_STABLE_MS = 900;
+// Top flat detection.
+// Important: top check is allowed only after full jack cycle.
+const float UP_TOP_FLAT_PITCH_DEG = 3.0;
 
-// Timeouts keep the robot from getting stuck forever if the MPU condition
-// is not detected perfectly during testing.
-const unsigned long UP_APPROACH_FIRST_TIMEOUT_MS = 60000;
-const unsigned long UP_WAIT_STABLE_TIMEOUT_MS    = 14000;
-const unsigned long UP_WAIT_FINAL_TILT_TIMEOUT_MS = 16000;
+// After retract is completed, do not check top immediately.
+// Give robot time to move forward away from the stair edge.
+const unsigned long UP_MIN_FORWARD_BEFORE_TOP_CHECK_MS = 2500;
 
-// Jack travel schedule for the 3 stairs.
-const unsigned long UP_JACK_FULL_TRAVEL_MS = 20000;
-const unsigned long UP_STEP1_JACK_EXTEND_MS = 14000;
-const unsigned long UP_STEP2_JACK_EXTEND_MS = 12000;
-const unsigned long UP_STEP3_JACK_EXTEND_MS = 20000;
+// If pitch stays flat for this time while moving after a completed jack cycle,
+// then we assume the robot reached the top flat area.
+const unsigned long UP_TOP_FLAT_CONFIRM_MS = 5000;
 
-// Retract duration is matched to how far the jack was extended, with a
-// small safety margin to make sure it is high enough before driving again.
-const unsigned long UP_JACK_RETRACT_EXTRA_MS = 700;
+// Rear jack fixed times
+const unsigned long UP_REAR_JACK_EXTEND_MS = 23000;
+const unsigned long UP_REAR_JACK_RETRACT_MS = 23000;
 
-// Forward after jack support.
-const unsigned long UP_STEP1_FORWARD_AFTER_JACK_MS = 3500;
-const unsigned long UP_STEP2_FORWARD_AFTER_JACK_MS = 2500;
-const unsigned long UP_STEP3_FORWARD_AFTER_JACK_MS = 1000;
+// Forward after jack lift
+const unsigned long UP_AFTER_JACK_FORWARD_MS = 3000;
 
-// After the last stair: move forward 2 seconds, turn 90 degrees, then stop.
-const unsigned long UP_FINAL_FORWARD_MS = 2000;
-const float UP_FINAL_TURN_DEG = 90.0;
-const unsigned long UP_FINAL_TURN_TIMEOUT_MS = 9000;
-const char UP_FINAL_TURN_DIRECTION = 'R';  // Change to 'L' if you want left turn.
+// Extra forward after top detected before stopping
+const unsigned long UP_TOP_EXTRA_FORWARD_MS = 1200;
 
-// During stair climbing pitch can be high, so hard danger must be higher
-// than the normal manual-mode safety threshold.
-const float UP_PITCH_HARD_DANGER_DEG = 50.0;
-const float UP_ROLL_HARD_DANGER_DEG  = 50.0;
+// Limit jack cycles
+const int UP_MAX_JACK_USES = 12;
 
-// Roll warning only, no stop.
-const float UP_ROLL_WARNING_DEG = 35.0;
+// Roll warning only
+const float UP_ROLL_WARNING_DEG = 28.0;
 
 
 // ==================================================
@@ -261,14 +236,11 @@ enum MegaBlockStep {
   STEP_JACK_RUNNING,
 
   STEP_UP_INIT,
-  STEP_UP_APPROACH_FIRST_TILT,
-  STEP_UP_WAIT_SECOND_TILT,
-  STEP_UP_WAIT_THIRD_TILT,
+  STEP_UP_FORWARD_CLIMB,
   STEP_UP_REAR_JACK_EXTEND,
   STEP_UP_AFTER_JACK_FORWARD,
   STEP_UP_REAR_JACK_RETRACT,
-  STEP_UP_FINAL_FORWARD,
-  STEP_UP_FINAL_TURN,
+  STEP_UP_TOP_EXTRA_FORWARD,
 
   STEP_DOWN_PLACEHOLDER
 };
@@ -297,14 +269,12 @@ String blockJackWhich = "REAR";
 String blockJackAction = "EXTEND";
 
 // UP STAIRS
-float upStartPitch = 0.0;
-float upStepStartPitch = 0.0;
-float upTurnStartYaw = 0.0;
-unsigned long upStableStartMs = 0;
-unsigned long upCurrentJackExtendMs = 0;
-unsigned long upCurrentJackRetractMs = 0;
-unsigned long upCurrentForwardAfterJackMs = 0;
-int upCurrentStair = 0;  // 1, 2, 3
+int upJackUseCount = 0;
+int upDetectedStepCount = 0;
+bool upFirstApproach = true;
+bool upCompletedAtLeastOneJackCycle = false;
+unsigned long upFlatStartMs = 0;
+unsigned long upLastRetractDoneMs = 0;
 
 
 // ==================================================
@@ -351,17 +321,14 @@ void setup() {
   Serial.println("MEGA:ULTRASONIC_DISPLAY_ONLY_ENABLED");
   Serial.println("MEGA:ULTRASONIC_DECISION_DISABLED");
   Serial.println("MEGA:LEGO_BLOCKS_ENABLED");
-  Serial.println("MEGA:AUTO_UP_STAIRS_3_STAIRS_SCENARIO_ENABLED");
-  Serial.println("MEGA:UP_STAIRS_WAIT_FIRST_MPU_TILT_THEN_3_4_2_3_FULL_JACK");
-  Serial.println("MEGA:UP_STAIRS_PER_STAIR_MPU_TRIGGERS_FIRST_30_SECOND_34_THIRD_38");
-  Serial.println("MEGA:UP_STAIRS_FINAL_FORWARD_2S_TURN_90_STOP");
+  Serial.println("MEGA:AUTO_UP_STAIRS_FIXED_JACK_23S_ENABLED");
+  Serial.println("MEGA:UP_FIRST_FORWARD_40_NEXT_FORWARD_30");
   Serial.println("MEGA:HARD_TILT_ONLY_ENABLED");
 
   Serial1.println("MEGA:READY");
   Serial1.println("MEGA:LEGO_BLOCKS_ENABLED");
-  Serial1.println("MEGA:AUTO_UP_STAIRS_3_STAIRS_SCENARIO_ENABLED");
-  Serial1.println("MEGA:UP_STAIRS_WAIT_FIRST_MPU_TILT_THEN_3_4_2_3_FULL_JACK");
-  Serial1.println("MEGA:UP_STAIRS_PER_STAIR_MPU_TRIGGERS_FIRST_30_SECOND_34_THIRD_38");
+  Serial1.println("MEGA:AUTO_UP_STAIRS_FIXED_JACK_23S_ENABLED");
+  Serial1.println("MEGA:UP_FIRST_FORWARD_40_NEXT_FORWARD_30");
 }
 
 
@@ -927,20 +894,18 @@ void startUpStairsBlock() {
   blockStartMs = millis();
   blockStepStartMs = blockStartMs;
 
-  upStartPitch = pitch;
-  upStepStartPitch = pitch;
-  upTurnStartYaw = yawDeg;
-  upStableStartMs = 0;
-  upCurrentJackExtendMs = 0;
-  upCurrentJackRetractMs = 0;
-  upCurrentForwardAfterJackMs = 0;
-  upCurrentStair = 0;
+  upJackUseCount = 0;
+  upDetectedStepCount = 0;
+  upFirstApproach = true;
+  upCompletedAtLeastOneJackCycle = false;
+  upFlatStartMs = 0;
+  upLastRetractDoneMs = 0;
 
   timedMoveActive = false;
 
-  setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
+  setSpeedPercent(UP_FIRST_APPROACH_SPEED_PERCENT, false);
 
-  blockAck("START:UP_STAIRS:3_STAIRS:WAIT_FIRST_MPU_TILT:SPEED_40");
+  blockAck("START:UP_STAIRS:FIXED_23S_JACK:FIRST_SPEED_40:NEXT_SPEED_30");
 }
 
 
@@ -1047,95 +1012,11 @@ void runJackBlock(unsigned long now) {
 
 
 // ==================================================
-// RUN AUTO BLOCK: UP STAIRS - 3 STAIRS SCENARIO
+// RUN AUTO BLOCK: UP STAIRS - FIXED JACK TIME
 // ==================================================
-unsigned long getUpJackExtendMs(int stairNumber) {
-  if (stairNumber == 1) {
-    return UP_STEP1_JACK_EXTEND_MS;
-  }
-
-  if (stairNumber == 2) {
-    return UP_STEP2_JACK_EXTEND_MS;
-  }
-
-  return UP_STEP3_JACK_EXTEND_MS;
-}
-
-unsigned long getUpForwardAfterJackMs(int stairNumber) {
-  if (stairNumber == 1) {
-    return UP_STEP1_FORWARD_AFTER_JACK_MS;
-  }
-
-  if (stairNumber == 2) {
-    return UP_STEP2_FORWARD_AFTER_JACK_MS;
-  }
-
-  return UP_STEP3_FORWARD_AFTER_JACK_MS;
-}
-
-bool upTiltDetected(float absTriggerDeg, float deltaTriggerDeg, float referencePitchDeg) {
-  float absPitch = fabs(pitch);
-  float deltaPitch = fabs(pitch - referencePitchDeg);
-
-  return (absPitch >= absTriggerDeg || deltaPitch >= deltaTriggerDeg);
-}
-
-bool upFirstTiltDetected() {
-  return upTiltDetected(
-    UP_FIRST_STAIR_TRIGGER_ABS_DEG,
-    UP_FIRST_STAIR_TRIGGER_DELTA_DEG,
-    upStartPitch
-  );
-}
-
-bool upSecondTiltDetected() {
-  return upTiltDetected(
-    UP_SECOND_STAIR_TRIGGER_ABS_DEG,
-    UP_SECOND_STAIR_TRIGGER_DELTA_DEG,
-    upStepStartPitch
-  );
-}
-
-bool upThirdTiltDetected() {
-  return upTiltDetected(
-    UP_THIRD_STAIR_TRIGGER_ABS_DEG,
-    UP_THIRD_STAIR_TRIGGER_DELTA_DEG,
-    upStepStartPitch
-  );
-}
-
-bool upRobotStable() {
-  return (fabs(pitch) <= UP_STABLE_PITCH_DEG && fabs(roll) <= UP_STABLE_ROLL_DEG);
-}
-
-void startUpJackCycle(int stairNumber, unsigned long now, String reason) {
-  upCurrentStair = constrain(stairNumber, 1, 3);
-  upCurrentJackExtendMs = getUpJackExtendMs(upCurrentStair);
-  upCurrentJackRetractMs = upCurrentJackExtendMs + UP_JACK_RETRACT_EXTRA_MS;
-  upCurrentForwardAfterJackMs = getUpForwardAfterJackMs(upCurrentStair);
-  upStepStartPitch = pitch;
-
-  stopMotors();
-  lastMovement = "STOP";
-
-  rearJackExtend();
-
-  blockStep = STEP_UP_REAR_JACK_EXTEND;
-  blockStepStartMs = now;
-
-  blockAck(
-    "STEP:UP_STAIRS:STAIR_" + String(upCurrentStair) +
-    ":REAR_JACK_DOWN_START:" + reason +
-    ":EXTEND_MS=" + String(upCurrentJackExtendMs) +
-    ":PITCH=" + String(pitch, 2) +
-    ":ROLL=" + String(roll, 2)
-  );
-}
-
 void runUpStairsBlock(unsigned long now) {
-  // Stair climbing can naturally create a high pitch, so use climbing-specific
-  // hard limits instead of the normal manual-mode limits.
-  if (fabs(roll) >= UP_ROLL_HARD_DANGER_DEG || fabs(pitch) >= UP_PITCH_HARD_DANGER_DEG) {
+  // Hard safety only
+  if (fabs(roll) >= ROLL_DANGER_DEG || fabs(pitch) >= PITCH_DANGER_DEG) {
     blockError(
       "UP_STAIRS:HARD_TILT_DANGER",
       "PITCH=" + String(pitch, 2) + ";ROLL=" + String(roll, 2)
@@ -1143,7 +1024,7 @@ void runUpStairsBlock(unsigned long now) {
     return;
   }
 
-  // Roll warning only, no stop.
+  // Roll warning only, no stop
   if (fabs(roll) >= UP_ROLL_WARNING_DEG) {
     static unsigned long lastRollWarnMs = 0;
     if (now - lastRollWarnMs > 1000) {
@@ -1152,90 +1033,98 @@ void runUpStairsBlock(unsigned long now) {
     }
   }
 
+  // Total timeout
   if (now - blockStartMs >= UP_STAIRS_MAX_TOTAL_MS) {
     blockError("UP_STAIRS:TIMEOUT", "MAX_TOTAL_MS");
     return;
   }
 
   // ==================================================
-  // STEP 0:
-  // Start approach. Distance before first stair is variable.
-  // The robot moves until MPU detects strong pitch change.
+  // STEP 1:
+  // Start first forward with speed 40.
   // ==================================================
   if (blockStep == STEP_UP_INIT) {
-    blockAck(
-      "STEP:UP_STAIRS:APPROACH_FIRST_STAIR_WAIT_MPU_TILT:"
-      "STEP1_ABS=" + String(UP_FIRST_STAIR_TRIGGER_ABS_DEG, 1) +
-      ":STEP1_DELTA=" + String(UP_FIRST_STAIR_TRIGGER_DELTA_DEG, 1) +
-      ":STEP2_ABS=" + String(UP_SECOND_STAIR_TRIGGER_ABS_DEG, 1) +
-      ":STEP3_ABS=" + String(UP_THIRD_STAIR_TRIGGER_ABS_DEG, 1) +
-      ":START_PITCH=" + String(upStartPitch, 2)
-    );
+    blockAck("STEP:UP_STAIRS:FIRST_FORWARD_SPEED_40_WAIT_PITCH");
 
-    setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
+    setSpeedPercent(UP_FIRST_APPROACH_SPEED_PERCENT, false);
     lastMovement = "FORWARD";
     moveForward();
 
-    blockStep = STEP_UP_APPROACH_FIRST_TILT;
+    blockStep = STEP_UP_FORWARD_CLIMB;
     blockStepStartMs = now;
     return;
   }
 
   // ==================================================
-  // STEP 1:
-  // Keep moving until the real stair-climb angle is detected.
-  // This means the robot is not only touching the first stair edge;
-  // it is already climbing enough to be supported between stair levels.
-  // ==================================================
-  if (blockStep == STEP_UP_APPROACH_FIRST_TILT) {
-    setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
-    lastMovement = "FORWARD";
-    moveForward();
-
-    if (upFirstTiltDetected()) {
-      startUpJackCycle(1, now, "FIRST_MPU_TILT_DETECTED");
-      return;
-    }
-
-    if (now - blockStepStartMs >= UP_APPROACH_FIRST_TIMEOUT_MS) {
-      blockError(
-        "UP_STAIRS:FIRST_TILT_NOT_DETECTED",
-        "PITCH=" + String(pitch, 2) + ";ROLL=" + String(roll, 2)
-      );
-      return;
-    }
-
-    return;
-  }
-
-  // ==================================================
   // STEP 2:
-  // After stair 1 cycle, move forward until the dedicated
-  // second-stair MPU angle is detected.
-  // Then do stair 2 jack cycle using the user's tested times.
+  // Move forward.
+  // First approach speed = 40.
+  // After first jack cycle speed = 30.
+  //
+  // If pitch >= 3.5 deg, start rear jack cycle.
+  // Top detection is allowed only after a completed jack cycle,
+  // and only after moving forward for enough time after retract.
   // ==================================================
-  if (blockStep == STEP_UP_WAIT_SECOND_TILT) {
-    setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
+  if (blockStep == STEP_UP_FORWARD_CLIMB) {
+    if (upFirstApproach) {
+      setSpeedPercent(UP_FIRST_APPROACH_SPEED_PERCENT, false);
+    } else {
+      setSpeedPercent(UP_WAIT_NEXT_STAIR_SPEED_PERCENT, false);
+    }
+
     lastMovement = "FORWARD";
     moveForward();
 
-    if (upSecondTiltDetected()) {
-      startUpJackCycle(2, now, "SECOND_MPU_TILT_DETECTED");
+    // Detect next stair
+    if (fabs(pitch) >= UP_PITCH_CLIMB_START_DEG) {
+      if (upJackUseCount >= UP_MAX_JACK_USES) {
+        blockError("UP_STAIRS:MAX_JACK_CYCLES", "COUNT=" + String(upJackUseCount));
+        return;
+      }
+
+      upDetectedStepCount++;
+      upJackUseCount++;
+      upFlatStartMs = 0;
+
+      blockAck(
+        "STEP:UP_STAIRS:STAIR_DETECTED_REAR_JACK_EXTEND_23S:"
+        "STEP_COUNT=" + String(upDetectedStepCount) +
+        ":JACK_COUNT=" + String(upJackUseCount) +
+        ":PITCH=" + String(pitch, 2)
+      );
+
+      rearJackExtend();
+
+      blockStep = STEP_UP_REAR_JACK_EXTEND;
+      blockStepStartMs = now;
       return;
     }
 
-    // Fallback: if the robot does not show the exact second angle, continue
-    // with the known 3-stair scenario instead of getting stuck forever.
-    if (now - blockStepStartMs >= UP_WAIT_STABLE_TIMEOUT_MS) {
-      blockAck(
-        "WARN:UP_STAIRS:SECOND_TILT_TIMEOUT_STARTING_STAIR_2:"
-        "PITCH=" + String(pitch, 2) +
-        ":ROLL=" + String(roll, 2) +
-        ":STEP2_ABS_TRIGGER=" + String(UP_SECOND_STAIR_TRIGGER_ABS_DEG, 1) +
-        ":STEP2_DELTA_TRIGGER=" + String(UP_SECOND_STAIR_TRIGGER_DELTA_DEG, 1)
-      );
-      startUpJackCycle(2, now, "SECOND_TILT_TIMEOUT_FALLBACK");
-      return;
+    // Top detection:
+    // Only after at least one full jack cycle is completed.
+    // Do not check top immediately after retract; wait minimum forward time.
+    if (upCompletedAtLeastOneJackCycle) {
+      bool enoughForwardAfterRetract = (now - upLastRetractDoneMs >= UP_MIN_FORWARD_BEFORE_TOP_CHECK_MS);
+      bool pitchIsFlat = (fabs(pitch) <= UP_TOP_FLAT_PITCH_DEG);
+
+      if (enoughForwardAfterRetract && pitchIsFlat) {
+        if (upFlatStartMs == 0) {
+          upFlatStartMs = now;
+          blockAck("STEP:UP_STAIRS:TOP_FLAT_TIMER_STARTED:PITCH=" + String(pitch, 2));
+        } else if (now - upFlatStartMs >= UP_TOP_FLAT_CONFIRM_MS) {
+          blockAck("STEP:UP_STAIRS:TOP_FLAT_CONFIRMED_EXTRA_FORWARD");
+
+          setSpeedPercent(UP_WAIT_NEXT_STAIR_SPEED_PERCENT, false);
+          lastMovement = "FORWARD";
+          moveForward();
+
+          blockStep = STEP_UP_TOP_EXTRA_FORWARD;
+          blockStepStartMs = now;
+          return;
+        }
+      } else {
+        upFlatStartMs = 0;
+      }
     }
 
     return;
@@ -1243,53 +1132,17 @@ void runUpStairsBlock(unsigned long now) {
 
   // ==================================================
   // STEP 3:
-  // After stair 2 cycle, move forward until the dedicated
-  // third-stair MPU angle is detected.
-  // Then do stair 3 jack cycle using the user's tested times.
-  // ==================================================
-  if (blockStep == STEP_UP_WAIT_THIRD_TILT) {
-    setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
-    lastMovement = "FORWARD";
-    moveForward();
-
-    if (upThirdTiltDetected()) {
-      startUpJackCycle(3, now, "THIRD_MPU_TILT_DETECTED");
-      return;
-    }
-
-    if (now - blockStepStartMs >= UP_WAIT_FINAL_TILT_TIMEOUT_MS) {
-      blockAck(
-        "WARN:UP_STAIRS:THIRD_TILT_TIMEOUT_STARTING_STAIR_3:"
-        "PITCH=" + String(pitch, 2) +
-        ":ROLL=" + String(roll, 2) +
-        ":STEP3_ABS_TRIGGER=" + String(UP_THIRD_STAIR_TRIGGER_ABS_DEG, 1) +
-        ":STEP3_DELTA_TRIGGER=" + String(UP_THIRD_STAIR_TRIGGER_DELTA_DEG, 1)
-      );
-      startUpJackCycle(3, now, "THIRD_TILT_TIMEOUT_FALLBACK");
-      return;
-    }
-
-    return;
-  }
-
-  // ==================================================
-  // JACK DOWN / EXTEND:
-  // Uses the user's tested values:
-  // Stair 1 = 14000 ms, Stair 2 = 12000 ms, Stair 3 = 20000 ms.
-  // Motors are stopped while the jack is moving down.
+  // Rear jack extend fixed 23 seconds.
+  // No pitch effect stop here.
+  // This prevents jack from stopping too early.
   // ==================================================
   if (blockStep == STEP_UP_REAR_JACK_EXTEND) {
-    stopMotors();
-    lastMovement = "STOP";
+    rearJackExtend();
 
-    if (now - blockStepStartMs >= upCurrentJackExtendMs) {
+    if (now - blockStepStartMs >= UP_REAR_JACK_EXTEND_MS) {
       rearJackStop();
 
-      blockAck(
-        "STEP:UP_STAIRS:STAIR_" + String(upCurrentStair) +
-        ":REAR_JACK_DOWN_DONE:FORWARD_AFTER_JACK_MS=" +
-        String(upCurrentForwardAfterJackMs)
-      );
+      blockAck("STEP:UP_STAIRS:REAR_JACK_EXTEND_DONE_23S_FORWARD_30_3S");
 
       setSpeedPercent(UP_AFTER_JACK_SPEED_PERCENT, false);
       lastMovement = "FORWARD";
@@ -1300,26 +1153,21 @@ void runUpStairsBlock(unsigned long now) {
       return;
     }
 
-    rearJackExtend();
     return;
   }
 
   // ==================================================
-  // FORWARD AFTER JACK:
-  // Uses the user's tested values:
-  // Stair 1 = 3500 ms, Stair 2 = 2000 ms, Stair 3 = 3000 ms.
+  // STEP 4:
+  // Move forward speed 30 for 3 seconds after jack.
+  // Goal: let robot body pass the stair edge.
   // ==================================================
   if (blockStep == STEP_UP_AFTER_JACK_FORWARD) {
     setSpeedPercent(UP_AFTER_JACK_SPEED_PERCENT, false);
     lastMovement = "FORWARD";
     moveForward();
 
-    if (now - blockStepStartMs >= upCurrentForwardAfterJackMs) {
-      blockAck(
-        "STEP:UP_STAIRS:STAIR_" + String(upCurrentStair) +
-        ":FORWARD_AFTER_JACK_DONE:RETRACT_MS=" +
-        String(upCurrentJackRetractMs)
-      );
+    if (now - blockStepStartMs >= UP_AFTER_JACK_FORWARD_MS) {
+      blockAck("STEP:UP_STAIRS:AFTER_JACK_FORWARD_DONE_STOP_AND_RETRACT_23S");
 
       stopMotors();
       lastMovement = "STOP";
@@ -1335,134 +1183,52 @@ void runUpStairsBlock(unsigned long now) {
   }
 
   // ==================================================
-  // JACK UP / RETRACT:
-  // Jack must go up after forward time so the robot can move correctly.
+  // STEP 5:
+  // Retract rear jack fixed 23 seconds.
+  // Motors are stopped here.
+  // This prevents rear jack from hitting stair edge.
   // ==================================================
   if (blockStep == STEP_UP_REAR_JACK_RETRACT) {
     stopMotors();
     lastMovement = "STOP";
 
-    if (now - blockStepStartMs >= upCurrentJackRetractMs) {
+    rearJackRetract();
+
+    if (now - blockStepStartMs >= UP_REAR_JACK_RETRACT_MS) {
       rearJackStop();
 
-      blockAck(
-        "STEP:UP_STAIRS:STAIR_" + String(upCurrentStair) +
-        ":REAR_JACK_UP_DONE"
-      );
+      upFirstApproach = false;
+      upCompletedAtLeastOneJackCycle = true;
+      upLastRetractDoneMs = now;
+      upFlatStartMs = 0;
 
-      if (upCurrentStair == 1) {
-        upStableStartMs = 0;
-        upStepStartPitch = pitch;
-        blockStep = STEP_UP_WAIT_SECOND_TILT;
-        blockStepStartMs = now;
-        blockAck(
-          "STEP:UP_STAIRS:MOVE_UNTIL_SECOND_STAIR_MPU_TILT:"
-          "STEP2_ABS_TRIGGER=" + String(UP_SECOND_STAIR_TRIGGER_ABS_DEG, 1) +
-          ":STEP2_DELTA_TRIGGER=" + String(UP_SECOND_STAIR_TRIGGER_DELTA_DEG, 1) +
-          ":REFERENCE_PITCH=" + String(upStepStartPitch, 2)
-        );
+      blockAck("STEP:UP_STAIRS:REAR_JACK_RETRACT_DONE_23S_REPEAT_FORWARD_30");
 
-        setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
-        lastMovement = "FORWARD";
-        moveForward();
-        return;
-      }
-
-      if (upCurrentStair == 2) {
-        upStepStartPitch = pitch;
-        blockStep = STEP_UP_WAIT_THIRD_TILT;
-        blockStepStartMs = now;
-        blockAck(
-          "STEP:UP_STAIRS:MOVE_UNTIL_THIRD_STAIR_MPU_TILT:"
-          "STEP3_ABS_TRIGGER=" + String(UP_THIRD_STAIR_TRIGGER_ABS_DEG, 1) +
-          ":STEP3_DELTA_TRIGGER=" + String(UP_THIRD_STAIR_TRIGGER_DELTA_DEG, 1) +
-          ":REFERENCE_PITCH=" + String(upStepStartPitch, 2)
-        );
-
-        setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
-        lastMovement = "FORWARD";
-        moveForward();
-        return;
-      }
-
-      // Stair 3 finished. Move forward 2 seconds before turning.
-      blockStep = STEP_UP_FINAL_FORWARD;
-      blockStepStartMs = now;
-      blockAck("STEP:UP_STAIRS:FINAL_STAIR_DONE_FORWARD_2S");
-
-      setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
+      setSpeedPercent(UP_WAIT_NEXT_STAIR_SPEED_PERCENT, false);
       lastMovement = "FORWARD";
       moveForward();
+
+      blockStep = STEP_UP_FORWARD_CLIMB;
+      blockStepStartMs = now;
       return;
     }
 
-    rearJackRetract();
     return;
   }
 
   // ==================================================
-  // FINAL FORWARD 2 SECONDS
+  // STEP 6:
+  // Top confirmed.
+  // Move a little extra forward then finish.
   // ==================================================
-  if (blockStep == STEP_UP_FINAL_FORWARD) {
-    setSpeedPercent(UP_STAIRS_SPEED_PERCENT, false);
+  if (blockStep == STEP_UP_TOP_EXTRA_FORWARD) {
+    setSpeedPercent(UP_WAIT_NEXT_STAIR_SPEED_PERCENT, false);
     lastMovement = "FORWARD";
     moveForward();
 
-    if (now - blockStepStartMs >= UP_FINAL_FORWARD_MS) {
-      stopMotors();
-      lastMovement = "STOP";
-
-      upTurnStartYaw = yawDeg;
-      setSpeedPercent(UP_FINAL_TURN_SPEED_PERCENT, false);
-
-      if (UP_FINAL_TURN_DIRECTION == 'L') {
-        lastMovement = "LEFT";
-        turnLeft();
-        blockAck("STEP:UP_STAIRS:FINAL_TURN_LEFT_90_START");
-      } else {
-        lastMovement = "RIGHT";
-        turnRight();
-        blockAck("STEP:UP_STAIRS:FINAL_TURN_RIGHT_90_START");
-      }
-
-      blockStep = STEP_UP_FINAL_TURN;
-      blockStepStartMs = now;
+    if (now - blockStepStartMs >= UP_TOP_EXTRA_FORWARD_MS) {
+      finishActiveBlock("UP_STAIRS_TOP_REACHED");
       return;
-    }
-
-    return;
-  }
-
-  // ==================================================
-  // FINAL TURN 90 DEGREES AND STOP
-  // ==================================================
-  if (blockStep == STEP_UP_FINAL_TURN) {
-    float turned = fabs(yawDeg - upTurnStartYaw);
-
-    if (turned >= (UP_FINAL_TURN_DEG - TURN_TOLERANCE_DEG)) {
-      finishActiveBlock("UP_STAIRS_3_STAIRS_DONE_FINAL_TURN_90");
-      return;
-    }
-
-    if (now - blockStepStartMs >= UP_FINAL_TURN_TIMEOUT_MS) {
-      stopMotors();
-      lastMovement = "STOP";
-      blockAck(
-        "WARN:UP_STAIRS:FINAL_TURN_TIMEOUT_STOPPING:"
-        "TURNED=" + String(turned, 1)
-      );
-      finishActiveBlock("UP_STAIRS_3_STAIRS_DONE_TURN_TIMEOUT");
-      return;
-    }
-
-    setSpeedPercent(UP_FINAL_TURN_SPEED_PERCENT, false);
-
-    if (UP_FINAL_TURN_DIRECTION == 'L') {
-      lastMovement = "LEFT";
-      turnLeft();
-    } else {
-      lastMovement = "RIGHT";
-      turnRight();
     }
 
     return;
@@ -1601,19 +1367,11 @@ void updateAndReportSensors() {
 // ALERT DETECTION
 // ==================================================
 String detectAlert() {
-  float pitchLimit = PITCH_DANGER_DEG;
-  float rollLimit = ROLL_DANGER_DEG;
-
-  if (activeBlock == BLOCK_UP_STAIRS) {
-    pitchLimit = UP_PITCH_HARD_DANGER_DEG;
-    rollLimit = UP_ROLL_HARD_DANGER_DEG;
-  }
-
-  if (fabs(pitch) > pitchLimit) {
+  if (fabs(pitch) > PITCH_DANGER_DEG) {
     return "TILT_DANGER";
   }
 
-  if (fabs(roll) > rollLimit) {
+  if (fabs(roll) > ROLL_DANGER_DEG) {
     return "TILT_DANGER";
   }
 
