@@ -222,7 +222,7 @@ const unsigned long UP_JACK_RETRACT_EXTRA_MS = 700;
 // Forward after jack support.
 const unsigned long UP_STEP1_FORWARD_AFTER_JACK_MS = 3500;
 const unsigned long UP_STEP2_FORWARD_AFTER_JACK_MS = 2500;
-const unsigned long UP_STEP3_FORWARD_AFTER_JACK_MS = 1000;
+const unsigned long UP_STEP3_FORWARD_AFTER_JACK_MS = 700;
 
 // After the last stair: move forward 2 seconds, turn 90 degrees, then stop.
 const unsigned long UP_FINAL_FORWARD_MS = 2000;
