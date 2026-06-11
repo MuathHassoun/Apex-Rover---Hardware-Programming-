@@ -211,9 +211,9 @@ const unsigned long UP_WAIT_FINAL_TILT_TIMEOUT_MS = 16000;
 
 // Jack travel schedule for the 3 stairs.
 const unsigned long UP_JACK_FULL_TRAVEL_MS = 20000;
-const unsigned long UP_STEP1_JACK_EXTEND_MS = 14000;
-const unsigned long UP_STEP2_JACK_EXTEND_MS = 12000;
-const unsigned long UP_STEP3_JACK_EXTEND_MS = 20000;
+const unsigned long UP_STEP1_JACK_EXTEND_MS = 14000;  // about 15 s
+const unsigned long UP_STEP2_JACK_EXTEND_MS = 12000;  // about 13.3 s
+const unsigned long UP_STEP3_JACK_EXTEND_MS = 20000;  // about 20 s
 
 // Retract duration is matched to how far the jack was extended, with a
 // small safety margin to make sure it is high enough before driving again.
@@ -240,6 +240,91 @@ const float UP_ROLL_WARNING_DEG = 35.0;
 
 
 // ==================================================
+// DOWN STAIRS SETTINGS - FRONT JACK + REAR SUPPORT DESCENT LOGIC
+// ==================================================
+// IMPORTANT:
+// UP_STAIRS logic is not changed.
+// This DOWN_STAIRS block mainly uses the FRONT jack,
+// with one added rear-jack support cycle after the 1.5s forward step.
+// The previous descent angle constants are kept unchanged.
+// The new sequence is a more accurate timed descent sequence,
+// with one MPU level check near the end.
+
+const bool DOWN_MOVE_FORWARD_DURING_DESCENT = true;
+
+const int DOWN_STAIRS_SPEED_PERCENT = 35;
+const int DOWN_AFTER_JACK_SPEED_PERCENT = 35;
+
+const unsigned long DOWN_STAIRS_MAX_TOTAL_MS = 180000;
+
+// Descent angles: kept exactly as the previous configured values.
+// They remain available for testing/logging; this new sequence mainly uses
+// the final level check between 0 and 10 degrees.
+const float DOWN_FIRST_STAIR_TRIGGER_ABS_DEG = 34.0;
+const float DOWN_FIRST_STAIR_TRIGGER_DELTA_DEG = 38.0;
+
+const float DOWN_SECOND_STAIR_TRIGGER_ABS_DEG = 38.0;
+const float DOWN_SECOND_STAIR_TRIGGER_DELTA_DEG = 42.0;
+
+const float DOWN_THIRD_STAIR_TRIGGER_ABS_DEG = 42.0;
+const float DOWN_THIRD_STAIR_TRIGGER_DELTA_DEG = 46.0;
+
+// Precise descent sequence requested by user.
+// Naming:
+// - frontJackExtend()  = front jack goes DOWN / extends
+// - frontJackRetract() = front jack goes UP / retracts
+const unsigned long DOWN_INITIAL_FORWARD_MS = 2000;
+
+const unsigned long DOWN_FRONT_EXTEND_12S_MS = 12000;
+const unsigned long DOWN_FORWARD_AFTER_EXTEND_12S_MS = 1000;
+
+const unsigned long DOWN_FRONT_EXTEND_3S_MS = 8000;
+const unsigned long DOWN_FORWARD_AFTER_EXTEND_3S_MS = 500;
+
+// Added rear-jack support cycle after the 1.5s forward step.
+const unsigned long DOWN_REAR_EXTEND_AFTER_FRONT_3S_MS = 20000;
+const unsigned long DOWN_FORWARD_AFTER_REAR_EXTEND_MS = 800;
+const unsigned long DOWN_REAR_RETRACT_AFTER_FORWARD_MS = 20000;
+
+const unsigned long DOWN_FRONT_RETRACT_5S_A_MS = 5000;
+const unsigned long DOWN_FORWARD_AFTER_RETRACT_5S_A_MS = 1000;
+
+const unsigned long DOWN_FRONT_RETRACT_10S_B_MS = 10000;
+const unsigned long DOWN_FORWARD_AFTER_RETRACT_10S_B_MS = 1000;
+
+const unsigned long DOWN_FRONT_EXTEND_5S_A_MS = 0;
+const unsigned long DOWN_FORWARD_AFTER_EXTEND_5S_A_MS = 2000;
+
+const unsigned long DOWN_FRONT_RETRACT_2S_A_MS = 4000;
+const unsigned long DOWN_FORWARD_AFTER_RETRACT_2S_A_MS = 2000;
+
+const unsigned long DOWN_FRONT_RETRACT_3S_A_MS = 8000;
+
+// After this forward, check that the pitch is approximately level.
+// Because descent pitch may be positive or negative depending on MPU mounting,
+// we use abs(pitch) <= 10.
+const unsigned long DOWN_FORWARD_BEFORE_LEVEL_CHECK_MS = 5000;
+const float DOWN_LEVEL_PITCH_MAX_DEG = 20.0;
+
+// If pitch is not within 0..10 degrees, keep moving forward 6 seconds
+// and check again until the robot becomes approximately level or total timeout.
+const unsigned long DOWN_LEVEL_RETRY_FORWARD_MS = 6000;
+
+// Final descent-support sequence after the level check succeeds.
+const unsigned long DOWN_FRONT_EXTEND_5S_B_MS = 5000;
+const unsigned long DOWN_FORWARD_AFTER_EXTEND_5S_B_MS = 2000;
+
+const unsigned long DOWN_FRONT_RETRACT_2S_B_MS = 2000;
+const unsigned long DOWN_FORWARD_AFTER_RETRACT_2S_B_MS = 2000;
+
+const unsigned long DOWN_FRONT_RETRACT_3S_B_MS = 3000;
+
+const float DOWN_PITCH_HARD_DANGER_DEG = 55.0;
+const float DOWN_ROLL_HARD_DANGER_DEG  = 50.0;
+const float DOWN_ROLL_WARNING_DEG = 35.0;
+
+
+// ==================================================
 // LEGO BLOCK STATE MACHINE
 // ==================================================
 enum MegaBlockType {
@@ -248,7 +333,7 @@ enum MegaBlockType {
   BLOCK_TURN,
   BLOCK_JACK,
   BLOCK_UP_STAIRS,
-  BLOCK_DOWN_STAIRS_PLACEHOLDER
+  BLOCK_DOWN_STAIRS
 };
 
 enum MegaBlockStep {
@@ -270,7 +355,44 @@ enum MegaBlockStep {
   STEP_UP_FINAL_FORWARD,
   STEP_UP_FINAL_TURN,
 
-  STEP_DOWN_PLACEHOLDER
+  STEP_DOWN_INIT,
+  STEP_DOWN_INITIAL_FORWARD,
+
+  STEP_DOWN_FRONT_EXTEND_12S,
+  STEP_DOWN_FORWARD_AFTER_EXTEND_12S,
+
+  STEP_DOWN_FRONT_EXTEND_3S,
+  STEP_DOWN_FORWARD_AFTER_EXTEND_3S,
+
+  STEP_DOWN_REAR_EXTEND_20S,
+  STEP_DOWN_FORWARD_AFTER_REAR_EXTEND_1S,
+  STEP_DOWN_REAR_RETRACT_20S,
+
+  STEP_DOWN_FRONT_RETRACT_5S_A,
+  STEP_DOWN_FORWARD_AFTER_RETRACT_5S_A,
+
+  STEP_DOWN_FRONT_RETRACT_5S_B,
+  STEP_DOWN_FORWARD_AFTER_RETRACT_5S_B,
+
+  STEP_DOWN_FRONT_EXTEND_5S_A,
+  STEP_DOWN_FORWARD_AFTER_EXTEND_5S_A,
+
+  STEP_DOWN_FRONT_RETRACT_2S_A,
+  STEP_DOWN_FORWARD_AFTER_RETRACT_2S_A,
+
+  STEP_DOWN_FRONT_RETRACT_3S_A,
+
+  STEP_DOWN_FORWARD_BEFORE_LEVEL_CHECK,
+  STEP_DOWN_LEVEL_CHECK,
+  STEP_DOWN_LEVEL_RETRY_FORWARD,
+
+  STEP_DOWN_FRONT_EXTEND_5S_B,
+  STEP_DOWN_FORWARD_AFTER_EXTEND_5S_B,
+
+  STEP_DOWN_FRONT_RETRACT_2S_B,
+  STEP_DOWN_FORWARD_AFTER_RETRACT_2S_B,
+
+  STEP_DOWN_FRONT_RETRACT_3S_B
 };
 
 MegaBlockType activeBlock = BLOCK_NONE;
@@ -305,6 +427,10 @@ unsigned long upCurrentJackExtendMs = 0;
 unsigned long upCurrentJackRetractMs = 0;
 unsigned long upCurrentForwardAfterJackMs = 0;
 int upCurrentStair = 0;  // 1, 2, 3
+
+// DOWN STAIRS
+float downStartPitch = 0.0;
+float downStepStartPitch = 0.0;
 
 
 // ==================================================
@@ -355,6 +481,8 @@ void setup() {
   Serial.println("MEGA:UP_STAIRS_WAIT_FIRST_MPU_TILT_THEN_3_4_2_3_FULL_JACK");
   Serial.println("MEGA:UP_STAIRS_PER_STAIR_MPU_TRIGGERS_FIRST_30_SECOND_34_THIRD_38");
   Serial.println("MEGA:UP_STAIRS_FINAL_FORWARD_2S_TURN_90_STOP");
+  Serial.println("MEGA:AUTO_DOWN_STAIRS_FRONT_JACK_WITH_REAR_SUPPORT_SEQUENCE_ENABLED");
+  Serial.println("MEGA:DOWN_STAIRS_FRONT_JACK_REAR_SUPPORT_LEVEL_CHECK_0_TO_10_DEG");
   Serial.println("MEGA:HARD_TILT_ONLY_ENABLED");
 
   Serial1.println("MEGA:READY");
@@ -362,6 +490,8 @@ void setup() {
   Serial1.println("MEGA:AUTO_UP_STAIRS_3_STAIRS_SCENARIO_ENABLED");
   Serial1.println("MEGA:UP_STAIRS_WAIT_FIRST_MPU_TILT_THEN_3_4_2_3_FULL_JACK");
   Serial1.println("MEGA:UP_STAIRS_PER_STAIR_MPU_TRIGGERS_FIRST_30_SECOND_34_THIRD_38");
+  Serial1.println("MEGA:AUTO_DOWN_STAIRS_FRONT_JACK_WITH_REAR_SUPPORT_SEQUENCE_ENABLED");
+  Serial1.println("MEGA:DOWN_STAIRS_FRONT_JACK_REAR_SUPPORT_LEVEL_CHECK_0_TO_10_DEG");
 }
 
 
@@ -604,7 +734,7 @@ void handleMegaBlockCommand(String command) {
   }
 
   if (command == "AUTO:DOWN_STAIRS") {
-    startDownStairsPlaceholder();
+    startDownStairsBlock();
     return;
   }
 
@@ -945,22 +1075,31 @@ void startUpStairsBlock() {
 
 
 // ==================================================
-// AUTO BLOCK: DOWN STAIRS PLACEHOLDER
+// AUTO BLOCK: DOWN STAIRS
 // ==================================================
-void startDownStairsPlaceholder() {
+void startDownStairsBlock() {
   stopActiveBlock("NEW_DOWN_STAIRS");
 
-  activeBlock = BLOCK_DOWN_STAIRS_PLACEHOLDER;
-  blockStep = STEP_DOWN_PLACEHOLDER;
-  activeBlockName = "DOWN_STAIRS_PLACEHOLDER";
+  saveCurrentSpeed();
+
+  activeBlock = BLOCK_DOWN_STAIRS;
+  blockStep = STEP_DOWN_INIT;
+  activeBlockName = "DOWN_STAIRS";
+
+  systemMode = "AUTO";
+  currentMode = "CLIMB";
 
   blockStartMs = millis();
   blockStepStartMs = blockStartMs;
 
-  blockAck("START:DOWN_STAIRS");
-  blockAck("STEP:DOWN_STAIRS:PLACEHOLDER_READY_NO_MOVEMENT");
+  downStartPitch = pitch;
+  downStepStartPitch = pitch;
 
-  finishActiveBlock("DOWN_STAIRS_PLACEHOLDER");
+  timedMoveActive = false;
+
+  setSpeedPercent(DOWN_STAIRS_SPEED_PERCENT, false);
+
+  blockAck("START:DOWN_STAIRS:FRONT_JACK_WITH_REAR_SUPPORT:INITIAL_FORWARD_2S:MPU_ANGLES_UNCHANGED");
 }
 
 
@@ -991,6 +1130,11 @@ void runMegaBlockStateMachine() {
 
   if (activeBlock == BLOCK_UP_STAIRS) {
     runUpStairsBlock(now);
+    return;
+  }
+
+  if (activeBlock == BLOCK_DOWN_STAIRS) {
+    runDownStairsBlock(now);
     return;
   }
 }
@@ -1471,6 +1615,650 @@ void runUpStairsBlock(unsigned long now) {
 
 
 // ==================================================
+// RUN AUTO BLOCK: DOWN STAIRS - FRONT JACK WITH REAR SUPPORT
+// ==================================================
+bool downPitchLevelOK() {
+  // Descent pitch can be positive or negative depending on MPU mounting.
+  // User requested approximately 0 to 10 degrees, so we check absolute pitch.
+  return (fabs(pitch) <= DOWN_LEVEL_PITCH_MAX_DEG);
+}
+
+void downDriveStep() {
+  if (DOWN_MOVE_FORWARD_DURING_DESCENT) {
+    lastMovement = "FORWARD";
+    moveForward();
+  } else {
+    lastMovement = "BACKWARD";
+    moveBackward();
+  }
+}
+
+String downDriveName() {
+  if (DOWN_MOVE_FORWARD_DURING_DESCENT) {
+    return "FORWARD";
+  }
+
+  return "BACKWARD";
+}
+
+void startDownTimedForward(MegaBlockStep nextStep, unsigned long now, unsigned long durationMs, String ackText) {
+  setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+  downDriveStep();
+
+  blockStep = nextStep;
+  blockStepStartMs = now;
+
+  blockAck(ackText + ":FORWARD_MS=" + String(durationMs));
+}
+
+void startDownFrontExtend(MegaBlockStep nextStep, unsigned long now, unsigned long durationMs, String ackText) {
+  stopMotors();
+  lastMovement = "STOP";
+
+  frontJackExtend();
+
+  blockStep = nextStep;
+  blockStepStartMs = now;
+
+  blockAck(ackText + ":FRONT_JACK_DOWN_MS=" + String(durationMs));
+}
+
+void startDownFrontRetract(MegaBlockStep nextStep, unsigned long now, unsigned long durationMs, String ackText) {
+  stopMotors();
+  lastMovement = "STOP";
+
+  frontJackRetract();
+
+  blockStep = nextStep;
+  blockStepStartMs = now;
+
+  blockAck(ackText + ":FRONT_JACK_UP_MS=" + String(durationMs));
+}
+
+void runDownStairsBlock(unsigned long now) {
+  // DOWN_STAIRS emergency tilt stop is intentionally disabled by user request.
+  // The block will continue even if pitch/roll becomes high.
+  // Manual STOP / BLOCK:STOP / AUTO:STOP still works normally.
+  if (fabs(roll) >= DOWN_ROLL_HARD_DANGER_DEG || fabs(pitch) >= DOWN_PITCH_HARD_DANGER_DEG) {
+    static unsigned long lastDownHardTiltWarnMs = 0;
+    if (now - lastDownHardTiltWarnMs > 1000) {
+      lastDownHardTiltWarnMs = now;
+      blockAck(
+        "WARN:DOWN_STAIRS:HARD_TILT_IGNORED_CONTINUING:"
+        "PITCH=" + String(pitch, 2) +
+        ":ROLL=" + String(roll, 2)
+      );
+    }
+  }
+
+  // Roll warning only, no stop.
+  if (fabs(roll) >= DOWN_ROLL_WARNING_DEG) {
+    static unsigned long lastDownRollWarnMs = 0;
+    if (now - lastDownRollWarnMs > 1000) {
+      lastDownRollWarnMs = now;
+      blockAck("WARN:DOWN_STAIRS:ROLL_HIGH_CONTINUING:ROLL=" + String(roll, 2));
+    }
+  }
+
+  if (now - blockStartMs >= DOWN_STAIRS_MAX_TOTAL_MS) {
+    blockError("DOWN_STAIRS:TIMEOUT", "MAX_TOTAL_MS");
+    return;
+  }
+
+  // ==================================================
+  // STEP 0:
+  // Start the precise descent sequence with front jack and added rear support.
+  // ==================================================
+  if (blockStep == STEP_DOWN_INIT) {
+    downStartPitch = pitch;
+    downStepStartPitch = pitch;
+
+    blockAck(
+      "STEP:DOWN_STAIRS:PRECISE_FRONT_JACK_WITH_REAR_SUPPORT_START:"
+      "DRIVE=" + downDriveName() +
+      ":START_PITCH=" + String(downStartPitch, 2) +
+      ":LEVEL_TARGET_ABS_PITCH_0_TO_" + String(DOWN_LEVEL_PITCH_MAX_DEG, 1)
+    );
+
+    setSpeedPercent(DOWN_STAIRS_SPEED_PERCENT, false);
+    downDriveStep();
+
+    blockStep = STEP_DOWN_INITIAL_FORWARD;
+    blockStepStartMs = now;
+    return;
+  }
+
+  // 1) Forward 2 seconds.
+  if (blockStep == STEP_DOWN_INITIAL_FORWARD) {
+    setSpeedPercent(DOWN_STAIRS_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_INITIAL_FORWARD_MS) {
+      startDownFrontExtend(
+        STEP_DOWN_FRONT_EXTEND_12S,
+        now,
+        DOWN_FRONT_EXTEND_12S_MS,
+        "STEP:DOWN_STAIRS:FORWARD_2S_DONE"
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 2) Front jack down 12 seconds.
+  if (blockStep == STEP_DOWN_FRONT_EXTEND_12S) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackExtend();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_EXTEND_12S_MS) {
+      frontJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_AFTER_EXTEND_12S;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FRONT_JACK_DOWN_12S_DONE:FORWARD_1S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 3) Forward 1 second.
+  if (blockStep == STEP_DOWN_FORWARD_AFTER_EXTEND_12S) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_AFTER_EXTEND_12S_MS) {
+      startDownFrontExtend(
+        STEP_DOWN_FRONT_EXTEND_3S,
+        now,
+        DOWN_FRONT_EXTEND_3S_MS,
+        "STEP:DOWN_STAIRS:FORWARD_1S_DONE"
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 4) Front jack down 3 seconds.
+  if (blockStep == STEP_DOWN_FRONT_EXTEND_3S) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackExtend();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_EXTEND_3S_MS) {
+      frontJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_AFTER_EXTEND_3S;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FRONT_JACK_DOWN_3S_DONE:FORWARD_1_5S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 5) Forward 1.5 seconds.
+  if (blockStep == STEP_DOWN_FORWARD_AFTER_EXTEND_3S) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_AFTER_EXTEND_3S_MS) {
+      stopMotors();
+      lastMovement = "STOP";
+
+      rearJackExtend();
+
+      blockStep = STEP_DOWN_REAR_EXTEND_20S;
+      blockStepStartMs = now;
+
+      blockAck(
+        "STEP:DOWN_STAIRS:FORWARD_1_5S_DONE:REAR_JACK_DOWN_20S_START:"
+        "REAR_JACK_DOWN_MS=" + String(DOWN_REAR_EXTEND_AFTER_FRONT_3S_MS)
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 6) Rear jack down 20 seconds.
+  if (blockStep == STEP_DOWN_REAR_EXTEND_20S) {
+    stopMotors();
+    lastMovement = "STOP";
+    rearJackExtend();
+
+    if (now - blockStepStartMs >= DOWN_REAR_EXTEND_AFTER_FRONT_3S_MS) {
+      rearJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_AFTER_REAR_EXTEND_1S;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:REAR_JACK_DOWN_20S_DONE:FORWARD_1S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 7) Forward 1 second after rear jack down.
+  if (blockStep == STEP_DOWN_FORWARD_AFTER_REAR_EXTEND_1S) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_AFTER_REAR_EXTEND_MS) {
+      stopMotors();
+      lastMovement = "STOP";
+
+      rearJackRetract();
+
+      blockStep = STEP_DOWN_REAR_RETRACT_20S;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FORWARD_1S_AFTER_REAR_DOWN_DONE:REAR_JACK_UP_20S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 8) Rear jack up 20 seconds.
+  if (blockStep == STEP_DOWN_REAR_RETRACT_20S) {
+    stopMotors();
+    lastMovement = "STOP";
+    rearJackRetract();
+
+    if (now - blockStepStartMs >= DOWN_REAR_RETRACT_AFTER_FORWARD_MS) {
+      rearJackStop();
+
+      frontJackRetract();
+
+      blockStep = STEP_DOWN_FRONT_RETRACT_5S_A;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:REAR_JACK_UP_20S_DONE:FRONT_JACK_UP_5S_A_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 9) Front jack up 5 seconds.
+  if (blockStep == STEP_DOWN_FRONT_RETRACT_5S_A) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackRetract();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_RETRACT_5S_A_MS) {
+      frontJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_AFTER_RETRACT_5S_A;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FRONT_JACK_UP_5S_A_DONE:FORWARD_1S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 10) Forward 1 second.
+  if (blockStep == STEP_DOWN_FORWARD_AFTER_RETRACT_5S_A) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_AFTER_RETRACT_5S_A_MS) {
+      startDownFrontRetract(
+        STEP_DOWN_FRONT_RETRACT_5S_B,
+        now,
+        DOWN_FRONT_RETRACT_10S_B_MS,
+        "STEP:DOWN_STAIRS:FORWARD_1S_DONE"
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 11) Front jack up another 5 seconds.
+  if (blockStep == STEP_DOWN_FRONT_RETRACT_5S_B) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackRetract();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_RETRACT_10S_B_MS) {
+      frontJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_AFTER_RETRACT_5S_B;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FRONT_JACK_UP_5S_B_DONE:FORWARD_1S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 12) Forward 1 second.
+  if (blockStep == STEP_DOWN_FORWARD_AFTER_RETRACT_5S_B) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_AFTER_RETRACT_10S_B_MS) {
+      startDownFrontExtend(
+        STEP_DOWN_FRONT_EXTEND_5S_A,
+        now,
+        DOWN_FRONT_EXTEND_5S_A_MS,
+        "STEP:DOWN_STAIRS:FORWARD_1S_DONE"
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 13) Front jack down 5 seconds.
+  if (blockStep == STEP_DOWN_FRONT_EXTEND_5S_A) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackExtend();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_EXTEND_5S_A_MS) {
+      frontJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_AFTER_EXTEND_5S_A;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FRONT_JACK_DOWN_5S_A_DONE:FORWARD_2S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 14) Forward 2 seconds.
+  if (blockStep == STEP_DOWN_FORWARD_AFTER_EXTEND_5S_A) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_AFTER_EXTEND_5S_A_MS) {
+      startDownFrontRetract(
+        STEP_DOWN_FRONT_RETRACT_2S_A,
+        now,
+        DOWN_FRONT_RETRACT_2S_A_MS,
+        "STEP:DOWN_STAIRS:FORWARD_2S_DONE"
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 15) Front jack up 2 seconds.
+  if (blockStep == STEP_DOWN_FRONT_RETRACT_2S_A) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackRetract();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_RETRACT_2S_A_MS) {
+      frontJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_AFTER_RETRACT_2S_A;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FRONT_JACK_UP_2S_A_DONE:FORWARD_2S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 16) Forward 2 seconds.
+  if (blockStep == STEP_DOWN_FORWARD_AFTER_RETRACT_2S_A) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_AFTER_RETRACT_2S_A_MS) {
+      startDownFrontRetract(
+        STEP_DOWN_FRONT_RETRACT_3S_A,
+        now,
+        DOWN_FRONT_RETRACT_3S_A_MS,
+        "STEP:DOWN_STAIRS:FORWARD_2S_DONE"
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 17) Front jack up 3 seconds.
+  if (blockStep == STEP_DOWN_FRONT_RETRACT_3S_A) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackRetract();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_RETRACT_3S_A_MS) {
+      frontJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_BEFORE_LEVEL_CHECK;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FRONT_JACK_UP_3S_A_DONE:FORWARD_5S_BEFORE_LEVEL_CHECK_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 18) Forward 5 seconds, then check pitch level.
+  if (blockStep == STEP_DOWN_FORWARD_BEFORE_LEVEL_CHECK) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_BEFORE_LEVEL_CHECK_MS) {
+      stopMotors();
+      lastMovement = "STOP";
+
+      blockStep = STEP_DOWN_LEVEL_CHECK;
+      blockStepStartMs = now;
+
+      blockAck(
+        "STEP:DOWN_STAIRS:FORWARD_5S_DONE:LEVEL_CHECK:"
+        "ABS_PITCH=" + String(fabs(pitch), 2) +
+        ":TARGET_MAX=" + String(DOWN_LEVEL_PITCH_MAX_DEG, 1)
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 19) If abs(pitch) is 0..10, continue.
+  // If not, forward 6 seconds and check again.
+  if (blockStep == STEP_DOWN_LEVEL_CHECK) {
+    stopMotors();
+    lastMovement = "STOP";
+
+    if (downPitchLevelOK()) {
+      blockAck(
+        "STEP:DOWN_STAIRS:LEVEL_OK_CONTINUE:"
+        "PITCH=" + String(pitch, 2) +
+        ":ROLL=" + String(roll, 2)
+      );
+
+      startDownFrontExtend(
+        STEP_DOWN_FRONT_EXTEND_5S_B,
+        now,
+        DOWN_FRONT_EXTEND_5S_B_MS,
+        "STEP:DOWN_STAIRS:LEVEL_OK"
+      );
+      return;
+    }
+
+    blockAck(
+      "WARN:DOWN_STAIRS:LEVEL_NOT_OK_FORWARD_6S_AND_RECHECK:"
+      "PITCH=" + String(pitch, 2) +
+      ":ROLL=" + String(roll, 2) +
+      ":ABS_PITCH=" + String(fabs(pitch), 2)
+    );
+
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    blockStep = STEP_DOWN_LEVEL_RETRY_FORWARD;
+    blockStepStartMs = now;
+    return;
+  }
+
+  // 20) Forward 6 seconds, then check pitch again. Repeat until level or total timeout.
+  if (blockStep == STEP_DOWN_LEVEL_RETRY_FORWARD) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_LEVEL_RETRY_FORWARD_MS) {
+      stopMotors();
+      lastMovement = "STOP";
+
+      blockStep = STEP_DOWN_LEVEL_CHECK;
+      blockStepStartMs = now;
+
+      blockAck(
+        "STEP:DOWN_STAIRS:FORWARD_6S_RETRY_DONE:RECHECK_LEVEL:"
+        "ABS_PITCH=" + String(fabs(pitch), 2) +
+        ":TARGET_MAX=" + String(DOWN_LEVEL_PITCH_MAX_DEG, 1)
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 21) Front jack down 5 seconds.
+  if (blockStep == STEP_DOWN_FRONT_EXTEND_5S_B) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackExtend();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_EXTEND_5S_B_MS) {
+      frontJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_AFTER_EXTEND_5S_B;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FRONT_JACK_DOWN_5S_B_DONE:FORWARD_2S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 22) Forward 2 seconds.
+  if (blockStep == STEP_DOWN_FORWARD_AFTER_EXTEND_5S_B) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_AFTER_EXTEND_5S_B_MS) {
+      startDownFrontRetract(
+        STEP_DOWN_FRONT_RETRACT_2S_B,
+        now,
+        DOWN_FRONT_RETRACT_2S_B_MS,
+        "STEP:DOWN_STAIRS:FORWARD_2S_DONE"
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 23) Front jack up 2 seconds.
+  if (blockStep == STEP_DOWN_FRONT_RETRACT_2S_B) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackRetract();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_RETRACT_2S_B_MS) {
+      frontJackStop();
+
+      setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+      downDriveStep();
+
+      blockStep = STEP_DOWN_FORWARD_AFTER_RETRACT_2S_B;
+      blockStepStartMs = now;
+
+      blockAck("STEP:DOWN_STAIRS:FRONT_JACK_UP_2S_B_DONE:FORWARD_2S_START");
+      return;
+    }
+
+    return;
+  }
+
+  // 24) Forward 2 seconds.
+  if (blockStep == STEP_DOWN_FORWARD_AFTER_RETRACT_2S_B) {
+    setSpeedPercent(DOWN_AFTER_JACK_SPEED_PERCENT, false);
+    downDriveStep();
+
+    if (now - blockStepStartMs >= DOWN_FORWARD_AFTER_RETRACT_2S_B_MS) {
+      startDownFrontRetract(
+        STEP_DOWN_FRONT_RETRACT_3S_B,
+        now,
+        DOWN_FRONT_RETRACT_3S_B_MS,
+        "STEP:DOWN_STAIRS:FORWARD_2S_DONE"
+      );
+      return;
+    }
+
+    return;
+  }
+
+  // 25) Front jack up 3 seconds, then finish.
+  if (blockStep == STEP_DOWN_FRONT_RETRACT_3S_B) {
+    stopMotors();
+    lastMovement = "STOP";
+    frontJackRetract();
+
+    if (now - blockStepStartMs >= DOWN_FRONT_RETRACT_3S_B_MS) {
+      frontJackStop();
+      finishActiveBlock("DOWN_STAIRS_FRONT_JACK_REAR_SUPPORT_PRECISE_SEQUENCE_DONE");
+      return;
+    }
+
+    return;
+  }
+}
+
+
+// ==================================================
 // PULSE COMMAND HANDLER
 // ==================================================
 void handlePulseCommand(String command) {
@@ -1607,6 +2395,9 @@ String detectAlert() {
   if (activeBlock == BLOCK_UP_STAIRS) {
     pitchLimit = UP_PITCH_HARD_DANGER_DEG;
     rollLimit = UP_ROLL_HARD_DANGER_DEG;
+  } else if (activeBlock == BLOCK_DOWN_STAIRS) {
+    pitchLimit = DOWN_PITCH_HARD_DANGER_DEG;
+    rollLimit = DOWN_ROLL_HARD_DANGER_DEG;
   }
 
   if (fabs(pitch) > pitchLimit) {

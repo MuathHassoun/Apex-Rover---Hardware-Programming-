@@ -200,20 +200,20 @@ const int HOME_GRIPPER = 180;
 // ==================================================
 // Arm TAKE_OUT Pose
 // ==================================================
-const int TAKE_OUT_SHOULDER = 125;
-const int TAKE_OUT_ELBOW = 70;
-const int TAKE_OUT_WRIST = 95;
-const int TAKE_OUT_AUX = 125;
-const int TAKE_OUT_GRIPPER = 180;
+const int TAKE_OUT_SHOULDER = 60;
+const int TAKE_OUT_ELBOW = 80;
+const int TAKE_OUT_WRIST = 150;
+const int TAKE_OUT_AUX = 170;
+const int TAKE_OUT_GRIPPER = 120;
 
 
 // ==================================================
 // Arm DROP_IN Pose
 // ==================================================
-const int DROP_IN_SHOULDER = 110;
-const int DROP_IN_ELBOW = 55;
-const int DROP_IN_WRIST = 85;
-const int DROP_IN_AUX = 120;
+const int DROP_IN_SHOULDER = 90;
+const int DROP_IN_ELBOW = 50;
+const int DROP_IN_WRIST = 150;
+const int DROP_IN_AUX = 170;
 const int DROP_IN_GRIPPER = 120;
 
 
@@ -221,9 +221,9 @@ const int DROP_IN_GRIPPER = 120;
 // Arm DROP_OUT Pose
 // ==================================================
 const int DROP_OUT_SHOULDER = 120;
-const int DROP_OUT_ELBOW = 65;
+const int DROP_OUT_ELBOW = 50;
 const int DROP_OUT_WRIST = 90;
-const int DROP_OUT_AUX = 125;
+const int DROP_OUT_AUX = 170;
 const int DROP_OUT_GRIPPER = 120;
 
 
@@ -242,8 +242,8 @@ const long ARM_BASE_STEPS_PER_DEG = 10;
 const long ARM_BASE_ZERO_DEG   = 0;
 const long ARM_BASE_HOME_DEG   = 150;
 const long ARM_BASE_READY_DEG  = 0;
-const long ARM_BASE_TAKE_OUT_DEG = 0;
-const long ARM_BASE_DROP_IN_DEG  = 120;
+const long ARM_BASE_TAKE_OUT_DEG = 150;
+const long ARM_BASE_DROP_IN_DEG  = 150;
 const long ARM_BASE_DROP_OUT_DEG = 0;
 
 const long ARM_BASE_ZERO_POSITION     = ARM_BASE_ZERO_DEG   * ARM_BASE_STEPS_PER_DEG;
