@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <WebSocketsServer.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiUdp.h>
 #include <ESP32Servo.h>
 
 // =================================================================
@@ -18,9 +20,15 @@
 // Mega ACK path WITHOUT return wire:
 //   Mega USB Serial -> Raspberry sensor_bridge -> ESP32 /bridge_event -> Mobile App
 //
+// Raspberry command mirror:
+//   Every command received by ESP32 and every routed command sent by ESP32
+//   is mirrored to Raspberry over UDP so Raspberry always knows the
+//   command currently being applied by the system.
+//
 // Routing:
 //   CAM:*        -> handled locally on ESP32 (camera stand)
 //   ARM:*        -> UNO
+//   AUTO:FULL_SCENARIO -> handled by ESP32 state machine
 //   AUTO:* / BLOCK:* / movement / jack / speed -> Mega
 //
 // Camera Stand pins (ESP32):
@@ -59,6 +67,7 @@ HardwareSerial UnoSerial(1);
 
 WebSocketsServer webSocket = WebSocketsServer(81);
 WebServer httpServer(80);
+WiFiUDP raspberryCommandUdp;
 
 
 // =================================================================
@@ -134,16 +143,90 @@ unsigned long lastBridgeEventAt = 0;
 
 
 // =================================================================
+// Raspberry notification settings
+// =================================================================
+// Raspberry Pi should be connected to the ESP32 AP.
+// Change this IP/port if your Raspberry gets another address.
+const bool RASPBERRY_NOTIFY_ENABLED = true;
+const char* RASPBERRY_HOST = "192.168.4.2";
+const uint16_t RASPBERRY_PORT = 5050;
+const char* RASPBERRY_AUTO_STATUS_PATH = "/auto_status";
+
+// Every command that reaches the ESP32, and every command routed by the ESP32,
+// is mirrored to the Raspberry Pi using UDP. UDP is used so manual control stays
+// fast even if the Raspberry Pi is temporarily offline.
+const bool RASPBERRY_COMMAND_MIRROR_ENABLED = true;
+IPAddress RASPBERRY_COMMAND_IP(192, 168, 4, 2);
+const uint16_t RASPBERRY_COMMAND_UDP_PORT = 5055;
+const uint16_t ESP32_COMMAND_UDP_LOCAL_PORT = 5056;
+
+String lastRaspberryMirrorPayload = "NONE";
+String lastRaspberryMirrorTarget  = "NONE";
+String lastRaspberryMirrorCommand = "NONE";
+bool lastRaspberryMirrorOk = false;
+unsigned long lastRaspberryMirrorAt = 0;
+unsigned long raspberryMirrorCount = 0;
+
+
+// =================================================================
+// Full automatic scenario managed by ESP32
+// Mobile/Raspberry sends one command:
+//   AUTO:FULL_SCENARIO
+// ESP32 then sends these commands to Mega one by one:
+//   1) AUTO:UP_STAIRS
+//   2) BLOCK:GO:FORWARD:4
+//   3) BLOCK:TURN:RIGHT:90
+//   4) BLOCK:GO:FORWARD:1
+//   5) AUTO:DOWN_STAIRS
+// ESP32 waits for Mega DONE ACK before sending the next command.
+// ACK can arrive directly on MegaSerial RX or through Raspberry /bridge_event.
+// =================================================================
+enum FullAutoStep {
+  FULL_AUTO_IDLE,
+  FULL_AUTO_UP_STAIRS,
+  FULL_AUTO_GO_FORWARD_4,
+  FULL_AUTO_TURN_RIGHT_90,
+  FULL_AUTO_GO_FORWARD_1,
+  FULL_AUTO_DOWN_STAIRS,
+  FULL_AUTO_DONE,
+  FULL_AUTO_ERROR
+};
+
+bool fullAutoActive = false;
+FullAutoStep fullAutoStep = FULL_AUTO_IDLE;
+unsigned long fullAutoStartedAt = 0;
+unsigned long fullAutoStepStartedAt = 0;
+unsigned long fullAutoStepTimeoutMs = 0;
+int fullAutoStepNumber = 0;
+
+String fullAutoState = "IDLE";
+String fullAutoCurrentCommand = "NONE";
+String fullAutoExpectedDonePrefix = "NONE";
+String fullAutoLastAck = "NONE";
+String fullAutoLastError = "NONE";
+String fullAutoLastStage = "IDLE";
+
+
+// =================================================================
+// Function prototypes used before their definitions
+// =================================================================
+void mirrorCommandToRaspberry(const String& direction, const String& target, const String& cmd);
+void stopCameraMotion();
+
+
+// =================================================================
 // Serial helpers
 // =================================================================
 void sendToMega(const String& cmd) {
   MegaSerial.println(cmd);
+  mirrorCommandToRaspberry("OUT", "MEGA", cmd);
   Serial.print("[-> MEGA] ");
   Serial.println(cmd);
 }
 
 void sendToUno(const String& cmd) {
   UnoSerial.println(cmd);
+  mirrorCommandToRaspberry("OUT", "UNO", cmd);
   Serial.print("[-> UNO] ");
   Serial.println(cmd);
 }
@@ -173,6 +256,60 @@ String urlDecode(String s) {
   s.replace("+", " ");
   s.replace("%25", "%");
   return s;
+}
+
+String urlEncode(String s) {
+  String out = "";
+
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+
+    if (isAlphaNumeric(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else if (c == ' ') {
+      out += "%20";
+    } else {
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%%%02X", (uint8_t)c);
+      out += buf;
+    }
+  }
+
+  return out;
+}
+
+void mirrorCommandToRaspberry(const String& direction, const String& target, const String& cmd) {
+  if (!RASPBERRY_COMMAND_MIRROR_ENABLED) return;
+  if (cmd.length() == 0) return;
+
+  String payload = "{";
+  payload += "\"event\":\"esp32_command\",";
+  payload += "\"direction\":\"" + jsonEscape(direction) + "\",";
+  payload += "\"target\":\"" + jsonEscape(target) + "\",";
+  payload += "\"mode\":\"" + jsonEscape(currentMode) + "\",";
+  payload += "\"command\":\"" + jsonEscape(cmd) + "\",";
+  payload += "\"full_auto_active\":" + String(fullAutoActive ? "true" : "false") + ",";
+  payload += "\"full_auto_stage\":\"" + jsonEscape(fullAutoLastStage) + "\",";
+  payload += "\"millis\":" + String(millis());
+  payload += "}";
+
+  raspberryCommandUdp.beginPacket(RASPBERRY_COMMAND_IP, RASPBERRY_COMMAND_UDP_PORT);
+  raspberryCommandUdp.print(payload);
+  int ok = raspberryCommandUdp.endPacket();
+
+  lastRaspberryMirrorPayload = payload;
+  lastRaspberryMirrorTarget = target;
+  lastRaspberryMirrorCommand = cmd;
+  lastRaspberryMirrorOk = (ok == 1);
+  lastRaspberryMirrorAt = millis();
+  raspberryMirrorCount++;
+
+  Serial.print("[RPI MIRROR ");
+  Serial.print(direction);
+  Serial.print(" -> ");
+  Serial.print(target);
+  Serial.print("] ");
+  Serial.println(cmd);
 }
 
 long camClampLong(long v, long lo, long hi) {
@@ -209,6 +346,258 @@ void broadcastBridgeLine(const String& source, const String& line) {
 
   String jsonPayload = json;
   webSocket.broadcastTXT(jsonPayload);
+}
+
+String fullAutoStepName(FullAutoStep step) {
+  switch (step) {
+    case FULL_AUTO_UP_STAIRS:      return "UP_STAIRS";
+    case FULL_AUTO_GO_FORWARD_4:   return "GO_FORWARD_4_UNITS";
+    case FULL_AUTO_TURN_RIGHT_90:  return "TURN_RIGHT_90";
+    case FULL_AUTO_GO_FORWARD_1:   return "GO_FORWARD_1_UNIT";
+    case FULL_AUTO_DOWN_STAIRS:    return "DOWN_STAIRS";
+    case FULL_AUTO_DONE:           return "DONE";
+    case FULL_AUTO_ERROR:          return "ERROR";
+    default:                       return "IDLE";
+  }
+}
+
+void notifyRaspberryAutoStatus(const String& phase, const String& detail) {
+  if (!RASPBERRY_NOTIFY_ENABLED) return;
+  if (WiFi.status() != WL_CONNECTED && WiFi.getMode() != WIFI_AP && WiFi.getMode() != WIFI_AP_STA) return;
+
+  HTTPClient http;
+  String url = "http://" + String(RASPBERRY_HOST) + ":" + String(RASPBERRY_PORT) + String(RASPBERRY_AUTO_STATUS_PATH);
+  url += "?source=ESP32";
+  url += "&phase=" + urlEncode(phase);
+  url += "&step=" + String(fullAutoStepNumber);
+  url += "&stage=" + urlEncode(fullAutoLastStage);
+  url += "&command=" + urlEncode(fullAutoCurrentCommand);
+  url += "&detail=" + urlEncode(detail);
+
+  http.begin(url);
+  http.setConnectTimeout(700);
+  http.setTimeout(700);
+  int code = http.GET();
+  Serial.print("[RASPBERRY AUTO STATUS] HTTP ");
+  Serial.println(code);
+  http.end();
+}
+
+void broadcastFullAutoEvent(const String& eventName, const String& detail) {
+  String json = "{";
+  json += "\"event\":\"" + jsonEscape(eventName) + "\",";
+  json += "\"mode\":\"" + currentMode + "\",";
+  json += "\"auto_active\":" + String(fullAutoActive ? "true" : "false") + ",";
+  json += "\"auto_state\":\"" + jsonEscape(fullAutoState) + "\",";
+  json += "\"auto_step\":" + String(fullAutoStepNumber) + ",";
+  json += "\"auto_stage\":\"" + jsonEscape(fullAutoLastStage) + "\",";
+  json += "\"auto_command\":\"" + jsonEscape(fullAutoCurrentCommand) + "\",";
+  json += "\"auto_expected_done\":\"" + jsonEscape(fullAutoExpectedDonePrefix) + "\",";
+  json += "\"auto_last_ack\":\"" + jsonEscape(fullAutoLastAck) + "\",";
+  json += "\"auto_last_error\":\"" + jsonEscape(fullAutoLastError) + "\",";
+  json += "\"detail\":\"" + jsonEscape(detail) + "\"";
+  json += "}";
+
+  webSocket.broadcastTXT(json);
+  notifyRaspberryAutoStatus(eventName, detail);
+}
+
+void fullAutoFail(const String& reason) {
+  fullAutoActive = false;
+  fullAutoStep = FULL_AUTO_ERROR;
+  fullAutoState = "ERROR";
+  fullAutoLastStage = "ERROR";
+  fullAutoLastError = reason;
+
+  stopCameraMotion();
+  sendToMega("AUTO:STOP");
+  sendToUno("ARM:STOP");
+
+  Serial.print("[FULL AUTO ERROR] ");
+  Serial.println(reason);
+  broadcastFullAutoEvent("full_auto_error", reason);
+}
+
+void fullAutoSendStep(FullAutoStep step) {
+  fullAutoStep = step;
+  fullAutoStepNumber++;
+  fullAutoStepStartedAt = millis();
+  fullAutoLastStage = fullAutoStepName(step);
+  fullAutoState = "RUNNING";
+
+  if (step == FULL_AUTO_UP_STAIRS) {
+    fullAutoCurrentCommand = "AUTO:UP_STAIRS";
+    fullAutoExpectedDonePrefix = "ACK:MEGA:DONE:UP_STAIRS";
+    fullAutoStepTimeoutMs = 210000UL;
+  } else if (step == FULL_AUTO_GO_FORWARD_4) {
+    fullAutoCurrentCommand = "BLOCK:GO:FORWARD:4";
+    fullAutoExpectedDonePrefix = "ACK:MEGA:DONE:GO:FORWARD";
+    fullAutoStepTimeoutMs = 15000UL;
+  } else if (step == FULL_AUTO_TURN_RIGHT_90) {
+    fullAutoCurrentCommand = "BLOCK:TURN:RIGHT:90";
+    fullAutoExpectedDonePrefix = "ACK:MEGA:DONE:TURN:RIGHT";
+    fullAutoStepTimeoutMs = 30000UL;
+  } else if (step == FULL_AUTO_GO_FORWARD_1) {
+    fullAutoCurrentCommand = "BLOCK:GO:FORWARD:1";
+    fullAutoExpectedDonePrefix = "ACK:MEGA:DONE:GO:FORWARD";
+    fullAutoStepTimeoutMs = 15000UL;
+  } else if (step == FULL_AUTO_DOWN_STAIRS) {
+    fullAutoCurrentCommand = "AUTO:DOWN_STAIRS";
+    fullAutoExpectedDonePrefix = "ACK:MEGA:DONE:DOWN_STAIRS";
+    fullAutoStepTimeoutMs = 230000UL;
+  } else {
+    return;
+  }
+
+  sendToMega(fullAutoCurrentCommand);
+
+  Serial.print("[FULL AUTO STEP ");
+  Serial.print(fullAutoStepNumber);
+  Serial.print("] ");
+  Serial.println(fullAutoCurrentCommand);
+
+  broadcastFullAutoEvent("full_auto_step_started", fullAutoLastStage);
+}
+
+void fullAutoAdvance() {
+  if (fullAutoStep == FULL_AUTO_UP_STAIRS) {
+    fullAutoSendStep(FULL_AUTO_GO_FORWARD_4);
+    return;
+  }
+
+  if (fullAutoStep == FULL_AUTO_GO_FORWARD_4) {
+    fullAutoSendStep(FULL_AUTO_TURN_RIGHT_90);
+    return;
+  }
+
+  if (fullAutoStep == FULL_AUTO_TURN_RIGHT_90) {
+    fullAutoSendStep(FULL_AUTO_GO_FORWARD_1);
+    return;
+  }
+
+  if (fullAutoStep == FULL_AUTO_GO_FORWARD_1) {
+    fullAutoSendStep(FULL_AUTO_DOWN_STAIRS);
+    return;
+  }
+
+  if (fullAutoStep == FULL_AUTO_DOWN_STAIRS) {
+    fullAutoActive = false;
+    fullAutoStep = FULL_AUTO_DONE;
+    fullAutoState = "DONE";
+    fullAutoLastStage = "DONE";
+    fullAutoCurrentCommand = "NONE";
+    fullAutoExpectedDonePrefix = "NONE";
+
+    sendToMega("SYS:MODE:MANUAL");
+    sendToUno("SYS:MODE:MANUAL");
+    currentMode = "MANUAL";
+
+    broadcastFullAutoEvent("full_auto_done", "FULL_SCENARIO_FINISHED");
+    return;
+  }
+}
+
+void startFullAutoScenario() {
+  if (fullAutoActive) {
+    broadcastFullAutoEvent("full_auto_busy", "Scenario already running");
+    return;
+  }
+
+  stopCameraMotion();
+
+  currentMode = "AUTO";
+  sendToMega("SYS:MODE:AUTO");
+  sendToUno("SYS:MODE:AUTO");
+
+  fullAutoActive = true;
+  fullAutoStep = FULL_AUTO_IDLE;
+  fullAutoStartedAt = millis();
+  fullAutoStepStartedAt = fullAutoStartedAt;
+  fullAutoStepNumber = 0;
+  fullAutoState = "RUNNING";
+  fullAutoCurrentCommand = "NONE";
+  fullAutoExpectedDonePrefix = "NONE";
+  fullAutoLastAck = "NONE";
+  fullAutoLastError = "NONE";
+  fullAutoLastStage = "START";
+
+  broadcastStatusEvent("mode_changed");
+  broadcastFullAutoEvent("full_auto_started", "UP_STAIRS_GO4_TURN_RIGHT90_GO1_DOWN_STAIRS");
+
+  fullAutoSendStep(FULL_AUTO_UP_STAIRS);
+}
+
+void cancelFullAutoScenario(const String& reason) {
+  if (!fullAutoActive && fullAutoState != "RUNNING") {
+    return;
+  }
+
+  fullAutoActive = false;
+  fullAutoState = "CANCELLED";
+  fullAutoLastStage = "CANCELLED";
+  fullAutoLastError = reason;
+
+  sendToMega("AUTO:STOP");
+  sendToUno("ARM:STOP");
+  stopCameraMotion();
+
+  broadcastFullAutoEvent("full_auto_cancelled", reason);
+}
+
+void handleFullAutoFeedbackLine(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  if (line.startsWith("ACK:MEGA:")) {
+    fullAutoLastAck = line;
+  }
+
+  if (line.startsWith("ERR:MEGA:") || line.startsWith("ERROR:MEGA:")) {
+    fullAutoFail(line);
+    return;
+  }
+
+  if (!fullAutoActive) return;
+
+  if (fullAutoExpectedDonePrefix != "NONE" && line.startsWith(fullAutoExpectedDonePrefix)) {
+    broadcastFullAutoEvent("full_auto_step_done", line);
+    fullAutoAdvance();
+  }
+}
+
+void runFullAutoScenario() {
+  if (!fullAutoActive) return;
+
+  unsigned long now = millis();
+  if (fullAutoStepTimeoutMs > 0 && (now - fullAutoStepStartedAt >= fullAutoStepTimeoutMs)) {
+    fullAutoFail(
+      String("TIMEOUT:") + fullAutoLastStage +
+      ":WAITING_FOR=" + fullAutoExpectedDonePrefix +
+      ":LAST_ACK=" + fullAutoLastAck
+    );
+  }
+}
+
+void readMegaDirectFeedback() {
+  while (MegaSerial.available() > 0) {
+    String line = MegaSerial.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() == 0) continue;
+
+    lastBridgeSource = "MEGA_DIRECT";
+    lastBridgeEvent = line;
+    lastBridgeEventAt = millis();
+
+    if (line.startsWith("ACK:")) lastMegaAck = line;
+    if (line.startsWith("ERR:") || line.startsWith("ERROR:")) lastMegaError = line;
+
+    Serial.print("[<- MEGA DIRECT] ");
+    Serial.println(line);
+
+    broadcastBridgeLine("MEGA_DIRECT", line);
+    handleFullAutoFeedbackLine(line);
+  }
 }
 
 // =================================================================
@@ -525,8 +914,28 @@ void routeCommand(String cmd) {
   lastCommand = cmd;
   lastCommandAt = millis();
 
+  // Mirror every command that reaches the ESP32 to Raspberry, before routing.
+  mirrorCommandToRaspberry("IN", "ESP32_ROUTER", cmd);
+
+  // One-command automatic scenario from mobile dashboard / Raspberry.
+  if (cmd == "AUTO:FULL_SCENARIO" || cmd == "AUTO:START_FULL_SCENARIO" || cmd == "FULL_AUTO:START") {
+    startFullAutoScenario();
+    return;
+  }
+
+  if (cmd == "AUTO:FULL_STATUS" || cmd == "FULL_AUTO:STATUS") {
+    broadcastFullAutoEvent("full_auto_status", fullAutoState);
+    return;
+  }
+
+  if (cmd == "AUTO:FULL_STOP" || cmd == "FULL_AUTO:STOP") {
+    cancelFullAutoScenario("USER_FULL_AUTO_STOP");
+    return;
+  }
+
   // System mode commands go to both Mega and UNO.
   if (cmd == "SYS:MODE:MANUAL") {
+    cancelFullAutoScenario("SYS_MODE_MANUAL");
     currentMode = "MANUAL";
     sendToMega(cmd);
     sendToUno(cmd);
@@ -550,6 +959,7 @@ void routeCommand(String cmd) {
 
   // STOP / ESTOP: stop camera locally, forward to both boards.
   if (cmd == "STOP" || cmd == "ESTOP") {
+    cancelFullAutoScenario("STOP_OR_ESTOP");
     stopCameraMotion();
     sendToMega(cmd);
     sendToUno(cmd);
@@ -558,6 +968,7 @@ void routeCommand(String cmd) {
 
   // Camera commands are handled entirely on ESP32.
   if (cmd.startsWith("CAM:")) {
+    mirrorCommandToRaspberry("LOCAL", "CAMERA_STAND", cmd);
     Serial.print("[CAM LOCAL] ");
     Serial.println(cmd);
     handleCameraCommand(cmd);
@@ -593,6 +1004,8 @@ void handleRoot() {
   text += "HTTP: http://192.168.4.1\n";
   text += "\nEndpoints:\n";
   text += "/get_status\n";
+  text += "/auto_status\n";
+  text += "Raspberry UDP mirror: 192.168.4.2:5055\n";
   text += "/sensor_update?pitch=2.4&roll=-1.1&front=35.6&rear=18.2&balance=STABLE\n";
   text += "/bridge_event?source=MEGA&line=ACK:MEGA:DONE:UP_STAIRS\n";
   text += "/command?cmd=STOP\n";
@@ -614,6 +1027,8 @@ void handleRoot() {
   text += "/command?cmd=PULSE:FORWARD:560\n";
   text += "/command?cmd=BLOCK:TURN:LEFT:90\n";
   text += "/command?cmd=AUTO:UP_STAIRS\n";
+  text += "/command?cmd=AUTO:FULL_SCENARIO\n";
+  text += "Full scenario: UP_STAIRS -> GO_FORWARD_4 -> TURN_RIGHT_90 -> GO_FORWARD_1 -> DOWN_STAIRS\n";
 
   httpServer.send(200, "text/plain", text);
 }
@@ -626,6 +1041,20 @@ void handleGetStatus() {
   json += "\"cam_stepper_pos\":" + String(cameraStepPosition) + ",";
   json += "\"cam_stepper_dir\":" + String(cameraStepperDirection) + ",";
   json += "\"cam_servo_move_dir\":" + String(cameraServoMoveDir) + ",";
+  json += "\"full_auto_active\":" + String(fullAutoActive ? "true" : "false") + ",";
+  json += "\"full_auto_state\":\"" + jsonEscape(fullAutoState) + "\",";
+  json += "\"full_auto_step\":" + String(fullAutoStepNumber) + ",";
+  json += "\"full_auto_stage\":\"" + jsonEscape(fullAutoLastStage) + "\",";
+  json += "\"full_auto_command\":\"" + jsonEscape(fullAutoCurrentCommand) + "\",";
+  json += "\"full_auto_expected_done\":\"" + jsonEscape(fullAutoExpectedDonePrefix) + "\",";
+  json += "\"full_auto_last_ack\":\"" + jsonEscape(fullAutoLastAck) + "\",";
+  json += "\"full_auto_last_error\":\"" + jsonEscape(fullAutoLastError) + "\",";
+  json += "\"raspberry_mirror_enabled\":" + String(RASPBERRY_COMMAND_MIRROR_ENABLED ? "true" : "false") + ",";
+  json += "\"raspberry_mirror_count\":" + String(raspberryMirrorCount) + ",";
+  json += "\"raspberry_mirror_last_ok\":" + String(lastRaspberryMirrorOk ? "true" : "false") + ",";
+  json += "\"raspberry_mirror_last_target\":\"" + jsonEscape(lastRaspberryMirrorTarget) + "\",";
+  json += "\"raspberry_mirror_last_command\":\"" + jsonEscape(lastRaspberryMirrorCommand) + "\",";
+  json += "\"raspberry_mirror_last_ms_ago\":" + String(millis() - lastRaspberryMirrorAt) + ",";
   json += "\"last_command\":\"" + jsonEscape(lastCommand) + "\",";
   json += "\"last_command_ms_ago\":" + String(millis() - lastCommandAt) + ",";
   json += "\"last_sensor\":\"" + jsonEscape(lastSensorMessage) + "\",";
@@ -634,6 +1063,24 @@ void handleGetStatus() {
   json += "\"last_bridge_event_ms_ago\":" + String(millis() - lastBridgeEventAt) + ",";
   json += "\"last_mega_ack\":\"" + jsonEscape(lastMegaAck) + "\",";
   json += "\"last_mega_error\":\"" + jsonEscape(lastMegaError) + "\"";
+  json += "}";
+
+  httpServer.send(200, "application/json", json);
+}
+
+void handleAutoStatus() {
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"mode\":\"" + currentMode + "\",";
+  json += "\"active\":" + String(fullAutoActive ? "true" : "false") + ",";
+  json += "\"state\":\"" + jsonEscape(fullAutoState) + "\",";
+  json += "\"step\":" + String(fullAutoStepNumber) + ",";
+  json += "\"stage\":\"" + jsonEscape(fullAutoLastStage) + "\",";
+  json += "\"command\":\"" + jsonEscape(fullAutoCurrentCommand) + "\",";
+  json += "\"expected_done\":\"" + jsonEscape(fullAutoExpectedDonePrefix) + "\",";
+  json += "\"last_ack\":\"" + jsonEscape(fullAutoLastAck) + "\",";
+  json += "\"last_error\":\"" + jsonEscape(fullAutoLastError) + "\",";
+  json += "\"last_sensor\":\"" + jsonEscape(lastSensorMessage) + "\"";
   json += "}";
 
   httpServer.send(200, "application/json", json);
@@ -685,6 +1132,10 @@ void handleBridgeEvent() {
 
   if (source == "MEGA" && line.startsWith("ACK:"))   lastMegaAck   = line;
   if (source == "MEGA" && (line.startsWith("ERR:") || line.startsWith("ERROR:"))) lastMegaError = line;
+
+  if (source == "MEGA" || source == "MEGA_DIRECT") {
+    handleFullAutoFeedbackLine(line);
+  }
 
   Serial.print("[BRIDGE EVENT ");
   Serial.print(source);
@@ -814,12 +1265,14 @@ void setup() {
   setCameraAngle(CAM_SERVO_CENTER);
 
   WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+  raspberryCommandUdp.begin(ESP32_COMMAND_UDP_LOCAL_PORT);
 
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
 
   httpServer.on("/",              handleRoot);
   httpServer.on("/get_status",    handleGetStatus);
+  httpServer.on("/auto_status",   handleAutoStatus);
   httpServer.on("/sensor_update", handleSensorUpdate);
   httpServer.on("/bridge_event",  handleBridgeEvent);
   httpServer.on("/command",       handleCommandHttp);
@@ -837,6 +1290,7 @@ void setup() {
   Serial.println("MEGA cmds: forwarded to Mega");
   Serial.print("SSID     : "); Serial.println(WIFI_SSID);
   Serial.print("AP IP    : "); Serial.println(WiFi.softAPIP());
+  Serial.print("RPI UDP  : "); Serial.print(RASPBERRY_COMMAND_IP); Serial.print(":"); Serial.println(RASPBERRY_COMMAND_UDP_PORT);
   Serial.println("WebSocket: ws://192.168.4.1:81");
   Serial.println("HTTP     : http://192.168.4.1");
   Serial.println("=========================================");
@@ -849,6 +1303,9 @@ void setup() {
 void loop() {
   webSocket.loop();
   httpServer.handleClient();
+
+  readMegaDirectFeedback();
+  runFullAutoScenario();
 
   // Camera stand runners - non-blocking
   runCameraStepper();

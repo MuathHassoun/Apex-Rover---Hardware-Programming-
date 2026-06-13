@@ -139,6 +139,29 @@ unsigned long timedMoveEndAt = 0;
 const float PITCH_DANGER_DEG  = 42.0;
 const float ROLL_DANGER_DEG   = 40.0;
 
+// ==================================================
+// SMART MPU SAFETY FILTER
+// ==================================================
+// Old behavior: one bad MPU sample could immediately stop the active block.
+// New behavior: send warning first, then stop only if danger remains continuous.
+// Very extreme tilt still stops immediately.
+const unsigned long MPU_TILT_STOP_HOLD_MS       = 1500;
+const unsigned long MPU_TILT_WARN_REPEAT_MS     = 700;
+const float MPU_INSTANT_STOP_MARGIN_DEG         = 18.0;
+
+// Ignore impossible single-sample MPU spikes.
+const float MPU_MAX_VALID_ANGLE_DEG             = 85.0;
+const float MPU_MAX_SINGLE_SAMPLE_JUMP_DEG      = 35.0;
+const unsigned long MPU_SPIKE_WARN_REPEAT_MS    = 1000;
+
+bool mpuDangerCandidateActive = false;
+unsigned long mpuDangerCandidateStartMs = 0;
+unsigned long mpuLastDangerWarnMs = 0;
+String mpuDangerContext = "NONE";
+
+bool mpuHaveValidAngles = false;
+unsigned long lastMpuSpikeWarnMs = 0;
+
 
 // ==================================================
 // LEGO BLOCK SETTINGS
@@ -802,7 +825,16 @@ void blockAck(String message) {
   sendBoth("ACK:MEGA:" + message);
 }
 
+void resetMpuDangerConfirmation() {
+  mpuDangerCandidateActive = false;
+  mpuDangerCandidateStartMs = 0;
+  mpuLastDangerWarnMs = 0;
+  mpuDangerContext = "NONE";
+}
+
 void blockError(String code, String details) {
+  resetMpuDangerConfirmation();
+
   stopMotors();
   stopAllJacks();
   restoreSavedSpeed();
@@ -821,6 +853,8 @@ void stopActiveBlock(String reason) {
     return;
   }
 
+  resetMpuDangerConfirmation();
+
   stopMotors();
   stopAllJacks();
   restoreSavedSpeed();
@@ -834,6 +868,8 @@ void stopActiveBlock(String reason) {
 }
 
 void finishActiveBlock(String doneName) {
+  resetMpuDangerConfirmation();
+
   stopMotors();
   stopAllJacks();
   restoreSavedSpeed();
@@ -858,13 +894,86 @@ void restoreSavedSpeed() {
 // ==================================================
 // BLOCK SAFETY
 // ==================================================
-bool blockTiltSafetyOK(String blockName) {
-  if (fabs(pitch) >= PITCH_DANGER_DEG || fabs(roll) >= ROLL_DANGER_DEG) {
-    blockError(blockName + ":HARD_TILT_DANGER", "PITCH=" + String(pitch, 2) + ";ROLL=" + String(roll, 2));
+bool smartTiltSafetyOK(String blockName, float pitchLimit, float rollLimit, bool allowInstantStop) {
+  unsigned long now = millis();
+
+  bool pitchDanger = fabs(pitch) >= pitchLimit;
+  bool rollDanger  = fabs(roll)  >= rollLimit;
+
+  if (!pitchDanger && !rollDanger) {
+    if (mpuDangerCandidateActive) {
+      blockAck("WARN:" + blockName + ":TILT_BACK_TO_SAFE:PITCH=" + String(pitch, 2) + ":ROLL=" + String(roll, 2));
+    }
+
+    resetMpuDangerConfirmation();
+    return true;
+  }
+
+  float pitchOver = fabs(pitch) - pitchLimit;
+  float rollOver  = fabs(roll)  - rollLimit;
+  float worstOver = max(pitchOver, rollOver);
+
+  // Very extreme tilt is treated as a true emergency, not just an MPU glitch.
+  if (allowInstantStop && worstOver >= MPU_INSTANT_STOP_MARGIN_DEG) {
+    blockError(
+      blockName + ":INSTANT_EXTREME_TILT_DANGER",
+      "PITCH=" + String(pitch, 2) +
+      ";ROLL=" + String(roll, 2) +
+      ";PITCH_LIMIT=" + String(pitchLimit, 1) +
+      ";ROLL_LIMIT=" + String(rollLimit, 1)
+    );
     return false;
   }
 
+  if (!mpuDangerCandidateActive || mpuDangerContext != blockName) {
+    mpuDangerCandidateActive = true;
+    mpuDangerCandidateStartMs = now;
+    mpuLastDangerWarnMs = now;
+    mpuDangerContext = blockName;
+
+    blockAck(
+      "WARN:" + blockName +
+      ":TILT_DANGER_CANDIDATE_CONTINUING:"
+      "PITCH=" + String(pitch, 2) +
+      ":ROLL=" + String(roll, 2) +
+      ":STOP_AFTER_MS=" + String(MPU_TILT_STOP_HOLD_MS)
+    );
+
+    return true;
+  }
+
+  unsigned long dangerAgeMs = now - mpuDangerCandidateStartMs;
+
+  if (dangerAgeMs >= MPU_TILT_STOP_HOLD_MS) {
+    blockError(
+      blockName + ":CONFIRMED_TILT_DANGER",
+      "PITCH=" + String(pitch, 2) +
+      ";ROLL=" + String(roll, 2) +
+      ";DURATION_MS=" + String(dangerAgeMs) +
+      ";PITCH_LIMIT=" + String(pitchLimit, 1) +
+      ";ROLL_LIMIT=" + String(rollLimit, 1)
+    );
+    return false;
+  }
+
+  if (now - mpuLastDangerWarnMs >= MPU_TILT_WARN_REPEAT_MS) {
+    mpuLastDangerWarnMs = now;
+    blockAck(
+      "WARN:" + blockName +
+      ":TILT_DANGER_STILL_CONFIRMING:"
+      "PITCH=" + String(pitch, 2) +
+      ":ROLL=" + String(roll, 2) +
+      ":AGE_MS=" + String(dangerAgeMs) +
+      ":STOP_AFTER_MS=" + String(MPU_TILT_STOP_HOLD_MS)
+    );
+  }
+
+  // Warning only for now; continue. If the danger persists, the next calls stop it.
   return true;
+}
+
+bool blockTiltSafetyOK(String blockName) {
+  return smartTiltSafetyOK(blockName, PITCH_DANGER_DEG, ROLL_DANGER_DEG, true);
 }
 
 bool frontHardObstacle() {
@@ -881,6 +990,7 @@ bool rearHardObstacle() {
 // ==================================================
 void startGoBlock(String command) {
   stopActiveBlock("NEW_GO_BLOCK");
+  resetMpuDangerConfirmation();
 
   String dir = getToken(command, 2);
   int amount = getTokenInt(command, 3, 20);
@@ -928,6 +1038,7 @@ void startGoBlock(String command) {
 // ==================================================
 void startTurnBlock(String command) {
   stopActiveBlock("NEW_TURN_BLOCK");
+  resetMpuDangerConfirmation();
 
   String dir = getToken(command, 2);
   int deg = getTokenInt(command, 3, 90);
@@ -984,6 +1095,7 @@ void startTurnBlock(String command) {
 // ==================================================
 void startJackBlock(String command) {
   stopActiveBlock("NEW_JACK_BLOCK");
+  resetMpuDangerConfirmation();
 
   String which = getToken(command, 2);
   String action = getToken(command, 3);
@@ -1044,6 +1156,7 @@ void startJackBlock(String command) {
 // ==================================================
 void startUpStairsBlock() {
   stopActiveBlock("NEW_UP_STAIRS");
+  resetMpuDangerConfirmation();
 
   saveCurrentSpeed();
 
@@ -1079,6 +1192,7 @@ void startUpStairsBlock() {
 // ==================================================
 void startDownStairsBlock() {
   stopActiveBlock("NEW_DOWN_STAIRS");
+  resetMpuDangerConfirmation();
 
   saveCurrentSpeed();
 
@@ -1278,12 +1392,8 @@ void startUpJackCycle(int stairNumber, unsigned long now, String reason) {
 
 void runUpStairsBlock(unsigned long now) {
   // Stair climbing can naturally create a high pitch, so use climbing-specific
-  // hard limits instead of the normal manual-mode limits.
-  if (fabs(roll) >= UP_ROLL_HARD_DANGER_DEG || fabs(pitch) >= UP_PITCH_HARD_DANGER_DEG) {
-    blockError(
-      "UP_STAIRS:HARD_TILT_DANGER",
-      "PITCH=" + String(pitch, 2) + ";ROLL=" + String(roll, 2)
-    );
+  // hard limits. The smart checker warns first and stops only if danger persists.
+  if (!smartTiltSafetyOK("UP_STAIRS", UP_PITCH_HARD_DANGER_DEG, UP_ROLL_HARD_DANGER_DEG, true)) {
     return;
   }
 
@@ -2718,8 +2828,44 @@ void readMPU() {
   gyroY = rawGy / 131.0;
   gyroZ = (rawGz / 131.0) - gyroZBias;
 
-  pitch = atan2(accelY, sqrt(accelX * accelX + accelZ * accelZ)) * 180.0 / PI;
-  roll  = atan2(-accelX, accelZ) * 180.0 / PI;
+  float newPitch = atan2(accelY, sqrt(accelX * accelX + accelZ * accelZ)) * 180.0 / PI;
+  float newRoll  = atan2(-accelX, accelZ) * 180.0 / PI;
+
+  bool invalidAngles = isnan(newPitch) || isnan(newRoll) ||
+                       fabs(newPitch) > MPU_MAX_VALID_ANGLE_DEG || fabs(newRoll) > MPU_MAX_VALID_ANGLE_DEG;
+
+  if (invalidAngles) {
+    unsigned long nowMs = millis();
+    if (nowMs - lastMpuSpikeWarnMs >= MPU_SPIKE_WARN_REPEAT_MS) {
+      lastMpuSpikeWarnMs = nowMs;
+      sendBoth("WARN:MEGA:MPU_INVALID_READING_IGNORED:PITCH=" + String(newPitch, 2) + ":ROLL=" + String(newRoll, 2));
+    }
+    return;
+  }
+
+  if (mpuHaveValidAngles) {
+    float pitchJump = fabs(newPitch - pitch);
+    float rollJump  = fabs(newRoll - roll);
+
+    if (pitchJump > MPU_MAX_SINGLE_SAMPLE_JUMP_DEG || rollJump > MPU_MAX_SINGLE_SAMPLE_JUMP_DEG) {
+      unsigned long nowMs = millis();
+      if (nowMs - lastMpuSpikeWarnMs >= MPU_SPIKE_WARN_REPEAT_MS) {
+        lastMpuSpikeWarnMs = nowMs;
+        sendBoth(
+          "WARN:MEGA:MPU_SPIKE_IGNORED:"
+          "OLD_PITCH=" + String(pitch, 2) +
+          ":NEW_PITCH=" + String(newPitch, 2) +
+          ":OLD_ROLL=" + String(roll, 2) +
+          ":NEW_ROLL=" + String(newRoll, 2)
+        );
+      }
+      return;
+    }
+  }
+
+  pitch = newPitch;
+  roll  = newRoll;
+  mpuHaveValidAngles = true;
 
   unsigned long nowMicros = micros();
 
