@@ -1,92 +1,72 @@
 #!/usr/bin/env python3
 """
-apex_rover_manual_servers_startup.py
+Apex Rover Manual Camera Startup - CLEAN VERSION
 
-Apex Rover Raspberry Pi Manual Services Startup Manager
+This file starts ONLY the manual camera admin server.
 
-This file starts and monitors Raspberry Pi MANUAL mode microservices:
+IMPORTANT CHANGE:
+  The old sensor_bridge.py is no longer started from Raspberry.
+  Mega sensor readings must go directly:
 
-1. camera_admin_server.py
-   - Smart manual camera admin
-   - Opens ONLY ONE camera at a time
-   - Front camera for Basic / Rear Jack / Front Jack modes
-   - Arm camera for Arm mode
-   - Flask server on port 5000
-   - Keeps old URLs working:
-       /front_snapshot
-       /arm_snapshot
-       /front_camera
-       /arm_camera
-       /status
+    Mega Serial1 TX -> ESP32 RX
+    ESP32 WebSocket -> Mobile App
 
-2. sensor_bridge.py
-   - Reads SENSOR lines from Arduino Mega over USB Serial
-   - Saves latest MPU/sensor data to /tmp/apex_last_sensor.json
-   - Sends sensor updates to ESP32 /sensor_update
-
-Important:
-Raspberry Pi does NOT control robot movement in Manual mode.
-All manual movement commands come from:
-
-Mobile App -> ESP32 -> Mega / UNO
+This avoids Raspberry USB serial ground/noise problems with the audio system.
 """
 
+from __future__ import annotations
+
 import os
-import sys
-import time
 import signal
 import subprocess
+import sys
 import threading
+import time
 from datetime import datetime
-
+from typing import Optional
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CAMERA_FILE = os.path.join(BASE_DIR, "camera_admin_server.py")
 
-SERVICES = [
-    {
-        "name": "camera_admin_service",
-        "file": "camera_admin_server.py",
-        "restart_delay": 3,
-    },
-    {
-        "name": "sensor_bridge",
-        "file": "sensor_bridge.py",
-        "restart_delay": 3,
-    },
-]
-
-processes = {}
+process: Optional[subprocess.Popen] = None
 running = True
 
 
-def log(message):
+def log(message: str) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {message}", flush=True)
 
 
-def service_path(service_file):
-    return os.path.join(BASE_DIR, service_file)
+def is_running() -> bool:
+    return process is not None and process.poll() is None
 
 
-def start_service(service):
-    name = service["name"]
-    path = service_path(service["file"])
+def print_output(proc: subprocess.Popen) -> None:
+    if proc.stdout is None:
+        return
 
-    if not os.path.exists(path):
-        log(f"[ERROR] {name}: file not found: {path}")
-        return None
+    while running and proc.poll() is None:
+        line = proc.stdout.readline()
+        if line:
+            print(f"[camera_admin] {line}", end="", flush=True)
+        else:
+            time.sleep(0.05)
 
-    old_item = processes.get(name)
-    if old_item:
-        old_process = old_item.get("process")
-        if old_process is not None and old_process.poll() is None:
-            log(f"[INFO] {name} already running")
-            return old_process
 
-    log(f"[START] {name}: {sys.executable} -u {path}")
+def start_camera() -> None:
+    global process
+
+    if is_running():
+        return
+
+    if not os.path.exists(CAMERA_FILE):
+        log(f"[ERROR] camera_admin_server.py not found: {CAMERA_FILE}")
+        return
+
+    log(f"[START] camera_admin_server.py")
 
     process = subprocess.Popen(
-        [sys.executable, "-u", path],
+        [sys.executable, "-u", CAMERA_FILE],
         cwd=BASE_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -94,127 +74,50 @@ def start_service(service):
         bufsize=1,
     )
 
-    processes[name] = {
-        "process": process,
-        "service": service,
-        "last_restart": time.time(),
-    }
-
-    output_thread = threading.Thread(
-        target=print_service_output,
-        args=(name, process),
-        daemon=True,
-    )
-    output_thread.start()
-
-    return process
+    threading.Thread(target=print_output, args=(process,), daemon=True).start()
 
 
-def stop_service(name):
-    item = processes.get(name)
-    if not item:
+def stop_camera() -> None:
+    global process
+
+    if process is None:
         return
 
-    process = item["process"]
-
     if process.poll() is None:
-        log(f"[STOP] {name}")
+        log("[STOP] camera_admin_server.py")
         process.terminate()
-
         try:
             process.wait(timeout=5)
-            log(f"[OK] {name} stopped")
         except subprocess.TimeoutExpired:
-            log(f"[KILL] {name}")
             process.kill()
 
-    processes.pop(name, None)
+    process = None
 
 
-def stop_all_services():
-    log("[INFO] Stopping all manual services...")
-
-    for name in list(processes.keys()):
-        stop_service(name)
-
-    log("[OK] All manual services stopped")
-
-
-def handle_shutdown(signum, frame):
+def shutdown(signum=None, frame=None) -> None:
     global running
-
-    log(f"[INFO] Shutdown signal received: {signum}")
     running = False
-    stop_all_services()
+    stop_camera()
     sys.exit(0)
 
 
-def print_service_output(name, process):
-    if process.stdout is None:
-        return
+def main() -> None:
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    log("==========================================")
+    log("Apex Rover Manual Camera Startup")
+    log("Sensor bridge: DISABLED")
+    log("Only camera_admin_server.py will run")
+    log("==========================================")
+
+    start_camera()
 
     while running:
-        if process.poll() is not None:
-            break
-
-        line = process.stdout.readline()
-
-        if line:
-            print(f"[{name}] {line}", end="", flush=True)
-        else:
-            time.sleep(0.05)
-
-
-def monitor_services():
-    global running
-
-    log("=" * 60)
-    log("Apex Rover Manual Services Startup Manager")
-    log("Mode: MANUAL")
-    log("Camera: Smart camera admin, one camera active at a time")
-    log("Sensors: Mega sensor bridge")
-    log("=" * 60)
-
-    for service in SERVICES:
-        start_service(service)
-
-    log("[OK] Manual services manager is running")
-    log("[INFO] Press Ctrl+C to stop")
-
-    while running:
-        for service in SERVICES:
-            name = service["name"]
-
-            if name not in processes:
-                log(f"[WARN] {name} not running. Starting...")
-                start_service(service)
-                continue
-
-            process = processes[name]["process"]
-            exit_code = process.poll()
-
-            if exit_code is not None:
-                log(f"[ERROR] {name} stopped with exit code {exit_code}")
-                processes.pop(name, None)
-
-                delay = service.get("restart_delay", 3)
-                log(f"[INFO] Restarting {name} in {delay} seconds...")
-                time.sleep(delay)
-
-                if running:
-                    start_service(service)
-
-        time.sleep(1)
-
-
-def main():
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
-    try:
-        monitor_services()
-    except KeyboardInterrupt:
-        handle_shutdown(signal.SIGINT, None)
+        if not is_running():
+            log("[MONITOR] camera_admin_server.py stopped, restarting...")
+            start_camera()
+        time.sleep(2)
 
 
 if __name__ == "__main__":

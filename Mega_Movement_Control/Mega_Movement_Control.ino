@@ -9,7 +9,7 @@
 // 2. Front / rear jacks
 // 3. MPU6500 pitch/roll/yaw
 // 4. Ultrasonic display only
-// 5. SENSOR messages to Raspberry over USB Serial
+// 5. SENSOR messages to ESP32 over Serial1, then ESP32 broadcasts to mobile
 // 6. LEGO movement blocks:
 //
 //    AUTO:UP_STAIRS
@@ -494,7 +494,7 @@ void setup() {
   delay(500);
 
   Serial.println("MEGA:READY");
-  Serial.println("MEGA:SENSOR_MODE_DEPENDENT_STREAM_ENABLED");
+  Serial.println("MEGA:SENSOR_TO_ESP32_SERIAL1_ENABLED");
   Serial.println("MEGA:MANUAL_SENSOR_INTERVAL_5000MS");
   Serial.println("MEGA:AUTO_SENSOR_INTERVAL_500MS");
   Serial.println("MEGA:ULTRASONIC_DISPLAY_ONLY_ENABLED");
@@ -509,6 +509,7 @@ void setup() {
   Serial.println("MEGA:HARD_TILT_ONLY_ENABLED");
 
   Serial1.println("MEGA:READY");
+  Serial1.println("MEGA:SENSOR_TO_ESP32_SERIAL1_ENABLED");
   Serial1.println("MEGA:LEGO_BLOCKS_ENABLED");
   Serial1.println("MEGA:AUTO_UP_STAIRS_3_STAIRS_SCENARIO_ENABLED");
   Serial1.println("MEGA:UP_STAIRS_WAIT_FIRST_MPU_TILT_THEN_3_4_2_3_FULL_JACK");
@@ -2523,75 +2524,70 @@ String detectAlert() {
 
 
 // ==================================================
-// SENSOR OUTPUT TO RASPBERRY PI
+// SENSOR OUTPUT TO ESP32 + USB DEBUG
 // ==================================================
+// CLEAN SENSOR PATH:
+//   Mega Serial1 TX1 Pin 18 -> ESP32 RX GPIO16 -> Mobile WebSocket
+// Raspberry no longer reads Mega USB Serial for sensors.
+
+void printSensorLine(Print &out, const char *prefix, String alertType, bool includeAlert) {
+  out.print(prefix);
+  out.print(":");
+
+  out.print("SYS=");
+  out.print(systemMode);
+
+  out.print(";MODE=");
+  out.print(currentMode);
+
+  out.print(";MOVE=");
+  out.print(lastMovement);
+
+  out.print(";SPEED=");
+  out.print(motorSpeedPercent);
+
+  out.print(";PITCH=");
+  out.print(pitch, 2);
+
+  out.print(";ROLL=");
+  out.print(roll, 2);
+
+  out.print(";YAW=");
+  out.print(yawDeg, 2);
+
+  out.print(";UF=");
+  out.print(frontUltrasonicCM, 2);
+
+  out.print(";UR=");
+  out.print(rearUltrasonicCM, 2);
+
+  out.print(";BLOCK=");
+  out.print(activeBlockName);
+
+  if (includeAlert) {
+    out.print(";ALERT=");
+    out.print(alertType);
+  }
+
+  out.println();
+}
+
 void sendSensorData(String alertType) {
-  Serial.print("SENSOR:");
-  Serial.print("SYS=");
-  Serial.print(systemMode);
+  // USB Serial is only debug if connected to a PC.
+  Serial.print("[DBG] ");
+  printSensorLine(Serial, "SENSOR", alertType, true);
 
-  Serial.print(";MODE=");
-  Serial.print(currentMode);
-
-  Serial.print(";MOVE=");
-  Serial.print(lastMovement);
-
-  Serial.print(";SPEED=");
-  Serial.print(motorSpeedPercent);
-
-  Serial.print(";PITCH=");
-  Serial.print(pitch, 2);
-
-  Serial.print(";ROLL=");
-  Serial.print(roll, 2);
-
-  Serial.print(";YAW=");
-  Serial.print(yawDeg, 2);
-
-  Serial.print(";UF=");
-  Serial.print(frontUltrasonicCM, 2);
-
-  Serial.print(";UR=");
-  Serial.print(rearUltrasonicCM, 2);
-
-  Serial.print(";BLOCK=");
-  Serial.print(activeBlockName);
-
-  Serial.print(";ALERT=");
-  Serial.println(alertType);
+  // Main sensor path to ESP32/mobile.
+  printSensorLine(Serial1, "SENSOR", alertType, true);
 }
 
 void sendStatusToPI() {
-  Serial.print("STATUS:");
-  Serial.print("SYS=");
-  Serial.print(systemMode);
+  // Name kept to avoid changing the rest of the old code.
+  // It now sends status to ESP32, not Raspberry Pi.
+  Serial.print("[DBG] ");
+  printSensorLine(Serial, "STATUS", "NONE", false);
 
-  Serial.print(";MODE=");
-  Serial.print(currentMode);
-
-  Serial.print(";MOVE=");
-  Serial.print(lastMovement);
-
-  Serial.print(";SPEED=");
-  Serial.print(motorSpeedPercent);
-
-  Serial.print(";PITCH=");
-  Serial.print(pitch, 2);
-
-  Serial.print(";ROLL=");
-  Serial.print(roll, 2);
-
-  Serial.print(";YAW=");
-  Serial.print(yawDeg, 2);
-
-  Serial.print(";UF=");
-  Serial.print(frontUltrasonicCM, 2);
-
-  Serial.print(";UR=");
-  Serial.print(rearUltrasonicCM, 2);
-
-  Serial.print(";BLOCK=");
-  Serial.println(activeBlockName);
+  printSensorLine(Serial1, "STATUS", "NONE", false);
 }
 
 

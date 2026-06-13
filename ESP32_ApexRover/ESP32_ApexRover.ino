@@ -14,11 +14,12 @@
 // Auto path:
 //   Raspberry Auto -> HTTP /command or WebSocket 81 -> ESP32 -> Mega / UNO
 //
-// Sensor path:
-//   Mega -> Raspberry sensor_bridge -> ESP32 /sensor_update -> Mobile App
+// Sensor path - CLEAN VERSION:
+//   Mega Serial1 TX -> ESP32 RX GPIO16 -> ESP32 WebSocket -> Mobile App
+//   Raspberry does NOT read Mega USB Serial anymore.
 //
-// Mega ACK path WITHOUT return wire:
-//   Mega USB Serial -> Raspberry sensor_bridge -> ESP32 /bridge_event -> Mobile App
+// Mega ACK path:
+//   Mega Serial1 TX -> ESP32 RX GPIO16 -> ESP32 WebSocket -> Mobile App
 //
 // Raspberry command mirror:
 //   Every command received by ESP32 and every routed command sent by ESP32
@@ -38,8 +39,9 @@
 //   Camera Servo Signal   -> ESP32 GPIO14
 //
 // Serial pin mapping:
-//   Mega command direction only:
+//   Mega bidirectional Serial1:
 //     ESP32 GPIO17 TX -> Mega RX1 Pin 19
+//     Mega TX1 Pin 18 -> ESP32 GPIO16 RX  (USE VOLTAGE DIVIDER 5V -> 3.3V)
 //     ESP32 GND       -> Mega GND
 //   UNO command direction:
 //     ESP32 GPIO4 TX  -> UNO D2 SoftwareSerial RX
@@ -85,9 +87,9 @@ WiFiUDP raspberryCommandUdp;
 const unsigned int CAM_STEP_PULSE_MICROS   = 3;
 const unsigned long CAM_SERVO_DETACH_DELAY_MS = 450;
 
-const int CAM_SERVO_MIN    = 30;
-const int CAM_SERVO_MAX    = 150;
-const int CAM_SERVO_CENTER = 90;
+const int CAM_SERVO_MIN    = 0;
+const int CAM_SERVO_MAX    = 90;
+const int CAM_SERVO_CENTER = 45;
 const bool INVERT_CAMERA_VERTICAL = true;
 
 const long CAM_MIN_STEPPER_STEPS = 1;
@@ -212,6 +214,7 @@ String fullAutoLastStage = "IDLE";
 // =================================================================
 void mirrorCommandToRaspberry(const String& direction, const String& target, const String& cmd);
 void stopCameraMotion();
+void broadcastMegaSensorToMobile(String line);
 
 
 // =================================================================
@@ -578,12 +581,106 @@ void runFullAutoScenario() {
   }
 }
 
+
+// =================================================================
+// Mega direct sensor helpers
+// =================================================================
+String getFieldFromMegaLine(const String& payload, const String& key) {
+  String search = key + "=";
+  int idx = payload.indexOf(search);
+  if (idx < 0) return "";
+
+  int start = idx + search.length();
+  int end = payload.indexOf(';', start);
+  if (end < 0) end = payload.length();
+
+  String value = payload.substring(start, end);
+  value.trim();
+  return value;
+}
+
+String normalizeMegaSensorForMobile(String line) {
+  line.trim();
+
+  String payload = line;
+  if (payload.startsWith("SENSOR:")) {
+    payload = payload.substring(7);
+  } else if (payload.startsWith("STATUS:")) {
+    payload = payload.substring(7);
+  }
+
+  String pitch = getFieldFromMegaLine(payload, "PITCH");
+  String roll  = getFieldFromMegaLine(payload, "ROLL");
+  String front = getFieldFromMegaLine(payload, "FRONT");
+  String rear  = getFieldFromMegaLine(payload, "REAR");
+
+  if (front.length() == 0) front = getFieldFromMegaLine(payload, "UF");
+  if (rear.length()  == 0) rear  = getFieldFromMegaLine(payload, "UR");
+
+  String balance = getFieldFromMegaLine(payload, "BALANCE");
+  String alert   = getFieldFromMegaLine(payload, "ALERT");
+
+  if (pitch.length() == 0) pitch = "0";
+  if (roll.length()  == 0) roll  = "0";
+  if (front.length() == 0) front = "-1";
+  if (rear.length()  == 0) rear  = "-1";
+
+  alert.toUpperCase();
+  balance.toUpperCase();
+
+  if (balance.length() == 0) {
+    float p = pitch.toFloat();
+    float r = roll.toFloat();
+
+    if (alert == "TILT_DANGER") {
+      balance = "DANGER";
+    } else if (fabs(p) >= 30.0 || fabs(r) >= 25.0) {
+      balance = "DANGER";
+    } else if (fabs(p) >= 15.0 || fabs(r) >= 12.0) {
+      balance = "WARNING";
+    } else {
+      balance = "STABLE";
+    }
+  }
+
+  String sensorMessage = "SENSOR:";
+  sensorMessage += "PITCH=" + pitch;
+  sensorMessage += ";ROLL=" + roll;
+  sensorMessage += ";FRONT=" + front;
+  sensorMessage += ";REAR=" + rear;
+  sensorMessage += ";BALANCE=" + balance;
+
+  if (alert.length() > 0) {
+    sensorMessage += ";ALERT=" + alert;
+  }
+
+  return sensorMessage;
+}
+
+void broadcastMegaSensorToMobile(String line) {
+  String sensorMessage = normalizeMegaSensorForMobile(line);
+  lastSensorMessage = sensorMessage;
+  webSocket.broadcastTXT(sensorMessage);
+
+  Serial.print("[MEGA SENSOR -> APP] ");
+  Serial.println(sensorMessage);
+}
+
 void readMegaDirectFeedback() {
   while (MegaSerial.available() > 0) {
     String line = MegaSerial.readStringUntil('\n');
     line.trim();
 
     if (line.length() == 0) continue;
+
+    // CLEAN SENSOR PATH:
+    // Mega sends SENSOR/STATUS to ESP32 directly.
+    // ESP32 broadcasts normalized SENSOR messages to the mobile app.
+    // Raspberry is not involved in sensor reading anymore.
+    if (line.startsWith("SENSOR:") || line.startsWith("STATUS:")) {
+      broadcastMegaSensorToMobile(line);
+      continue;
+    }
 
     lastBridgeSource = "MEGA_DIRECT";
     lastBridgeEvent = line;
@@ -1006,8 +1103,9 @@ void handleRoot() {
   text += "/get_status\n";
   text += "/auto_status\n";
   text += "Raspberry UDP mirror: 192.168.4.2:5055\n";
-  text += "/sensor_update?pitch=2.4&roll=-1.1&front=35.6&rear=18.2&balance=STABLE\n";
-  text += "/bridge_event?source=MEGA&line=ACK:MEGA:DONE:UP_STAIRS\n";
+  text += "Sensor path: Mega Serial1 -> ESP32 -> Mobile WebSocket\n";
+  text += "/sensor_update?pitch=2.4&roll=-1.1&front=35.6&rear=18.2&balance=STABLE (debug only)\n";
+  text += "/bridge_event?source=MEGA&line=ACK:MEGA:DONE:UP_STAIRS (debug only)\n";
   text += "/command?cmd=STOP\n";
   text += "/command?cmd=CAM:CENTER\n";
   text += "/command?cmd=CAM:LEFT\n";
