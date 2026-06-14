@@ -1,0 +1,20 @@
+[Unit]
+Description=Apex Rover Raspberry Startup Manager
+After=network-online.target sound.target
+Wants=network-online.target sound.target
+
+[Service]
+Type=simple
+User=apex-rover
+WorkingDirectory=/home/apex-rover/ApexRover_Repo/Raspberry
+ExecStart=/usr/bin/python3 -u /home/apex-rover/ApexRover_Repo/Raspberry/main_startup.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=APEX_IDLE_MUSIC=ASSAULT.mp4
+Environment=APEX_SPEAK_ON_STARTUP=1
+Environment=APEX_TTS_VOICE=en-us
+Environment=APEX_TTS_SPEED=150
+
+[Install]
+WantedBy=multi-user.target

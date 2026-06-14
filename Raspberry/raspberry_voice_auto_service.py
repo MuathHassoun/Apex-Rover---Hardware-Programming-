@@ -22,7 +22,7 @@ Raspberry does NOT read Mega USB Serial anymore.
 
 Music:
   Put your music file beside this script.
-  Default name: idle_music.mp3
+  Default name: ASSAULT.mp4
 
 Install:
   sudo apt update
@@ -61,7 +61,7 @@ UDP_LISTEN_IP = "0.0.0.0"
 UDP_LISTEN_PORT = int(os.environ.get("APEX_RPI_UDP_PORT", "5055"))
 
 BASE_DIR = Path(__file__).resolve().parent
-IDLE_MUSIC_FILE = BASE_DIR / os.environ.get("APEX_IDLE_MUSIC", "idle_music.mp3")
+IDLE_MUSIC_FILE = BASE_DIR / os.environ.get("APEX_IDLE_MUSIC", "ASSAULT.mp4")
 IDLE_MUSIC_DELAY_SEC = float(os.environ.get("APEX_IDLE_MUSIC_DELAY", "4.0"))
 
 # main_startup.py local endpoint. It starts/stops camera services.
@@ -70,6 +70,11 @@ RPI_MODE_URL = os.environ.get("APEX_RPI_MODE_URL", "http://127.0.0.1:5050/intern
 TTS_BINARIES = ["espeak-ng", "espeak"]
 TTS_VOICE = os.environ.get("APEX_TTS_VOICE", "en-us")
 TTS_SPEED = os.environ.get("APEX_TTS_SPEED", "150")
+
+# Speak once when the Raspberry boots, so you can confirm the service started.
+# Set APEX_SPEAK_ON_STARTUP=0 in the service file to disable it.
+STARTUP_SPEECH_ENABLED = os.environ.get("APEX_SPEAK_ON_STARTUP", "1").strip() != "0"
+STARTUP_SPEECH_TEXT = os.environ.get("APEX_STARTUP_SPEECH", "Apex Rover sound system is ready.")
 
 # Auto camera scan pattern.
 # Servo angles must stay inside 0..90.
@@ -205,6 +210,7 @@ class IdleMusicPlayer:
         self._lock = threading.Lock()
         self._mpg123 = find_binary(["mpg123"])
         self._ffplay = find_binary(["ffplay"])
+        self._missing_logged = False
 
     @property
     def is_playing(self) -> bool:
@@ -217,6 +223,9 @@ class IdleMusicPlayer:
                 return
 
             if not self.music_path.exists():
+                if not self._missing_logged:
+                    log(f"[MUSIC WARN] Music file not found: {self.music_path}")
+                    self._missing_logged = True
                 return
 
             suffix = self.music_path.suffix.lower()
@@ -587,6 +596,9 @@ def main() -> None:
     speaker = Speaker(music)
     auto_controller = AutoModeController(speaker)
     listener = CommandListener(speaker, auto_controller, music)
+
+    if STARTUP_SPEECH_ENABLED:
+        speaker.speak(STARTUP_SPEECH_TEXT)
 
     try:
         listener.start()

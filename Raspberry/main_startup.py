@@ -188,9 +188,11 @@ def start_process(name: str, file_path: Path, log_name: str, cwd: Optional[Path]
     log(f"[LOG]   {log_path}")
 
     env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env["PATH"] = env.get("PATH", "") + ":/usr/local/bin:/usr/bin:/bin"
     env.setdefault("APEX_ESP32_IP", ESP32_IP)
     env.setdefault("APEX_ESP32_HTTP_PORT", str(ESP32_HTTP_PORT))
-    env.setdefault("APEX_IDLE_MUSIC", "idle_music.mp3")
+    env.setdefault("APEX_IDLE_MUSIC", "ASSAULT.mp4")
     env.setdefault("APEX_RPI_MODE_URL", f"http://127.0.0.1:{SERVER_PORT}/internal/mode_from_voice")
 
     return subprocess.Popen(
